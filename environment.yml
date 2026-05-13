@@ -1,0 +1,25 @@
+# Conda environment for mini-embed-filip.
+#
+# Same shape as mini-embed: pip-only inside conda to avoid the macOS libomp
+# clash between conda's llvm-openmp (from numpy/openblas) and the libomp
+# bundled in the pip torch wheel. On Linux CUDA hosts, swap the pip torch
+# line for the matching wheel index; on Intel XPU hosts, install
+# intel-extension-for-pytorch from Intel's instructions.
+
+name: mini-embed-filip
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch>=2.4
+      - transformers>=4.40
+      - tokenizers>=0.15
+      - safetensors>=0.4
+      - numpy>=1.24
+      - pyyaml>=6.0     # AMPLIFY's amplify.py imports yaml at module load
+      - matplotlib      # for inspect.py heatmaps (optional but lightweight)
+      - sentencepiece   # BioGPT tokenizer uses BPE merges; sentencepiece kept
+                        # available for safety against other downloads.
+      - sacremoses      # required by BioGPT tokenizer
