@@ -31,6 +31,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -44,6 +46,7 @@ from src.data import (
     save_splits,
     splits_are_valid,
 )
+from src.dist import init_distributed, barrier, cleanup
 from src.decoder_adapters import (
     LoRACfg,
     clear_cross_memory,
@@ -189,15 +192,20 @@ def main() -> None:
     ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every)
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
+    ap.add_argument("--val-subset", type=int, default=1000,
+                    help="evaluate on the first N val pairs each epoch (0 = full val split)")
     args = ap.parse_args()
 
-    device = pick_device(args.device)
-    print(f"[gen] direction={args.direction}  device={device}")
+    env = init_distributed(args.device, group_size=1)
+    device = env.device
     torch.manual_seed(args.seed)
+    if env.is_main:
+        print(f"[gen] direction={args.direction} world_size={env.world_size} device={device}")
 
     # 1) Retrieval model (frozen) — provides projection + expansion
     retrieval = load_retrieval_model(args.retrieval_ckpt, device)
-    print(f"[gen] loaded retrieval model from {args.retrieval_ckpt}")
+    if env.is_main:
+        print(f"[gen] loaded retrieval model from {args.retrieval_ckpt}")
 
     # 2) Decoder + adapters
     decoder_path = (
@@ -218,9 +226,10 @@ def main() -> None:
     decoder, target_tok, adapters = load_decoder_with_cross_attn(
         args.direction, decoder_path, args.cross_attn_every, mem_dim, lora_cfg, device,
     )
-    n_train = count_trainable(decoder)
-    print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
-    print(f"[gen] num cross-attention adapters: {len(adapters)}")
+    if env.is_main:
+        n_train = count_trainable(decoder)
+        print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
+        print(f"[gen] num cross-attention adapters: {len(adapters)}")
 
     # 3) Data
     pairs = load_pairs(
@@ -232,36 +241,67 @@ def main() -> None:
         subset_size=args.subset_size,
     )
     splits_path = Path(args.cache_dir) / "splits.json"
-    if splits_path.exists():
-        splits = load_splits(str(splits_path))
-        if not splits_are_valid(splits, len(pairs), args.seed, cfg.data.splits):
-            print("[gen] splits stale; rebuilding")
+    # Rank 0 owns split creation; everyone reads after a barrier (no write race).
+    if env.is_main:
+        if splits_path.exists():
+            splits = load_splits(str(splits_path))
+            if not splits_are_valid(splits, len(pairs), args.seed, cfg.data.splits):
+                print("[gen] splits stale; rebuilding")
+                splits = make_splits(len(pairs), cfg.data.splits, args.seed)
+                save_splits(splits, str(splits_path))
+        else:
             splits = make_splits(len(pairs), cfg.data.splits, args.seed)
             save_splits(splits, str(splits_path))
-    else:
-        splits = make_splits(len(pairs), cfg.data.splits, args.seed)
-        save_splits(splits, str(splits_path))
+    barrier()
+    splits = load_splits(str(splits_path))
+
+    # `val` is a random permutation slice, so the first N is a deterministic
+    # random sample; keeps the per-epoch rank-0 eval cheap at full scale.
+    val_indices = splits["val"]
+    if args.val_subset and args.val_subset > 0:
+        val_indices = val_indices[:args.val_subset]
 
     train_ds = GenerationDataset(args.direction, args.cache_dir, pairs,
                                  splits["train"],
                                  cfg.model.protein_hidden, cfg.model.text_hidden)
     val_ds = GenerationDataset(args.direction, args.cache_dir, pairs,
-                               splits["val"],
+                               val_indices,
                                cfg.model.protein_hidden, cfg.model.text_hidden)
 
     collate = make_collate(target_tok, cfg.generation.max_target_tokens)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True, collate_fn=collate, drop_last=True,
-                              num_workers=cfg.generation.num_workers)
+    if env.distributed:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=env.world_size, rank=env.rank,
+            shuffle=True, seed=args.seed, drop_last=True,
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  sampler=train_sampler, collate_fn=collate,
+                                  drop_last=True, num_workers=cfg.generation.num_workers)
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  shuffle=True, collate_fn=collate, drop_last=True,
+                                  num_workers=cfg.generation.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size,
                             shuffle=False, collate_fn=collate,
                             num_workers=cfg.generation.num_workers)
     if len(train_loader) == 0:
         raise RuntimeError(
-            f"train_loader has 0 batches (train_size={len(train_ds)}, bs={args.batch_size})"
+            f"train_loader has 0 batches (per-rank train_size≈"
+            f"{len(train_ds)//max(env.world_size,1)}, bs={args.batch_size}). "
+            f"Lower --batch-size or use fewer ranks."
         )
-    print(f"[gen] split sizes: train={len(splits['train'])} val={len(splits['val'])}")
-    print(f"[gen] batches/epoch: train={len(train_loader)} val={len(val_loader)}")
+    if env.is_main:
+        print(f"[gen] split sizes: train={len(splits['train'])} "
+              f"val={len(splits['val'])} (eval on {len(val_indices)})")
+        print(f"[gen] batches/epoch/rank: train={len(train_loader)} val={len(val_loader)}")
+
+    # Data-parallel DDP over the decoder. Many decoder blocks have no cross-attn
+    # adapter and stay frozen, so allow unused params.
+    if env.distributed:
+        ddp_ids = [device.index] if device.type in ("xpu", "cuda") else None
+        decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=True)
+    core = decoder.module if env.distributed else decoder
 
     # 4) Optim
     optim = torch.optim.AdamW(
@@ -273,11 +313,15 @@ def main() -> None:
 
     # 5) Train loop
     ckpt_dir = Path(args.ckpt_dir) / args.direction
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if env.is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    barrier()
 
     global_step = 0
     log = []
     for epoch in range(args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         decoder.train()
         t0 = time.time()
         for it, batch in enumerate(train_loader):
@@ -321,7 +365,7 @@ def main() -> None:
             optim.step()
             global_step += 1
 
-            if (it + 1) % cfg.generation.log_every == 0 or it == 0:
+            if env.is_main and ((it + 1) % cfg.generation.log_every == 0 or it == 0):
                 with torch.no_grad():
                     ppl = torch.exp(loss).item()
                 print(
@@ -331,48 +375,53 @@ def main() -> None:
                 )
 
         dt = time.time() - t0
-        print(f"[{args.direction}] epoch={epoch} done in {dt:.1f}s")
+        if env.is_main:
+            print(f"[{args.direction}] epoch={epoch} done in {dt:.1f}s")
 
-        # Val pass
-        decoder.eval()
-        val_losses = []
-        with torch.no_grad():
-            for batch in val_loader:
-                h = batch["h"].to(device).float()
-                mask = batch["m"].to(device)
-                input_ids = batch["input_ids"].to(device)
-                attn_mask = batch["attn_mask"].to(device)
-                labels = batch["labels"].to(device)
-                if args.direction == "text2protein":
-                    mem = retrieval.text_expand(retrieval.text_proj(h))
-                else:
-                    mem = retrieval.protein_expand(retrieval.protein_proj(h))
-                set_cross_memory(adapters, mem, mask)
-                out = decoder(input_ids=input_ids, attention_mask=attn_mask)
-                clear_cross_memory(adapters)
-                logits = out.logits
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_labels = labels[:, 1:].contiguous()
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-                val_losses.append(loss.item())
-        val_ce = sum(val_losses) / max(len(val_losses), 1)
-        print(f"[val] epoch={epoch} ce={val_ce:.4f} ppl={math.exp(val_ce):.2f}")
-        log.append({"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)})
+        # Val pass + checkpoint on rank 0 only (uses the unwrapped decoder).
+        if env.is_main:
+            core.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    h = batch["h"].to(device).float()
+                    mask = batch["m"].to(device)
+                    input_ids = batch["input_ids"].to(device)
+                    attn_mask = batch["attn_mask"].to(device)
+                    labels = batch["labels"].to(device)
+                    if args.direction == "text2protein":
+                        mem = retrieval.text_expand(retrieval.text_proj(h))
+                    else:
+                        mem = retrieval.protein_expand(retrieval.protein_proj(h))
+                    set_cross_memory(adapters, mem, mask)
+                    out = core(input_ids=input_ids, attention_mask=attn_mask)
+                    clear_cross_memory(adapters)
+                    logits = out.logits
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                    val_losses.append(loss.item())
+            val_ce = sum(val_losses) / max(len(val_losses), 1)
+            print(f"[val] epoch={epoch} ce={val_ce:.4f} ppl={math.exp(val_ce):.2f}")
+            log.append({"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)})
 
-        # Save adapter-only checkpoint (frozen base weights stay on disk)
-        adapter_state = {k: v for k, v in decoder.state_dict().items()
-                         if "lora_" in k or "cross_attn" in k}
-        path = ckpt_dir / f"epoch{epoch:02d}.pt"
-        torch.save({"epoch": epoch, "adapter_state": adapter_state}, path)
-        print(f"[ckpt] saved {path}")
+            # Save adapter-only checkpoint (frozen base weights stay on disk)
+            adapter_state = {k: v for k, v in core.state_dict().items()
+                             if "lora_" in k or "cross_attn" in k}
+            path = ckpt_dir / f"epoch{epoch:02d}.pt"
+            torch.save({"epoch": epoch, "adapter_state": adapter_state}, path)
+            print(f"[ckpt] saved {path}")
+        barrier()
 
-    with open(ckpt_dir / "train_log.json", "w") as f:
-        json.dump(log, f, indent=2)
-    print("[gen] done")
+    if env.is_main:
+        with open(ckpt_dir / "train_log.json", "w") as f:
+            json.dump(log, f, indent=2)
+        print("[gen] done")
+    cleanup()
 
 
 if __name__ == "__main__":

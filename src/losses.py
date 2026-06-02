@@ -186,6 +186,73 @@ def phase_r1_loss(
     }
 
 
+def phase_r2_loss_grouped(
+    out: dict,
+    h_p: torch.Tensor,
+    h_t: torch.Tensor,
+    mask_p: torch.Tensor,
+    mask_t: torch.Tensor,
+    logit_scale: torch.Tensor,
+    *,
+    z_p_all: torch.Tensor,        # [G, L_p, D] gathered across the subgroup
+    z_t_all: torch.Tensor,        # [G, L_t, D]
+    mask_p_all: torch.Tensor,     # [G, L_p]
+    mask_t_all: torch.Tensor,     # [G, L_t]
+    local_offset: int,            # row index of this rank's first sample within [0, G)
+    align_aux_weight: float,
+    recon_weight: float,
+    chunk_rows: int = 0,
+) -> dict:
+    """Distributed Phase-R2 InfoNCE over a bounded subgroup of negatives.
+
+    Each rank scores its *local* anchors (B rows) against the *gathered* group
+    columns (G = group_size * B). Targets are the local anchors' positions
+    inside the gathered batch (`local_offset .. local_offset+B`). Only the
+    local slice of `z_*_all` carries gradient (see `dist.grouped_all_gather`),
+    so this is the standard gather-with-grad contrastive loss — no double count.
+    """
+    z_p, z_t = out["z_p"], out["z_t"]
+    h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]
+    B = z_p.size(0)
+    scale = logit_scale.exp()
+
+    builder = (lambda a, b, ma, mb: filip_score_matrix_chunked(a, b, ma, mb, chunk_rows)) \
+        if chunk_rows > 0 else filip_score_matrix
+
+    # p->t: [B_local, G] ; t->p: [B_local, G] (built as [G, B_local] then transposed)
+    mat_p2t = builder(z_p, z_t_all, mask_p, mask_t_all)            # [B, G]
+    mat_t2p = builder(z_p_all, z_t, mask_p_all, mask_t).t()        # [B, G]
+
+    target = torch.arange(B, device=z_p.device) + local_offset
+    loss_pt = F.cross_entropy(scale * mat_p2t, target)
+    loss_tp = F.cross_entropy(scale * mat_t2p, target)
+    l_nce = 0.5 * (loss_pt + loss_tp)
+
+    with torch.no_grad():
+        acc_pt = (mat_p2t.argmax(dim=-1) == target).float().mean()
+        acc_tp = (mat_t2p.argmax(dim=-1) == target).float().mean()
+        acc = 0.5 * (acc_pt + acc_tp)
+        # positive-pair score = diagonal entries at the local offset
+        filip_pos = mat_p2t.gather(1, target[:, None]).mean()
+
+    l_align = 1.0 - filip_pos
+    l_recon = 0.5 * (
+        reconstruction_loss(h_p_hat, h_p, mask_p)
+        + reconstruction_loss(h_t_hat, h_t, mask_t)
+    )
+
+    total = l_nce + align_aux_weight * l_align + recon_weight * l_recon
+    return {
+        "loss": total,
+        "align": l_align,
+        "unif": torch.zeros((), device=z_p.device),
+        "recon": l_recon,
+        "nce": l_nce,
+        "acc": acc,
+        "filip_pos": filip_pos,
+    }
+
+
 def phase_r2_loss(
     out: dict,
     h_p: torch.Tensor,

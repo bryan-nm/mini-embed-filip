@@ -22,6 +22,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -40,8 +42,9 @@ from src.data import (
     fingerprint_matches,
     cache_fingerprint,
 )
+from src.dist import init_distributed, barrier, cleanup, grouped_all_gather
 from src.evaluate import evaluate_split
-from src.losses import phase_r1_loss, phase_r2_loss
+from src.losses import phase_r1_loss, phase_r2_loss_grouped
 from src.model import MiniEmbedFilip
 
 
@@ -74,7 +77,7 @@ def cosine_warmup_lr(step: int, total: int, warmup: int, base: float) -> float:
 # ---------------------------------------------------------------------------
 # Build data loaders
 # ---------------------------------------------------------------------------
-def build_loaders(cfg: Cfg, splits_path: Path, pairs=None):
+def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int = 0):
     if cfg.retrieval.use_cache:
         # Validate cache fingerprint
         expected = cache_fingerprint(
@@ -91,25 +94,41 @@ def build_loaders(cfg: Cfg, splits_path: Path, pairs=None):
             )
         with open(Path(cfg.retrieval.cache_dir) / "pair_ids.json") as f:
             n = len(json.load(f))
-        print(f"[train] cache at {cfg.retrieval.cache_dir}; n={n}")
+        if env.is_main:
+            print(f"[train] cache at {cfg.retrieval.cache_dir}; n={n}")
     else:
         if pairs is None:
             raise RuntimeError("pairs required when use_cache=False")
         n = len(pairs)
-        print(f"[train] live mode; n={n}")
+        if env.is_main:
+            print(f"[train] live mode; n={n}")
 
-    if splits_path.exists():
-        splits = load_splits(str(splits_path))
-        if not splits_are_valid(splits, n, cfg.data.seed, cfg.data.splits):
-            print(f"[train] splits at {splits_path} stale; rebuilding")
+    # Only rank 0 creates/repairs the splits file; everyone else reads it after
+    # a barrier (avoids a write race across ranks).
+    if env.is_main:
+        if splits_path.exists():
+            splits = load_splits(str(splits_path))
+            if not splits_are_valid(splits, n, cfg.data.seed, cfg.data.splits):
+                print(f"[train] splits at {splits_path} stale; rebuilding")
+                splits = make_splits(n, cfg.data.splits, cfg.data.seed)
+                save_splits(splits, str(splits_path))
+        else:
             splits = make_splits(n, cfg.data.splits, cfg.data.seed)
             save_splits(splits, str(splits_path))
-    else:
-        splits = make_splits(n, cfg.data.splits, cfg.data.seed)
-        save_splits(splits, str(splits_path))
+    barrier()
+    splits = load_splits(str(splits_path))
 
-    print(f"[train] split sizes: train={len(splits['train'])} "
-          f"val={len(splits['val'])} test={len(splits['test'])}")
+    # Subsample validation: `val` is already a random permutation slice, so the
+    # first N is a deterministic random sample. Keeps the per-epoch rank-0 eval
+    # cheap on the full-scale dataset. val_subset<=0 means use the whole split.
+    val_indices = splits["val"]
+    if val_subset and val_subset > 0:
+        val_indices = val_indices[:val_subset]
+
+    if env.is_main:
+        print(f"[train] split sizes: train={len(splits['train'])} "
+              f"val={len(splits['val'])} (eval on {len(val_indices)}) "
+              f"test={len(splits['test'])}")
 
     if cfg.retrieval.use_cache:
         train_ds = PackedPerTokenDataset(
@@ -117,32 +136,48 @@ def build_loaders(cfg: Cfg, splits_path: Path, pairs=None):
             cfg.model.protein_hidden, cfg.model.text_hidden,
         )
         val_ds = PackedPerTokenDataset(
-            cfg.retrieval.cache_dir, splits["val"],
+            cfg.retrieval.cache_dir, val_indices,
             cfg.model.protein_hidden, cfg.model.text_hidden,
         )
         collate = packed_collate
         bs = cfg.retrieval.batch_size
     else:
         train_ds = RawPairsDataset(pairs, splits["train"])
-        val_ds = RawPairsDataset(pairs, splits["val"])
+        val_ds = RawPairsDataset(pairs, val_indices)
         collate = raw_collate
         bs = cfg.retrieval.live_batch_size
 
-    drop_last = len(train_ds) >= 2 * bs
-    train_loader = DataLoader(
-        train_ds, batch_size=bs, shuffle=True,
-        num_workers=cfg.retrieval.num_workers, collate_fn=collate, drop_last=drop_last,
-    )
+    # Distributed: shard the train set across ranks. drop_last keeps a constant
+    # per-rank batch size B, which the grouped all-gather (fixed-shape gather)
+    # depends on. Validation runs on rank 0 only (unsharded loader).
+    if env.distributed:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=env.world_size, rank=env.rank,
+            shuffle=True, seed=cfg.data.seed, drop_last=True,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=bs, sampler=train_sampler,
+            num_workers=cfg.retrieval.num_workers, collate_fn=collate, drop_last=True,
+        )
+    else:
+        train_sampler = None
+        train_loader = DataLoader(
+            train_ds, batch_size=bs, shuffle=True,
+            num_workers=cfg.retrieval.num_workers, collate_fn=collate,
+            drop_last=len(train_ds) >= 2 * bs,
+        )
     val_loader = DataLoader(
         val_ds, batch_size=bs, shuffle=False,
         num_workers=cfg.retrieval.num_workers, collate_fn=collate,
     )
     if len(train_loader) == 0:
         raise RuntimeError(
-            f"train_loader has 0 batches (train_size={len(train_ds)}, bs={bs})"
+            f"train_loader has 0 batches (per-rank train_size≈{len(train_ds)//max(env.world_size,1)}, "
+            f"bs={bs}). Lower --batch-size or use fewer ranks."
         )
-    print(f"[train] batches/epoch: train={len(train_loader)} val={len(val_loader)} bs={bs}")
-    return train_loader, val_loader
+    if env.is_main:
+        print(f"[train] batches/epoch/rank: train={len(train_loader)} val={len(val_loader)} bs={bs}")
+    return train_loader, val_loader, train_sampler
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +218,12 @@ def main() -> None:
     ap.add_argument("--phase2-epochs", type=int, default=cfg.retrieval.phase2_epochs)
     ap.add_argument("--lr", type=float, default=cfg.retrieval.lr)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
+    ap.add_argument("--group-size", type=int, default=16,
+                    help="ranks per contrastive subgroup; global negatives = group_size*batch_size")
+    ap.add_argument("--filip-chunk-rows", type=int, default=0,
+                    help=">0 chunks the FILIP score matrix over the protein axis to cap memory")
+    ap.add_argument("--val-subset", type=int, default=1000,
+                    help="evaluate on the first N val pairs each epoch (0 = full val split)")
     args = ap.parse_args()
 
     cfg.retrieval.use_cache = args.use_cache
@@ -200,11 +241,16 @@ def main() -> None:
             cfg.retrieval.live_batch_size = args.batch_size
 
     torch.manual_seed(cfg.data.seed)
-    device = pick_device(args.device)
-    print(f"[train] device={device}  use_cache={cfg.retrieval.use_cache}")
+    env = init_distributed(args.device, group_size=args.group_size)
+    device = env.device
+    if env.is_main:
+        print(f"[train] world_size={env.world_size} group_size={env.group_size} "
+              f"device={device} use_cache={cfg.retrieval.use_cache}")
 
     ckpt_dir = Path(cfg.retrieval.ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if env.is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    barrier()
     splits_dir = Path(cfg.retrieval.cache_dir) if cfg.retrieval.use_cache else Path("data")
     splits_dir.mkdir(parents=True, exist_ok=True)
     splits_path = splits_dir / "splits.json"
@@ -225,7 +271,8 @@ def main() -> None:
         prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
         encoders = (text_model, text_tok, prot_model, prot_tok)
 
-    train_loader, val_loader = build_loaders(cfg, splits_path, pairs=pairs)
+    train_loader, val_loader, train_sampler = build_loaders(
+        cfg, splits_path, env, pairs=pairs, val_subset=args.val_subset)
 
     model = MiniEmbedFilip(
         text_hidden=cfg.model.text_hidden,
@@ -240,8 +287,15 @@ def main() -> None:
         init_temperature=cfg.retrieval.init_temperature,
         max_temperature=cfg.retrieval.max_temperature,
     ).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[train] trainable params: {n_params:,}")
+    if env.is_main:
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[train] trainable params: {n_params:,}")
+
+    if env.distributed:
+        ddp_ids = [device.index] if device.type in ("xpu", "cuda") else None
+        # logit_scale is unused in Phase R1, so allow unused params.
+        model = DDP(model, device_ids=ddp_ids, find_unused_parameters=True)
+    core = model.module if env.distributed else model
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.retrieval.lr,
@@ -257,6 +311,8 @@ def main() -> None:
     for epoch in range(total_epochs):
         in_phase1 = epoch < cfg.retrieval.phase1_epochs
         phase_name = "R1-warm" if in_phase1 else "R2-NCE"
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         t0 = time.time()
         for it, batch in enumerate(train_loader):
@@ -276,20 +332,32 @@ def main() -> None:
                         recon_weight=cfg.retrieval.recon_weight,
                     )
                 else:
-                    losses = phase_r2_loss(
-                        out, h_p, h_t, mask_p, mask_t, model.logit_scale,
+                    # Bounded contrastive negatives: gather z/masks within the
+                    # subgroup (local slice keeps grad). When not distributed
+                    # this reduces to standard in-batch InfoNCE over B.
+                    z_p_all = grouped_all_gather(out["z_p"], env)
+                    z_t_all = grouped_all_gather(out["z_t"], env)
+                    mp_all = grouped_all_gather(mask_p.to(out["z_p"].dtype), env) > 0.5
+                    mt_all = grouped_all_gather(mask_t.to(out["z_t"].dtype), env) > 0.5
+                    local_offset = env.group_rank * out["z_p"].size(0)
+                    losses = phase_r2_loss_grouped(
+                        out, h_p, h_t, mask_p, mask_t, core.logit_scale,
+                        z_p_all=z_p_all, z_t_all=z_t_all,
+                        mask_p_all=mp_all, mask_t_all=mt_all,
+                        local_offset=local_offset,
                         align_aux_weight=cfg.retrieval.align_aux_weight,
                         recon_weight=cfg.retrieval.recon_weight,
+                        chunk_rows=args.filip_chunk_rows,
                     )
 
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.retrieval.grad_clip)
             optimizer.step()
-            model.clamp_temperature()
+            core.clamp_temperature()
             global_step += 1
 
-            if (it + 1) % cfg.retrieval.log_every == 0 or it == 0:
-                tau = 1.0 / model.logit_scale.exp().item()
+            if env.is_main and ((it + 1) % cfg.retrieval.log_every == 0 or it == 0):
+                tau = 1.0 / core.logit_scale.exp().item()
                 print(
                     f"[{phase_name}] epoch={epoch} step={it+1}/{steps_per_epoch} "
                     f"lr={lr:.2e} loss={losses['loss'].item():.4f} "
@@ -304,26 +372,32 @@ def main() -> None:
                 )
 
         dt = time.time() - t0
-        print(f"[{phase_name}] epoch={epoch} done in {dt:.1f}s")
+        if env.is_main:
+            print(f"[{phase_name}] epoch={epoch} done in {dt:.1f}s")
 
-        if cfg.retrieval.eval_every_epoch:
-            metrics = evaluate_split(
-                model, val_loader, device, encoders,
-                cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
-            )
-            short = {k: round(v, 4) for k, v in metrics.items()
-                     if k in ("R@1", "R@5", "R@10", "gap_l2",
-                              "mean_cross_token_cos", "uniformity_p_tokens")}
-            print(f"[val] epoch={epoch}  {short}")
-            log.append({"epoch": epoch, "phase": phase_name, **metrics})
+        # Evaluation + checkpointing on rank 0 only (uses the unwrapped model).
+        if env.is_main:
+            if cfg.retrieval.eval_every_epoch:
+                metrics = evaluate_split(
+                    core, val_loader, device, encoders,
+                    cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
+                )
+                short = {k: round(v, 4) for k, v in metrics.items()
+                         if k in ("R@1", "R@5", "R@10", "gap_l2",
+                                  "mean_cross_token_cos", "uniformity_p_tokens")}
+                print(f"[val] epoch={epoch}  {short}")
+                log.append({"epoch": epoch, "phase": phase_name, **metrics})
 
-        ckpt = ckpt_dir / f"epoch{epoch:02d}.pt"
-        torch.save({"epoch": epoch, "model_state": model.state_dict()}, ckpt)
-        print(f"[ckpt] saved {ckpt}")
+            ckpt = ckpt_dir / f"epoch{epoch:02d}.pt"
+            torch.save({"epoch": epoch, "model_state": core.state_dict()}, ckpt)
+            print(f"[ckpt] saved {ckpt}")
+        barrier()
 
-    with open(ckpt_dir / "train_log.json", "w") as f:
-        json.dump(log, f, indent=2)
-    print("[train] done")
+    if env.is_main:
+        with open(ckpt_dir / "train_log.json", "w") as f:
+            json.dump(log, f, indent=2)
+        print("[train] done")
+    cleanup()
 
 
 if __name__ == "__main__":

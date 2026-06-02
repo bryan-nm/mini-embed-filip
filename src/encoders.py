@@ -93,14 +93,30 @@ def _text_valid_mask(input_ids: torch.Tensor, attention_mask: torch.Tensor,
     return valid & ~spec
 
 
+def text_encoder_max_len(model) -> int:
+    """The hard architectural limit on input length for this text encoder.
+
+    BERT-family models cap at config.max_position_embeddings; long-context
+    variants (Longformer, BigBird, etc.) advertise their own cap. We respect
+    whichever is smaller: the model's cap or the caller's requested max_len.
+    """
+    return int(getattr(model.config, "max_position_embeddings", 512))
+
+
 @torch.no_grad()
 def encode_text_batch(
     model, tokenizer, texts: List[str], device: torch.device,
     max_len: int, mask_specials: bool = True,
 ):
-    """Returns (h_t, valid_mask) where h_t is [B, L, 768] and mask is [B, L]."""
+    """Returns (h_t, valid_mask) where h_t is [B, L, 768] and mask is [B, L].
+
+    `max_len` is silently capped at the model's max_position_embeddings —
+    BioLinkBERT-base cannot index past 512 tokens regardless of what the
+    config requests. Swap to a long-context text encoder if you need more.
+    """
+    effective_max = min(max_len, text_encoder_max_len(model))
     enc = tokenizer(
-        texts, padding=True, truncation=True, max_length=max_len,
+        texts, padding=True, truncation=True, max_length=effective_max,
         return_tensors="pt",
     ).to(device)
     out = model(**enc)
