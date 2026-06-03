@@ -257,7 +257,9 @@ def main() -> None:
         merge_shards(args, cfg)
         return
 
-    env = init_distributed(args.device, group_size=1)
+    # Precompute is embarrassingly parallel: no collectives beyond a barrier,
+    # so skip the oneCCL process group and rely on the MPI barrier.
+    env = init_distributed(args.device, group_size=1, init_pg=False)
     encode_shard(args, cfg, env)
     barrier()
     if not args.encode_only and env.is_main:

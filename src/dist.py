@@ -62,6 +62,25 @@ class DistEnv:
 
 
 def _detect_topology() -> tuple[int, int, int]:
+    """Return (rank, world_size, local_rank).
+
+    Ask MPI directly first — this is ground truth under `mpiexec` and immune to
+    launcher env-var naming differences (the env-var path silently returned
+    world=1 on Aurora MPICH, making every rank encode the whole dataset). Local
+    rank comes from a shared-memory communicator split, so it's correct even
+    when no *_LOCAL_RANK* env var is exported.
+    """
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        world = comm.Get_size()
+        if world > 1:
+            rank = comm.Get_rank()
+            local = comm.Split_type(MPI.COMM_TYPE_SHARED).Get_rank()
+            return rank, world, local
+    except Exception:
+        pass
+    # Fallback: launcher environment variables (covers non-MPI / other stacks).
     world = _first_env("PALS_NRANKS", "PMI_SIZE", "WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", default=1)
     rank = _first_env("PALS_RANKID", "PMI_RANK", "RANK", "OMPI_COMM_WORLD_RANK", default=0)
     local = _first_env(
@@ -87,12 +106,16 @@ def _pick_local_device(local_rank: int, device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def init_distributed(device_name: str = "auto", group_size: int = 1) -> DistEnv:
+def init_distributed(device_name: str = "auto", group_size: int = 1, init_pg: bool = True) -> DistEnv:
     """Initialise the process group (if launched under MPI) and pin the tile.
 
     `group_size` > 1 additionally builds contiguous rank subgroups of that size
     and records this rank's subgroup, used by `grouped_all_gather` for the
     bounded FILIP negative pool.
+
+    `init_pg=False` skips the torch (oneCCL) process group entirely: useful for
+    embarrassingly-parallel jobs (precompute) that only need rank/world for
+    sharding plus an MPI barrier — no collective backend required.
     """
     rank, world, local = _detect_topology()
     device = _pick_local_device(local, device_name)
@@ -100,6 +123,12 @@ def init_distributed(device_name: str = "auto", group_size: int = 1) -> DistEnv:
     if world <= 1:
         return DistEnv(rank=0, world_size=1, local_rank=0, device=device,
                        backend="none", group_size=1, group_rank=0)
+    if not init_pg:
+        if rank == 0:
+            print(f"[dist] world={world} ranks, no process group (MPI barrier only); "
+                  f"rank0 device={device}", flush=True)
+        return DistEnv(rank=rank, world_size=world, local_rank=local, device=device,
+                       backend="mpi", group_size=1, group_rank=0)
 
     # env:// rendezvous; MASTER_ADDR/PORT come from the launch script.
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -113,7 +142,9 @@ def init_distributed(device_name: str = "auto", group_size: int = 1) -> DistEnv:
         torch.distributed.init_process_group(
             backend=backend, init_method="env://", world_size=world, rank=rank
         )
-
+    if rank == 0:
+        print(f"[dist] process group up: backend={backend} world={world} "
+              f"group_size={group_size} rank0 device={device}", flush=True)
     env = DistEnv(rank=rank, world_size=world, local_rank=local, device=device,
                   backend=backend, group_size=max(group_size, 1))
 
@@ -133,8 +164,18 @@ def init_distributed(device_name: str = "auto", group_size: int = 1) -> DistEnv:
 
 
 def barrier() -> None:
+    """Cross-rank barrier. Uses the torch process group if up, else falls back
+    to an MPI barrier (so precompute, which runs without a process group, still
+    gets a real barrier between the encode and merge phases)."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
+        return
+    try:
+        from mpi4py import MPI
+        if MPI.Is_initialized() and MPI.COMM_WORLD.Get_size() > 1:
+            MPI.COMM_WORLD.Barrier()
+    except Exception:
+        pass
 
 
 def cleanup() -> None:
