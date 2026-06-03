@@ -33,6 +33,35 @@ except Exception:
     pass
 
 
+def _resolve_xpu_backend() -> str:
+    """Pick the distributed backend for Intel XPU.
+
+    Recent PyTorch (>=2.6, which the Aurora `frameworks` module ships) registers
+    a native `xccl` backend built on oneCCL — no external bindings needed. Older
+    stacks used `ccl` via the `oneccl_bindings_for_pytorch` (torch-ccl) package,
+    which must be imported to register itself. Prefer `xccl`, fall back to `ccl`.
+    Override with FILIP_DIST_BACKEND if the autopick is wrong on a given build.
+    """
+    override = os.environ.get("FILIP_DIST_BACKEND")
+    if override:
+        if override == "ccl":
+            try:
+                import oneccl_bindings_for_pytorch  # noqa: F401
+            except Exception:
+                pass
+        return override
+    try:
+        if getattr(torch.distributed, "is_xccl_available", lambda: False)():
+            return "xccl"
+    except Exception:
+        pass
+    try:
+        import oneccl_bindings_for_pytorch  # noqa: F401
+        return "ccl"
+    except Exception:
+        return "xccl"
+
+
 def _first_env(*names: str, default: int = 0) -> int:
     for n in names:
         v = os.environ.get(n)
@@ -137,11 +166,24 @@ def init_distributed(device_name: str = "auto", group_size: int = 1, init_pg: bo
     os.environ["WORLD_SIZE"] = str(world)
     os.environ["LOCAL_RANK"] = str(local)
 
-    backend = "ccl" if device.type == "xpu" else ("nccl" if device.type == "cuda" else "gloo")
+    if device.type == "xpu":
+        backend = _resolve_xpu_backend()
+    elif device.type == "cuda":
+        backend = "nccl"
+    else:
+        backend = "gloo"
     if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(
-            backend=backend, init_method="env://", world_size=world, rank=rank
-        )
+        # Newer torch accepts device_id to bind the PG to this rank's device and
+        # silence the "device capability unknown" warning; fall back if absent.
+        try:
+            torch.distributed.init_process_group(
+                backend=backend, init_method="env://", world_size=world, rank=rank,
+                device_id=device if device.type in ("xpu", "cuda") else None,
+            )
+        except TypeError:
+            torch.distributed.init_process_group(
+                backend=backend, init_method="env://", world_size=world, rank=rank,
+            )
     if rank == 0:
         print(f"[dist] process group up: backend={backend} world={world} "
               f"group_size={group_size} rank0 device={device}", flush=True)
