@@ -226,6 +226,13 @@ def main() -> None:
                     help=">0 chunks the FILIP score matrix over the protein axis to cap memory")
     ap.add_argument("--val-subset", type=int, default=1000,
                     help="evaluate on the first N val pairs each epoch (0 = full val split)")
+    ap.add_argument("--phase1-uniformity-weight", type=float,
+                    default=cfg.retrieval.phase1_uniformity_weight,
+                    help="R1 token-spread weight; raise toward 0.3 if R1 collapses")
+    ap.add_argument("--align-aux-weight", type=float, default=cfg.retrieval.align_aux_weight,
+                    help="R2 positive-pair maintenance weight")
+    ap.add_argument("--recon-weight", type=float, default=cfg.retrieval.recon_weight,
+                    help="autoencoder reconstruction weight (both phases)")
     args = ap.parse_args()
 
     cfg.retrieval.use_cache = args.use_cache
@@ -235,6 +242,9 @@ def main() -> None:
     cfg.retrieval.phase1_epochs = args.phase1_epochs
     cfg.retrieval.phase2_epochs = args.phase2_epochs
     cfg.retrieval.lr = args.lr
+    cfg.retrieval.phase1_uniformity_weight = args.phase1_uniformity_weight
+    cfg.retrieval.align_aux_weight = args.align_aux_weight
+    cfg.retrieval.recon_weight = args.recon_weight
     cfg.data.seed = args.seed
     if args.batch_size is not None:
         if cfg.retrieval.use_cache:
