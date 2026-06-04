@@ -22,7 +22,6 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,7 +41,10 @@ from src.data import (
     fingerprint_matches,
     cache_fingerprint,
 )
-from src.dist import init_distributed, barrier, cleanup, grouped_all_gather
+from src.dist import (
+    init_distributed, barrier, cleanup, grouped_all_gather,
+    broadcast_parameters, average_gradients,
+)
 from src.evaluate import evaluate_split
 from src.losses import phase_r1_loss, phase_r2_loss_grouped
 from src.model import MiniEmbedFilip
@@ -291,11 +293,13 @@ def main() -> None:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[train] trainable params: {n_params:,}")
 
+    # NOTE: the retrieval model is NOT wrapped in DDP. Its contrastive loss uses
+    # logit_scale and subgroup-gathered embeddings *outside* the module forward,
+    # which DDP's reducer mishandles ("logit_scale marked ready twice"). Instead
+    # we broadcast initial weights and average gradients manually each step.
+    core = model
     if env.distributed:
-        ddp_ids = [device.index] if device.type in ("xpu", "cuda") else None
-        # logit_scale is unused in Phase R1, so allow unused params.
-        model = DDP(model, device_ids=ddp_ids, find_unused_parameters=True)
-    core = model.module if env.distributed else model
+        broadcast_parameters(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.retrieval.lr,
@@ -351,6 +355,7 @@ def main() -> None:
                     )
 
             losses["loss"].backward()
+            average_gradients(model)            # manual data-parallel sync
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.retrieval.grad_clip)
             optimizer.step()
             core.clamp_temperature()

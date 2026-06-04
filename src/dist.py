@@ -226,6 +226,35 @@ def cleanup() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Manual data-parallel (used where DDP's reducer can't trace the graph).
+# ---------------------------------------------------------------------------
+def broadcast_parameters(model, src: int = 0) -> None:
+    """Make every rank start from rank `src`'s weights."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    for p in model.parameters():
+        torch.distributed.broadcast(p.data, src=src)
+
+
+def average_gradients(model) -> None:
+    """Average gradients across the full world after backward, before step.
+
+    Used instead of DDP for the retrieval model: its contrastive loss consumes
+    `logit_scale` and the subgroup-gathered embeddings *outside* the module's
+    forward, which DDP's reducer can't track (it double-marks `logit_scale`).
+    The set of params receiving a grad is identical across ranks within a step
+    (phase-consistent), so iterating in parameter order stays collective-safe.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    world = torch.distributed.get_world_size()
+    for p in model.parameters():
+        if p.grad is not None:
+            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
+            p.grad /= world
+
+
+# ---------------------------------------------------------------------------
 # Grouped all-gather of variable-length per-token tensors (with gradient on
 # the local slice, open_clip style).
 # ---------------------------------------------------------------------------
