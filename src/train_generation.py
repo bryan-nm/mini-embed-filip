@@ -223,9 +223,22 @@ def main() -> None:
         target_self_attn=cfg.generation.lora_targets_self_attn,
         target_ffn=cfg.generation.lora_targets_ffn,
     )
-    decoder, target_tok, adapters = load_decoder_with_cross_attn(
-        args.direction, decoder_path, args.cross_attn_every, mem_dim, lora_cfg, device,
-    )
+    # trust_remote_code (ProGen2) compiles the custom modeling file into a
+    # *shared* transformers_modules cache. If all ranks do this at once they
+    # race on the write and some import a half-defined module ("has no attribute
+    # ProGenForCausalLM"). Rank 0 populates the cache first; the barrier then
+    # releases the others to import it read-only (concurrent reads are safe).
+    def _load_decoder():
+        return load_decoder_with_cross_attn(
+            args.direction, decoder_path, args.cross_attn_every, mem_dim, lora_cfg, device,
+        )
+
+    decoder = target_tok = adapters = None
+    if env.is_main:
+        decoder, target_tok, adapters = _load_decoder()
+    barrier()
+    if not env.is_main:
+        decoder, target_tok, adapters = _load_decoder()
     if env.is_main:
         n_train = count_trainable(decoder)
         print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
