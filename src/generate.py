@@ -112,11 +112,11 @@ def main() -> None:
         rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
         dropout=cfg.generation.lora_dropout,
     )
-    decoder, target_tok, adapters = load_decoder_with_cross_attn(
-        args.direction, decoder_path, cfg.generation.cross_attn_every,
-        mem_dim, lora_cfg, device,
-    )
     ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
+    cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
+    decoder, target_tok, adapters = load_decoder_with_cross_attn(
+        args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
+    )
     decoder.load_state_dict(ckpt["adapter_state"], strict=False)
     decoder.eval()
 

@@ -53,6 +53,7 @@ from src.decoder_adapters import (
     count_trainable,
     load_decoder_with_cross_attn,
     set_cross_memory,
+    unfreeze_top_blocks,
 )
 from src.model import MiniEmbedFilip
 
@@ -190,6 +191,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=cfg.generation.epochs)
     ap.add_argument("--lr", type=float, default=cfg.generation.lr)
     ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every)
+    ap.add_argument("--unfreeze-top", type=int, default=0,
+                    help="fully fine-tune the top N decoder blocks (0 = adapters/LoRA only)")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -239,6 +242,13 @@ def main() -> None:
     barrier()
     if not env.is_main:
         decoder, target_tok, adapters = _load_decoder()
+
+    # Optional partial unfreeze of the top decoder blocks (all ranks, identically,
+    # before DDP captures requires_grad state).
+    n_unfrozen = unfreeze_top_blocks(decoder, args.direction, args.unfreeze_top)
+    if env.is_main and args.unfreeze_top > 0:
+        print(f"[gen] unfroze top {args.unfreeze_top} decoder blocks "
+              f"({n_unfrozen:,} params now trainable)")
     if env.is_main:
         n_train = count_trainable(decoder)
         print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
@@ -422,11 +432,14 @@ def main() -> None:
             print(f"[val] epoch={epoch} ce={val_ce:.4f} ppl={math.exp(val_ce):.2f}")
             log.append({"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)})
 
-            # Save adapter-only checkpoint (frozen base weights stay on disk)
-            adapter_state = {k: v for k, v in core.state_dict().items()
-                             if "lora_" in k or "cross_attn" in k}
+            # Save every trainable tensor (cross-attn + LoRA + any unfrozen
+            # blocks), keyed by requires_grad so partial-unfreeze weights persist.
+            trainable = {n for n, p in core.named_parameters() if p.requires_grad}
+            adapter_state = {k: v for k, v in core.state_dict().items() if k in trainable}
             path = ckpt_dir / f"epoch{epoch:02d}.pt"
-            torch.save({"epoch": epoch, "adapter_state": adapter_state}, path)
+            torch.save({"epoch": epoch, "adapter_state": adapter_state,
+                        "cross_attn_every": args.cross_attn_every,
+                        "unfreeze_top": args.unfreeze_top}, path)
             print(f"[ckpt] saved {path}")
         barrier()
 

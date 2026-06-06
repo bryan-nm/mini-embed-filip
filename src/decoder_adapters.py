@@ -200,6 +200,31 @@ def _freeze(model: nn.Module) -> None:
         p.requires_grad_(False)
 
 
+def unfreeze_top_blocks(model: nn.Module, direction: str, n: int) -> int:
+    """Unfreeze the top `n` decoder transformer blocks in place (full fine-tune
+    of those blocks, on top of the adapters/LoRA). Returns # params unfrozen.
+
+    Gives the decoder real capacity to incorporate the cross-attention memory
+    when small adapters alone can't overcome the frozen prior. Keep `n` small
+    and the LR low to avoid wrecking the pretrained protein/text prior.
+    """
+    if n <= 0:
+        return 0
+    if direction == "text2protein":
+        blocks = list(model.transformer.h)        # ProGen2
+    elif direction == "protein2text":
+        blocks = list(model.biogpt.layers)        # BioGPT
+    else:
+        raise ValueError(direction)
+    n = min(n, len(blocks))
+    count = 0
+    for block in blocks[-n:]:
+        for p in block.parameters():
+            p.requires_grad_(True)
+            count += p.numel()
+    return count
+
+
 def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
                    ) -> List[CrossAttentionAdapter]:
     """Inject cross-attention adapters + LoRA into a ProGen2 model in-place."""

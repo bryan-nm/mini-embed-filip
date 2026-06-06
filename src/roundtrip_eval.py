@@ -112,11 +112,14 @@ def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
             rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
             dropout=cfg.generation.lora_dropout,
         )
+        # Build the decoder with the SAME cross_attn_every the checkpoint was
+        # trained with (stored in the ckpt), so adapter counts line up.
+        ck = torch.load(args.decoder_ckpt, map_location="cpu")
+        cae = ck.get("cross_attn_every", args.cross_attn_every)
         dec, dtok, adapters = load_decoder_with_cross_attn(
-            args.direction, cfg.generation.decoder_path, args.cross_attn_every,
+            args.direction, cfg.generation.decoder_path, cae,
             cfg.model.text_hidden, lora_cfg, device,
         )
-        ck = torch.load(args.decoder_ckpt, map_location="cpu")
         dec.load_state_dict(ck["adapter_state"], strict=False)
         dec.eval()
         if dtok.pad_token is None:
