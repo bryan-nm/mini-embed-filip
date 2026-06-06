@@ -121,6 +121,7 @@ def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
         dec.eval()
         if dtok.pad_token is None:
             dtok.pad_token = dtok.eos_token
+        dtok.padding_side = "left"   # correct for batched decoder generation
         return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters
 
     if env.is_main:
