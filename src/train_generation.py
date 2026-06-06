@@ -36,7 +36,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import default_cfg, Cfg
+from config import default_cfg, Cfg, TEXT_DECODER_PATH
 from src.data import (
     PackedPerTokenCache,
     Pair,
@@ -211,7 +211,7 @@ def main() -> None:
     decoder_path = (
         cfg.generation.decoder_path
         if args.direction == "text2protein"
-        else "/Users/bryan/Documents/models/biogpt"
+        else TEXT_DECODER_PATH
     )
     # Memory dim = encoder hidden dim of the INPUT modality (what the expansion
     # head outputs). For text2protein, input is text -> text_expand -> 768-d.

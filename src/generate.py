@@ -24,7 +24,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import default_cfg
+from config import default_cfg, TEXT_DECODER_PATH
 from src.decoder_adapters import (
     LoRACfg, load_decoder_with_cross_attn,
     set_cross_memory, clear_cross_memory,
@@ -104,7 +104,7 @@ def main() -> None:
         with torch.no_grad():
             z = retrieval.protein_proj(h.float())
             mem = retrieval.protein_expand(z)
-        decoder_path = "/Users/bryan/Documents/models/biogpt"
+        decoder_path = TEXT_DECODER_PATH
         mem_dim = cfg.model.protein_hidden
 
     # Decoder
