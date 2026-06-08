@@ -40,11 +40,10 @@ from config import default_cfg, Cfg, TEXT_DECODER_PATH
 from src.data import (
     PackedPerTokenCache,
     Pair,
+    build_or_load_splits,
+    group_ids_from_accessions,
     load_pairs,
     load_splits,
-    make_splits,
-    save_splits,
-    splits_are_valid,
 )
 from src.dist import init_distributed, barrier, cleanup
 from src.decoder_adapters import (
@@ -115,6 +114,13 @@ def make_collate(target_tokenizer, max_target_tokens: int):
     bos_id = target_tokenizer.bos_token_id
     eos_id = target_tokenizer.eos_token_id
 
+    # We add BOS/EOS explicitly rather than relying on the tokenizer's
+    # `add_special_tokens`: Dayhoff's char tokenizer never adds them (its
+    # build_inputs_with_special_tokens is a no-op), which would leave the model
+    # with no EOS to learn termination and a BOS-mismatch vs inference (which
+    # seeds generation with BOS). Doing it here is uniform across decoders.
+    body_cap = max_target_tokens - (1 if bos_id is not None else 0) - (1 if eos_id is not None else 0)
+
     def collate(batch):
         B = len(batch)
         L_h = max(b["h"].size(0) for b in batch)
@@ -126,16 +132,25 @@ def make_collate(target_tokenizer, max_target_tokens: int):
             h_pad[i, :l] = b["h"]
             m_pad[i, :l] = b["m"]
 
-        # Tokenize targets. Add BOS/EOS, pad to max.
-        tok = target_tokenizer(
-            [b["target"] for b in batch],
-            padding=True, truncation=True, max_length=max_target_tokens,
-            return_tensors="pt",
-        )
-        input_ids = tok["input_ids"]
-        attn_mask = tok["attention_mask"]
+        # Tokenize bodies without specials, then wrap with [BOS] ... [EOS].
+        seqs = []
+        for b in batch:
+            body = target_tokenizer(
+                b["target"], add_special_tokens=False, truncation=True,
+                max_length=body_cap,
+            )["input_ids"]
+            ids = ([bos_id] if bos_id is not None else []) + body + \
+                  ([eos_id] if eos_id is not None else [])
+            seqs.append(ids)
 
-        # Labels = input_ids shifted; positions with pad become -100 (ignored by CE).
+        L = max(len(s) for s in seqs)
+        input_ids = torch.full((B, L), pad_id, dtype=torch.long)
+        attn_mask = torch.zeros(B, L, dtype=torch.long)
+        for i, s in enumerate(seqs):
+            input_ids[i, :len(s)] = torch.tensor(s, dtype=torch.long)
+            attn_mask[i, :len(s)] = 1
+
+        # Labels = input_ids; pad positions become -100 (ignored by CE).
         labels = input_ids.clone()
         labels[attn_mask == 0] = -100
 
@@ -264,17 +279,14 @@ def main() -> None:
         subset_size=args.subset_size,
     )
     splits_path = Path(args.cache_dir) / "splits.json"
-    # Rank 0 owns split creation; everyone reads after a barrier (no write race).
+    # Group-aware (by-accession) split, matching retrieval. Rank 0 owns creation;
+    # everyone reads after a barrier (no write race). Reuses the retrieval split
+    # when the cache's splits.json is already present and valid.
     if env.is_main:
-        if splits_path.exists():
-            splits = load_splits(str(splits_path))
-            if not splits_are_valid(splits, len(pairs), args.seed, cfg.data.splits):
-                print("[gen] splits stale; rebuilding")
-                splits = make_splits(len(pairs), cfg.data.splits, args.seed)
-                save_splits(splits, str(splits_path))
-        else:
-            splits = make_splits(len(pairs), cfg.data.splits, args.seed)
-            save_splits(splits, str(splits_path))
+        group_ids = group_ids_from_accessions([p.uid for p in pairs])
+        splits = build_or_load_splits(
+            str(splits_path), len(pairs), cfg.data.splits, args.seed, group_ids=group_ids)
+        print(f"[gen] splits: {len(pairs)} rows over {splits['n_groups']} proteins")
     barrier()
     splits = load_splits(str(splits_path))
 

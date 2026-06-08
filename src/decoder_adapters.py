@@ -86,13 +86,20 @@ class CrossAttentionAdapter(nn.Module):
         if self.memory is None:
             return hidden_states  # pass-through if no memory is set
 
+        # Run the adapter in its own parameter dtype (fp32) and cast the residual
+        # back to the decoder's dtype. This keeps a bf16-loaded frozen decoder and
+        # an fp32 memory source compatible with fp32 trainable adapters, both
+        # under autocast (training) and without it (generation).
+        in_dtype = hidden_states.dtype
+        w_dtype = self.q_proj.weight.dtype
         B, T, D = hidden_states.shape
-        h = self.ln_q(hidden_states)
+        h = self.ln_q(hidden_states.to(w_dtype))
+        memory = self.memory.to(w_dtype)
 
         # [B, T, D] -> [B, n_heads, T, head_dim]
         q = self.q_proj(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(self.memory).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(self.memory).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(memory).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(memory).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
 
         attn_scores = (q @ k.transpose(-1, -2)) * self.scale          # [B, n_heads, T, L_mem]
         if self.memory_mask is not None:
@@ -103,7 +110,7 @@ class CrossAttentionAdapter(nn.Module):
         attn_weights = self.drop(attn_weights)
         attn_out = attn_weights @ v                                    # [B, n_heads, T, head_dim]
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
-        return hidden_states + self.o_proj(attn_out)
+        return hidden_states + self.o_proj(attn_out).to(in_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +134,12 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.scaling * self.lora_B(self.lora_A(self.drop(x)))
+        base_out = self.base(x)
+        # Low-rank update runs in the LoRA params' dtype (fp32), then casts back —
+        # so an fp32 adapter on a bf16-loaded frozen base stays dtype-consistent.
+        lx = self.drop(x).to(self.lora_A.weight.dtype)
+        lora = self.scaling * self.lora_B(self.lora_A(lx))
+        return base_out + lora.to(base_out.dtype)
 
 
 def _replace_linear_with_lora(module: nn.Module, attr: str,
@@ -200,22 +212,42 @@ def _freeze(model: nn.Module) -> None:
         p.requires_grad_(False)
 
 
+def _decoder_arch(model: nn.Module) -> str:
+    """Identify the decoder family from a loaded model, so injection/unfreezing
+    work regardless of which checkpoint a direction is pointed at."""
+    mt = getattr(getattr(model, "config", None), "model_type", "")
+    if mt == "jamba":
+        return "jamba"
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return "progen"
+    if hasattr(model, "biogpt"):
+        return "biogpt"
+    raise ValueError(f"Unsupported decoder architecture (model_type={mt!r})")
+
+
+def _decoder_blocks(model: nn.Module):
+    """The ordered list of decoder blocks/layers for the model's architecture."""
+    arch = _decoder_arch(model)
+    if arch == "progen":
+        return model.transformer.h            # ProGen2
+    if arch == "biogpt":
+        return model.biogpt.layers            # BioGPT
+    return model.model.layers                 # Jamba (Dayhoff)
+
+
 def unfreeze_top_blocks(model: nn.Module, direction: str, n: int) -> int:
-    """Unfreeze the top `n` decoder transformer blocks in place (full fine-tune
-    of those blocks, on top of the adapters/LoRA). Returns # params unfrozen.
+    """Unfreeze the top `n` decoder blocks in place (full fine-tune of those
+    blocks, on top of the adapters/LoRA). Returns # params unfrozen.
 
     Gives the decoder real capacity to incorporate the cross-attention memory
     when small adapters alone can't overcome the frozen prior. Keep `n` small
     and the LR low to avoid wrecking the pretrained protein/text prior.
+    `direction` is accepted for backward compatibility; the block list is
+    resolved from the model architecture.
     """
     if n <= 0:
         return 0
-    if direction == "text2protein":
-        blocks = list(model.transformer.h)        # ProGen2
-    elif direction == "protein2text":
-        blocks = list(model.biogpt.layers)        # BioGPT
-    else:
-        raise ValueError(direction)
+    blocks = list(_decoder_blocks(model))
     n = min(n, len(blocks))
     count = 0
     for block in blocks[-n:]:
@@ -292,6 +324,96 @@ def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     return adapters
 
 
+# ---------------------------------------------------------------------------
+# Jamba (Dayhoff) injection — via forward hooks
+# ---------------------------------------------------------------------------
+def _make_cross_attn_hook(adapter: CrossAttentionAdapter):
+    """Forward hook that applies the cross-attention residual to a layer output.
+
+    Jamba is used *unwrapped* (not replaced by a module) because JambaModel
+    selects the per-layer attention mask with `isinstance(layer,
+    JambaMambaDecoderLayer)`; wrapping a mamba layer would route the wrong mask
+    to it. A forward hook leaves the layer's class intact. Jamba decoder layers
+    return a bare hidden-state tensor; older/other layers may return a tuple.
+    """
+    def hook(module, inputs, output):
+        if isinstance(output, tuple):
+            return (adapter(output[0]),) + tuple(output[1:])
+        return adapter(output)
+    return hook
+
+
+def _load_protein_tokenizer(path: str):
+    """Load Dayhoff's tokenizer, working around transformers-5.
+
+    The repo ships a custom slow char tokenizer (`ProteinTokenizer`, written for
+    transformers 4.42). transformers 5's `AutoTokenizer` routes it through the
+    fast backend and fails to instantiate, but the class itself works when
+    constructed directly. Try Auto first (so a future model with a normal
+    tokenizer still works), then fall back to importing the repo's
+    `tokenizers.py` (same trust model as trust_remote_code).
+    """
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    except Exception:
+        import importlib.util
+        import os
+        tok_file = os.path.join(path, "tokenizers.py")
+        if not os.path.exists(tok_file):
+            raise
+        spec = importlib.util.spec_from_file_location("_dayhoff_tokenizer", tok_file)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.ProteinTokenizer()
+
+
+def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
+                  ) -> List[CrossAttentionAdapter]:
+    """Inject cross-attention adapters (via hooks) + LoRA into a Jamba model.
+
+    Cross-attention is added after every Nth decoder layer (mamba or attention
+    alike — the adapter only needs the [B, T, hidden] output). LoRA targets the
+    attention layers' self-attn projections and the dense MLP layers; the MoE
+    blocks' fused expert Parameters (not nn.Linear) and the SSM mixers are left
+    frozen.
+    """
+    base = model.model                                   # JambaModel
+    dec_hidden = model.config.hidden_size
+    n_heads = model.config.num_attention_heads
+
+    adapters: List[CrossAttentionAdapter] = []
+    for i, layer in enumerate(base.layers):
+        if i % every != 0:
+            continue
+        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0)
+        layer.register_forward_hook(_make_cross_attn_hook(ca))
+        adapters.append(ca)
+    # Register the adapters on the model so their params are tracked by the
+    # optimizer / state_dict / .to(device). The hooks above hold the same module
+    # objects, so set_cross_memory() reaches them.
+    model.cross_attn_adapters = nn.ModuleList(adapters)
+
+    if lora_cfg.target_self_attn:
+        for layer in base.layers:
+            attn = getattr(layer, "self_attn", None)     # attention layers only
+            if attn is not None:
+                for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    _replace_linear_with_lora(attn, attr, lora_cfg.rank,
+                                              lora_cfg.alpha, lora_cfg.dropout)
+    if lora_cfg.target_ffn:
+        for layer in base.layers:
+            ff = getattr(layer, "feed_forward", None)
+            # Dense MLP layers (gate/up/down Linear) are LoRA-able; MoE blocks
+            # use fused expert Parameter tensors and are left frozen.
+            if ff is not None and hasattr(ff, "gate_proj"):
+                for attr in ("gate_proj", "up_proj", "down_proj"):
+                    _replace_linear_with_lora(ff, attr, lora_cfg.rank,
+                                              lora_cfg.alpha, lora_cfg.dropout)
+
+    return adapters
+
+
 def load_decoder_with_cross_attn(
     direction: str,
     path: str,
@@ -300,10 +422,30 @@ def load_decoder_with_cross_attn(
     lora_cfg: LoRACfg,
     device: torch.device,
 ) -> Tuple[nn.Module, object, List[CrossAttentionAdapter]]:
-    """Load the appropriate decoder, freeze it, inject adapters + LoRA."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load the appropriate decoder, freeze it, inject adapters + LoRA.
 
-    if direction == "text2protein":
+    Dispatch is by architecture (read from the checkpoint's config) first, then
+    by `direction`. This lets a direction be re-pointed at a different model
+    (e.g. text2protein: ProGen2 -> Dayhoff/Jamba) without code changes.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    model_type = getattr(AutoConfig.from_pretrained(path, trust_remote_code=True),
+                         "model_type", "")
+
+    if model_type == "jamba":
+        # Dayhoff-3b: native Jamba (hybrid Mamba/attention MoE), no remote
+        # modeling code. Force the pure-PyTorch SSM path — the fused
+        # mamba-ssm/causal-conv1d CUDA kernels aren't available on Mac/XPU — and
+        # drop router-logits output (we compute CE from logits and never use the
+        # MoE load-balancing aux loss).
+        model = AutoModelForCausalLM.from_pretrained(
+            path, use_mamba_kernels=False, output_router_logits=False,
+            dtype=torch.bfloat16)
+        tokenizer = _load_protein_tokenizer(path)
+        _freeze(model)
+        adapters = _jamba_inject(model, cross_attn_every, mem_dim, lora_cfg)
+    elif direction == "text2protein":
         # ProGen2 — custom code via auto_map
         model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)

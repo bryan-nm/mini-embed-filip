@@ -19,15 +19,28 @@ def retrieval_recall(
     z_p: torch.Tensor, z_t: torch.Tensor,
     mask_p: torch.Tensor, mask_t: torch.Tensor,
     ks=(1, 5, 10), chunk_rows: int = 16,
+    groups: torch.Tensor = None,
 ) -> Dict[str, float]:
-    """Symmetric retrieval R@K over the FILIP score matrix."""
+    """Symmetric retrieval R@K over the FILIP score matrix.
+
+    `groups` (per-row accession id) makes every same-protein candidate a
+    positive, so the augmented corpus's sibling captions in a val batch don't
+    count as distractors. The reported rank is that of the best-scoring
+    positive. Without `groups` this is the diagonal-positive recall.
+    """
     sim = filip_score_matrix_chunked(z_p, z_t, mask_p, mask_t, chunk_rows)
     n = sim.size(0)
     target = torch.arange(n, device=sim.device)
+    same = None if groups is None else (groups[:, None] == groups[None, :])
 
     out: Dict[str, float] = {}
     for direction, mat in (("p2t", sim), ("t2p", sim.t())):
-        ranks = (mat >= mat.gather(1, target.unsqueeze(1))).sum(dim=1)
+        if same is None:
+            ranks = (mat >= mat.gather(1, target.unsqueeze(1))).sum(dim=1)
+        else:
+            neg_inf = torch.finfo(mat.dtype).min
+            best_pos = mat.masked_fill(~same, neg_inf).max(dim=1).values
+            ranks = ((mat > best_pos[:, None]) & ~same).sum(dim=1) + 1
         for k in ks:
             out[f"R@{k}_{direction}"] = (ranks <= k).float().mean().item()
     for k in ks:
@@ -89,12 +102,21 @@ def modality_gap_metrics(
 @torch.no_grad()
 def evaluate_split(model, loader, device: torch.device, encoders=None,
                    max_protein_tokens: int = 1024, max_text_tokens: int = 1024,
-                   filip_chunk_rows: int = 16) -> Dict[str, float]:
-    """Run a full eval pass. Works for both cached and live modes."""
+                   filip_chunk_rows: int = 16,
+                   row_group_ids: torch.Tensor = None) -> Dict[str, float]:
+    """Run a full eval pass. Works for both cached and live modes.
+
+    `row_group_ids` (global row -> accession id) enables accession-grouped
+    recall, so multiple captions of one protein in the val set are scored as
+    positives rather than distractors.
+    """
     model.eval()
     z_ps, z_ts, mps, mts = [], [], [], []
+    idxs = []
 
     for batch in loader:
+        if "idx" in batch:
+            idxs.append(batch["idx"])
         if "h_p" in batch:
             h_p = batch["h_p"].to(device).float()
             h_t = batch["h_t"].to(device).float()
@@ -134,8 +156,13 @@ def evaluate_split(model, loader, device: torch.device, encoders=None,
     z_p, mask_p = _pad_cat(z_ps, mps)
     z_t, mask_t = _pad_cat(z_ts, mts)
 
+    groups = None
+    if row_group_ids is not None and idxs:
+        sel = torch.cat(idxs)                       # global row indices, eval order
+        groups = row_group_ids[sel].to(z_p.device)  # aligned with z_p / z_t rows
+
     metrics: Dict[str, float] = {}
     metrics.update(retrieval_recall(z_p, z_t, mask_p, mask_t,
-                                    chunk_rows=filip_chunk_rows))
+                                    chunk_rows=filip_chunk_rows, groups=groups))
     metrics.update(modality_gap_metrics(z_p, z_t, mask_p, mask_t))
     return metrics

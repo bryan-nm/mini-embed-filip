@@ -10,15 +10,23 @@ order is preserved) and writes per-rank shard files into `<cache>/shards/`.
 A single merge pass then concatenates the shards, in rank order, into the
 final single-file cache the trainers/readers expect.
 
-Final output layout (under cache_dir), identical to the original format:
-  protein_h.bin       bf16, total_protein_tokens × 640
-  protein_offsets.pt  int64 [N+1]
+Protein dedup: the augmented corpus repeats each protein across ~8.87 caption
+rows. The protein modality is encoded + stored once per *unique* protein
+(keyed by accession), the text modality once per CSV row, and a row_protein_idx
+map joins them at read time. This avoids ~9x of the protein encoder pass (the
+precompute bottleneck) and ~1.5 TB of duplicated protein cache.
+
+Final output layout (under cache_dir):
+  protein_h.bin       bf16, total_protein_tokens × 640   (UNIQUE proteins)
+  protein_offsets.pt  int64 [N_unique+1]
   protein_mask.bin    uint8, total_protein_tokens
-  text_h.bin          bf16, total_text_tokens × 768
-  text_offsets.pt     int64 [N+1]
+  protein_ids.json    list of accessions, unique-protein order [N_unique]
+  text_h.bin          bf16, total_text_tokens × 768      (per CSV row)
+  text_offsets.pt     int64 [N_rows+1]
   text_mask.bin       uint8, total_text_tokens
-  pair_ids.json       list of UniProt IDs
-  fingerprint.json    (encoder paths, length caps, special-mask flags)
+  pair_ids.json       list of accessions, one per CSV row [N_rows]
+  row_protein_idx.pt  int64 [N_rows]; CSV row -> unique-protein index
+  fingerprint.json    (format tag, encoder paths, length caps, special-mask flags)
 
 Usage:
   # distributed encode + merge in one job (all ranks encode; rank 0 merges):
@@ -46,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import default_cfg
 from src.data import (
     cache_fingerprint,
+    dedup_proteins,
     load_pairs,
     write_cache_fingerprint,
 )
@@ -73,8 +82,45 @@ def _shard_range(n: int, rank: int, world: int) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Encode one rank's slice -> shard files
+# Encode one modality's slice -> packed shard files (generic over modality)
 # ---------------------------------------------------------------------------
+def _encode_modality(items, ids, start, end, prefix, encode_fn,
+                     shards_dir: Path, tag: str, env, bs: int) -> None:
+    """Encode `items` (list of strings) in batches, writing a packed shard.
+
+    Each row's invalid (masked-out) positions are dropped before packing, so
+    storage matches the FILIP/uniformity valid-token set. Writes
+    <prefix>_h.<tag>.bin, <prefix>_mask.<tag>.bin and <prefix>meta.<tag>.json.
+    """
+    h_fh = open(shards_dir / f"{prefix}_h.{tag}.bin", "wb")
+    mask_fh = open(shards_dir / f"{prefix}_mask.{tag}.bin", "wb")
+    lens: list[int] = []
+    m = len(items)
+    t0 = time.time()
+    last_log = t0
+    for s in range(0, m, bs):
+        e = min(s + bs, m)
+        h, mask = encode_fn(items[s:e])
+        for row in range(h.size(0)):
+            keep = mask[row]
+            h_row = h[row][keep].to(torch.bfloat16)
+            h_fh.write(_bf16_to_uint16_bytes(h_row).tobytes())
+            mask_fh.write(mask[row][keep].cpu().numpy().astype(np.uint8).tobytes())
+            lens.append(int(h_row.size(0)))
+        if env.is_main and (e == m or (time.time() - last_log) > 10.0):
+            rate = e / max(time.time() - t0, 1e-6)
+            print(f"[precompute][rank 0][{prefix}] {e}/{m}  {rate:.1f} items/s "
+                  f"eta={(m-e)/max(rate,1e-6)/60:.1f} min", flush=True)
+            last_log = time.time()
+    h_fh.close()
+    mask_fh.close()
+    with open(shards_dir / f"{prefix}meta.{tag}.json", "w") as f:
+        json.dump({"rank": env.rank, "start": start, "end": end,
+                   "lens": lens, "ids": ids}, f)
+    print(f"[precompute][rank {env.rank}][{prefix}] shard done: {len(ids)} rows, "
+          f"{sum(lens)} tokens", flush=True)
+
+
 def encode_shard(args, cfg, env) -> None:
     device = env.device
     shards_dir = Path(args.shards_dir)
@@ -91,17 +137,17 @@ def encode_shard(args, cfg, env) -> None:
         pfam_col=cfg.data.csv_pfam_col,
         subset_size=args.subset_size,
     )
-    n = len(pairs)
-    start, end = _shard_range(n, env.rank, env.world_size)
-    my_pairs = pairs[start:end]
+    n_rows = len(pairs)
+    # Deterministic, world-wide dedup (first-appearance by accession). Every rank
+    # derives the identical unique-protein ordering from the same pairs list.
+    _, unique_seqs, unique_ids = dedup_proteins(pairs)
+    n_unique = len(unique_seqs)
     if env.is_main:
-        print(f"[precompute] n={n} world={env.world_size} "
-              f"max_text={args.max_text_tokens} max_protein={args.max_protein_tokens}",
-              flush=True)
-    print(f"[precompute][rank {env.rank}] rows [{start},{end}) -> {len(my_pairs)} pairs "
-          f"on {device}", flush=True)
+        print(f"[precompute] n_rows={n_rows} unique_proteins={n_unique} "
+              f"world={env.world_size} max_text={args.max_text_tokens} "
+              f"max_protein={args.max_protein_tokens}", flush=True)
 
-    # Stagger encoder load to avoid 3072 ranks hammering the model files at once.
+    # Stagger encoder load to avoid thousands of ranks hammering the files at once.
     if args.load_stagger > 0 and env.world_size > 1:
         time.sleep((env.local_rank % 12) * args.load_stagger)
     text_model, text_tok = load_text_encoder(cfg.model.text_encoder_path, device)
@@ -109,117 +155,121 @@ def encode_shard(args, cfg, env) -> None:
     barrier()  # everyone past model load before timing the encode
 
     tag = f"{env.rank:05d}"
-    p_h_fh = open(shards_dir / f"protein_h.{tag}.bin", "wb")
-    p_mask_fh = open(shards_dir / f"protein_mask.{tag}.bin", "wb")
-    t_h_fh = open(shards_dir / f"text_h.{tag}.bin", "wb")
-    t_mask_fh = open(shards_dir / f"text_mask.{tag}.bin", "wb")
-
-    p_lens: list[int] = []
-    t_lens: list[int] = []
-    ids: list[str] = []
-
     bs = args.batch_size
-    t0 = time.time()
-    last_log = t0
-    m = len(my_pairs)
-    for s in range(0, m, bs):
-        e = min(s + bs, m)
-        chunk = my_pairs[s:e]
-        ids.extend(c.uid for c in chunk)
 
-        h_t, mask_t = encode_text_batch(
-            text_model, text_tok, [c.text for c in chunk],
-            device, args.max_text_tokens, mask_specials=mask_text_specials,
-        )
-        h_p, mask_p = encode_protein_batch(
-            prot_model, prot_tok, [c.protein for c in chunk],
-            device, args.max_protein_tokens, mask_specials=mask_protein_specials,
-        )
-        for row in range(h_t.size(0)):
-            keep_t = mask_t[row]
-            keep_p = mask_p[row]
-            ht_row = h_t[row][keep_t].to(torch.bfloat16)
-            hp_row = h_p[row][keep_p].to(torch.bfloat16)
-            p_h_fh.write(_bf16_to_uint16_bytes(hp_row).tobytes())
-            t_h_fh.write(_bf16_to_uint16_bytes(ht_row).tobytes())
-            p_mask_fh.write(mask_p[row][keep_p].cpu().numpy().astype(np.uint8).tobytes())
-            t_mask_fh.write(mask_t[row][keep_t].cpu().numpy().astype(np.uint8).tobytes())
-            p_lens.append(int(hp_row.size(0)))
-            t_lens.append(int(ht_row.size(0)))
+    # --- Protein pass: shard over UNIQUE proteins ---
+    p_start, p_end = _shard_range(n_unique, env.rank, env.world_size)
+    print(f"[precompute][rank {env.rank}] proteins [{p_start},{p_end}) "
+          f"-> {p_end - p_start} on {device}", flush=True)
+    _encode_modality(
+        unique_seqs[p_start:p_end], unique_ids[p_start:p_end], p_start, p_end,
+        "protein",
+        lambda batch: encode_protein_batch(
+            prot_model, prot_tok, batch, device, args.max_protein_tokens,
+            mask_specials=mask_protein_specials),
+        shards_dir, tag, env, bs,
+    )
 
-        if env.is_main and (e == m or (time.time() - last_log) > 10.0):
-            rate = e / max(time.time() - t0, 1e-6)
-            print(f"[precompute][rank 0] {e}/{m}  {rate:.1f} pairs/s "
-                  f"eta={ (m-e)/max(rate,1e-6)/60:.1f} min", flush=True)
-            last_log = time.time()
-
-    for fh in (p_h_fh, p_mask_fh, t_h_fh, t_mask_fh):
-        fh.close()
-    with open(shards_dir / f"meta.{tag}.json", "w") as f:
-        json.dump({"rank": env.rank, "start": start, "end": end,
-                   "p_lens": p_lens, "t_lens": t_lens, "ids": ids}, f)
-    print(f"[precompute][rank {env.rank}] shard done: {len(ids)} rows, "
-          f"{sum(p_lens)} p-tokens, {sum(t_lens)} t-tokens", flush=True)
+    # --- Text pass: shard over CSV rows ---
+    t_start, t_end = _shard_range(n_rows, env.rank, env.world_size)
+    print(f"[precompute][rank {env.rank}] text rows [{t_start},{t_end}) "
+          f"-> {t_end - t_start} on {device}", flush=True)
+    _encode_modality(
+        [p.text for p in pairs[t_start:t_end]],
+        [p.uid for p in pairs[t_start:t_end]], t_start, t_end, "text",
+        lambda batch: encode_text_batch(
+            text_model, text_tok, batch, device, args.max_text_tokens,
+            mask_specials=mask_text_specials),
+        shards_dir, tag, env, bs,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Merge all shards (one process) -> final single-file cache
 # ---------------------------------------------------------------------------
-def merge_shards(args, cfg) -> None:
-    shards_dir = Path(args.shards_dir)
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+_MERGE_BUFSIZE = 64 * 1024 * 1024
 
-    metas = sorted(glob.glob(str(shards_dir / "meta.*.json")))
+
+def _copy_into(src: Path, dst) -> None:
+    with open(src, "rb") as fh:
+        while True:
+            b = fh.read(_MERGE_BUFSIZE)
+            if not b:
+                break
+            dst.write(b)
+
+
+def _merge_modality(shards_dir: Path, cache_dir: Path, prefix: str,
+                    expected_total: int):
+    """Concatenate one modality's shards (rank order) -> final cache files.
+
+    Validates that the shards tile [0, expected_total) contiguously. Returns
+    (offsets_tensor [rows+1], ids list).
+    """
+    metas = sorted(glob.glob(str(shards_dir / f"{prefix}meta.*.json")))
     if not metas:
-        raise RuntimeError(f"No shard metadata found in {shards_dir}; run encode first.")
-    print(f"[merge] {len(metas)} shards from {shards_dir}", flush=True)
-
-    p_h_out = open(cache_dir / "protein_h.bin", "wb")
-    p_mask_out = open(cache_dir / "protein_mask.bin", "wb")
-    t_h_out = open(cache_dir / "text_h.bin", "wb")
-    t_mask_out = open(cache_dir / "text_mask.bin", "wb")
-
-    p_offsets = [0]
-    t_offsets = [0]
+        raise RuntimeError(
+            f"No {prefix} shard metadata in {shards_dir}; run encode first.")
+    h_out = open(cache_dir / f"{prefix}_h.bin", "wb")
+    mask_out = open(cache_dir / f"{prefix}_mask.bin", "wb")
+    offsets = [0]
     ids: list[str] = []
     expect_start = 0
-    bufsize = 64 * 1024 * 1024
-
-    def _copy(src: Path, dst):
-        with open(src, "rb") as fh:
-            while True:
-                b = fh.read(bufsize)
-                if not b:
-                    break
-                dst.write(b)
-
     for mp in metas:
         with open(mp) as f:
             meta = json.load(f)
         if meta["start"] != expect_start:
             raise RuntimeError(
-                f"Shard gap/overlap: {mp} starts at {meta['start']}, expected "
-                f"{expect_start}. Shards must tile [0,N) contiguously.")
+                f"{prefix} shard gap/overlap: {mp} starts at {meta['start']}, "
+                f"expected {expect_start}. Shards must tile [0,N) contiguously.")
         expect_start = meta["end"]
         tag = f"{meta['rank']:05d}"
-        _copy(shards_dir / f"protein_h.{tag}.bin", p_h_out)
-        _copy(shards_dir / f"protein_mask.{tag}.bin", p_mask_out)
-        _copy(shards_dir / f"text_h.{tag}.bin", t_h_out)
-        _copy(shards_dir / f"text_mask.{tag}.bin", t_mask_out)
-        for pl in meta["p_lens"]:
-            p_offsets.append(p_offsets[-1] + pl)
-        for tl in meta["t_lens"]:
-            t_offsets.append(t_offsets[-1] + tl)
+        _copy_into(shards_dir / f"{prefix}_h.{tag}.bin", h_out)
+        _copy_into(shards_dir / f"{prefix}_mask.{tag}.bin", mask_out)
+        for l in meta["lens"]:
+            offsets.append(offsets[-1] + l)
         ids.extend(meta["ids"])
+    h_out.close()
+    mask_out.close()
+    if expect_start != expected_total:
+        raise RuntimeError(
+            f"{prefix} shards tile [0,{expect_start}) but expected "
+            f"[0,{expected_total}). Missing or extra shards.")
+    off = torch.tensor(offsets, dtype=torch.long)
+    torch.save(off, cache_dir / f"{prefix}_offsets.pt")
+    return off, ids
 
-    for fh in (p_h_out, p_mask_out, t_h_out, t_mask_out):
-        fh.close()
 
-    torch.save(torch.tensor(p_offsets, dtype=torch.long), cache_dir / "protein_offsets.pt")
-    torch.save(torch.tensor(t_offsets, dtype=torch.long), cache_dir / "text_offsets.pt")
+def merge_shards(args, cfg) -> None:
+    shards_dir = Path(args.shards_dir)
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-derive the row->protein map deterministically (same function the encode
+    # ranks used), so it is consistent with the protein shard ordering.
+    pairs = load_pairs(
+        cfg.data.csv_path,
+        id_col=cfg.data.csv_id_col,
+        protein_col=cfg.data.csv_protein_col,
+        text_col=cfg.data.csv_text_col,
+        pfam_col=cfg.data.csv_pfam_col,
+        subset_size=args.subset_size,
+    )
+    row_protein_idx, unique_seqs, _ = dedup_proteins(pairs)
+    n_rows = len(pairs)
+    n_unique = len(unique_seqs)
+    print(f"[merge] n_rows={n_rows} unique_proteins={n_unique} from {shards_dir}",
+          flush=True)
+
+    _, protein_ids = _merge_modality(shards_dir, cache_dir, "protein", n_unique)
+    _, pair_ids = _merge_modality(shards_dir, cache_dir, "text", n_rows)
+
+    torch.save(torch.as_tensor(row_protein_idx, dtype=torch.long),
+               cache_dir / "row_protein_idx.pt")
+    with open(cache_dir / "protein_ids.json", "w") as f:
+        json.dump(protein_ids, f)
     with open(cache_dir / "pair_ids.json", "w") as f:
-        json.dump(ids, f)
+        json.dump(pair_ids, f)
     fp = cache_fingerprint(
         cfg.model.text_encoder_path, cfg.model.protein_encoder_path,
         args.max_text_tokens, args.max_protein_tokens,
@@ -228,8 +278,8 @@ def merge_shards(args, cfg) -> None:
     write_cache_fingerprint(str(cache_dir), fp)
     bytes_p = (cache_dir / "protein_h.bin").stat().st_size
     bytes_t = (cache_dir / "text_h.bin").stat().st_size
-    print(f"[merge] done. {len(ids)} rows. protein {bytes_p/1e9:.2f} GB, "
-          f"text {bytes_t/1e9:.2f} GB", flush=True)
+    print(f"[merge] done. {n_rows} rows, {n_unique} unique proteins. "
+          f"protein {bytes_p/1e9:.2f} GB, text {bytes_t/1e9:.2f} GB", flush=True)
 
 
 def main() -> None:

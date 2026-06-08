@@ -19,7 +19,7 @@ DATA_CSV = "/Users/bryan/Documents/datasets/SwissProt_full/fully_annotated_swiss
 
 TEXT_ENCODER_PATH = "/Users/bryan/Documents/models/BioLinkBERT-base"
 PROTEIN_ENCODER_PATH = "/Users/bryan/Documents/models/SaAMPLIFY_120M"
-PROTEIN_DECODER_PATH = "/Users/bryan/Documents/models/progen2-small"
+PROTEIN_DECODER_PATH = "/Users/bryan/Documents/models/Dayhoff-3b-UR90"  # Jamba (hybrid Mamba/attn MoE)
 TEXT_DECODER_PATH = "/Users/bryan/Documents/models/biogpt"
 
 
@@ -35,7 +35,7 @@ class DataCfg:
     subset_size: int = 0
     seed: int = 0
     splits: tuple = (0.90, 0.05, 0.05)
-    max_text_tokens: int = 1024
+    max_text_tokens: int = 512
     max_protein_tokens: int = 1024            # bumped from 512 — covers long-tail proteins
 
 

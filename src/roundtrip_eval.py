@@ -49,7 +49,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
-from src.data import load_pairs, load_splits
+from src.data import group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
     LoRACfg, load_decoder_with_cross_attn, set_cross_memory, clear_cross_memory,
 )
@@ -188,7 +188,7 @@ def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
         gen = decoder.generate(
             input_ids, max_new_tokens=args.max_new_tokens,
             do_sample=args.temperature > 0, temperature=max(args.temperature, 1e-6),
-            top_p=args.top_p, pad_token_id=pad_id,
+            top_p=args.top_p, pad_token_id=pad_id, use_cache=True,
         )
         clear_cross_memory(adapters)
         gen_tgts = [dtok.decode(row, skip_special_tokens=True).strip() for row in gen]
@@ -237,15 +237,26 @@ def _pad_stack(seqs, dim=32):
     return out, mask
 
 
-def _recall(S: torch.Tensor, ks):
-    """S [Nq, Nc] with aligned diagonal positives. Returns recall dict + ranks."""
+def _recall(S: torch.Tensor, groups: torch.Tensor, ks):
+    """Accession-grouped retrieval recall.
+
+    S [Nq, Nc] with query i and candidate i index-aligned. `groups` [N] holds
+    each row's accession id; EVERY candidate sharing the query's accession is a
+    positive. With the augmented corpus a protein has ~8.87 captions, so a
+    generated protein that re-embeds onto a *sibling* caption of its own source
+    protein must count as a hit, not a miss (and duplicate proteins on the
+    protein2text source side likewise). Reports the rank of the best-scoring
+    positive. When every accession is unique this reduces to diagonal recall.
+    """
     n = S.size(0)
-    tgt = torch.arange(n, device=S.device)
-    true_scores = S.gather(1, tgt[:, None])
-    ranks = (S > true_scores).sum(dim=1) + 1
+    same = groups[:, None] == groups[None, :]                  # [Nq, Nc] positives
+    neg_inf = torch.finfo(S.dtype).min
+    best_pos = S.masked_fill(~same, neg_inf).max(dim=1).values  # [Nq]
+    # rank = 1 + (# non-positive candidates strictly outscoring the best positive)
+    ranks = ((S > best_pos[:, None]) & (~same)).sum(dim=1) + 1
     out = {f"R@{k}": (ranks <= k).float().mean().item() for k in ks if k <= n}
     out["median_rank"] = float(ranks.median().item())
-    out["mean_pos_score"] = float(true_scores.mean().item())
+    out["mean_pos_score"] = float(best_pos.mean().item())
     return out, ranks
 
 
@@ -264,18 +275,25 @@ def score_and_write(args, device) -> None:
     Z_gen, mask_gen = Z_gen.to(device), mask_gen.to(device)
     Z_src, mask_src = Z_src.to(device), mask_src.to(device)
 
+    # Accession ids align rows/cols of every matrix below, so the same vector
+    # marks positives for gen->src, src->gen, and the ceiling.
+    groups = torch.as_tensor(
+        group_ids_from_accessions([r["uid"] for r in recs]), device=device)
+    n_groups = int(groups.unique().numel())
+    print(f"[rt][score] {n} rows over {n_groups} distinct proteins", flush=True)
+
     # NxN FILIP (generated target rows x source cols), chunked.
     S = filip_score_matrix_chunked(Z_gen, Z_src, mask_gen, mask_src,
                                    chunk_rows=args.filip_chunk_rows)
     ks = [1, 5, 10]
-    gen2src, ranks_g = _recall(S, ks)              # generated target -> its source
-    src2gen, _ = _recall(S.t().contiguous(), ks)   # source -> its generated target
+    gen2src, ranks_g = _recall(S, groups, ks)              # generated target -> its source
+    src2gen, _ = _recall(S.t().contiguous(), groups, ks)   # source -> its generated target
 
     # Ceiling: true targets -> sources, same scorer/candidate set.
     Z_true, mask_true = _pad_stack([r["z_true"] for r in recs])
     S_true = filip_score_matrix_chunked(Z_true.to(device), Z_src, mask_true.to(device),
                                         mask_src, chunk_rows=args.filip_chunk_rows)
-    ceiling, _ = _recall(S_true, ks)
+    ceiling, _ = _recall(S_true, groups, ks)
 
     tgt = "protein" if _target_is_protein(args.direction) else "text"
     src = "text" if _target_is_protein(args.direction) else "protein"
@@ -364,6 +382,18 @@ def main() -> None:
     )
     splits = load_splits(str(Path(args.cache_dir) / "splits.json"))
     sel = list(splits[args.split])
+    if not _target_is_protein(args.direction):
+        # protein2text: the source (protein) is identical across a protein's
+        # ~8.87 captions, so generation would repeat per sibling. Keep one row
+        # per protein. (text2protein keeps all caption rows; siblings are scored
+        # as positives by the accession-grouped recall.)
+        seen, dedup = set(), []
+        for i in sel:
+            a = pairs[i].uid
+            if a not in seen:
+                seen.add(a)
+                dedup.append(i)
+        sel = dedup
     if args.num_samples > 0:
         sel = sel[:args.num_samples]
 

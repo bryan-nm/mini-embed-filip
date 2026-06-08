@@ -133,6 +133,7 @@ def main() -> None:
             temperature=max(args.temperature, 1e-6),
             top_p=args.top_p,
             pad_token_id=target_tok.pad_token_id or target_tok.eos_token_id,
+            use_cache=True,
         )
     clear_cross_memory(adapters)
 

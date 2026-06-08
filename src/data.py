@@ -84,20 +84,133 @@ def load_pairs(
 # ---------------------------------------------------------------------------
 # Splits (fingerprinted)
 # ---------------------------------------------------------------------------
-def make_splits(n: int, ratios: Sequence[float], seed: int) -> dict:
+def group_ids_from_accessions(accessions: Sequence[str]) -> np.ndarray:
+    """Per-row accession strings -> dense int group ids in first-appearance order.
+
+    Rows describing the same protein (same accession) get the same id, so a
+    group-aware split keeps every caption of a protein on one side of the
+    train/val/test boundary. The augmented SwissProt corpus has ~8.87 captions
+    per protein; a row-level split would leak proteins across splits.
+    """
+    mapping: dict = {}
+    out = np.empty(len(accessions), dtype=np.int64)
+    for i, a in enumerate(accessions):
+        gid = mapping.get(a)
+        if gid is None:
+            gid = len(mapping)
+            mapping[a] = gid
+        out[i] = gid
+    return out
+
+
+def dedup_proteins(pairs: List["Pair"]):
+    """Collapse rows to unique proteins (keyed by accession, first-appearance).
+
+    Returns:
+      row_protein_idx : np.int64 [N_rows]  -- CSV row -> unique-protein index
+      unique_seqs     : list[str]          -- one sequence per unique protein
+      unique_ids      : list[str]          -- accessions, unique-protein order
+
+    The augmented corpus repeats each protein across ~8.87 caption rows; encoding
+    and storing the protein once per unique accession (rather than per row) saves
+    ~9x of the protein encoder pass (the precompute bottleneck) and ~1.5 TB of
+    cache. Dedup key is the accession, which is also the split group key, so the
+    two stay consistent.
+    """
+    mapping: dict = {}
+    row_protein_idx = np.empty(len(pairs), dtype=np.int64)
+    unique_seqs: List[str] = []
+    unique_ids: List[str] = []
+    for i, p in enumerate(pairs):
+        j = mapping.get(p.uid)
+        if j is None:
+            j = len(unique_seqs)
+            mapping[p.uid] = j
+            unique_seqs.append(p.protein)
+            unique_ids.append(p.uid)
+        row_protein_idx[i] = j
+    return row_protein_idx, unique_seqs, unique_ids
+
+
+def make_splits(
+    n: int,
+    ratios: Sequence[float],
+    seed: int,
+    group_ids: Optional[Sequence[int]] = None,
+) -> dict:
+    """Train/val/test split over row indices [0, n).
+
+    If `group_ids` is given (one per row), the split is done over *groups*
+    (proteins) and then expanded back to rows, so no group straddles two
+    splits. Without it, falls back to the legacy per-row split (used only by
+    the live smoke-test path / single-caption corpora).
+    """
     assert abs(sum(ratios) - 1.0) < 1e-6
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(n)
-    n_train = int(round(ratios[0] * n))
-    n_val = int(round(ratios[1] * n))
+
+    if group_ids is None:
+        perm = rng.permutation(n)
+        n_train = int(round(ratios[0] * n))
+        n_val = int(round(ratios[1] * n))
+        train = perm[:n_train]
+        val = perm[n_train : n_train + n_val]
+        test = perm[n_train + n_val :]
+        n_groups = int(n)
+    else:
+        g = np.asarray(group_ids)
+        assert g.shape[0] == n, "group_ids must have one entry per row"
+        uniq = np.unique(g)                       # sorted unique group ids
+        gperm = rng.permutation(uniq.shape[0])
+        ng_train = int(round(ratios[0] * uniq.shape[0]))
+        ng_val = int(round(ratios[1] * uniq.shape[0]))
+        train_g = set(uniq[gperm[:ng_train]].tolist())
+        val_g = set(uniq[gperm[ng_train : ng_train + ng_val]].tolist())
+        train_rows, val_rows, test_rows = [], [], []
+        for row, gid in enumerate(g.tolist()):
+            if gid in train_g:
+                train_rows.append(row)
+            elif gid in val_g:
+                val_rows.append(row)
+            else:
+                test_rows.append(row)
+        # Shuffle row order within each split so a prefix slice (val_subset) is
+        # still a random sample rather than accession-contiguous.
+        train = rng.permutation(np.array(train_rows, dtype=np.int64))
+        val = rng.permutation(np.array(val_rows, dtype=np.int64))
+        test = rng.permutation(np.array(test_rows, dtype=np.int64))
+        n_groups = int(uniq.shape[0])
+
     return {
         "n": int(n),
         "seed": int(seed),
         "ratios": list(ratios),
-        "train": perm[:n_train].tolist(),
-        "val": perm[n_train : n_train + n_val].tolist(),
-        "test": perm[n_train + n_val :].tolist(),
+        "n_groups": n_groups,
+        "train": train.tolist(),
+        "val": val.tolist(),
+        "test": test.tolist(),
     }
+
+
+def build_or_load_splits(
+    splits_path: str,
+    n: int,
+    ratios: Sequence[float],
+    seed: int,
+    group_ids: Optional[Sequence[int]] = None,
+) -> dict:
+    """Return a valid split dict, rebuilding + saving if missing/stale.
+
+    Caller must invoke this on rank 0 only and barrier before other ranks read
+    the file (avoids a write race), matching the existing pattern.
+    """
+    n_groups = int(np.unique(np.asarray(group_ids)).shape[0]) if group_ids is not None else int(n)
+    if Path(splits_path).exists():
+        sp = load_splits(splits_path)
+        if splits_are_valid(sp, n, seed, ratios, n_groups=n_groups):
+            return sp
+    sp = make_splits(n, ratios, seed, group_ids=group_ids)
+    save_splits(sp, splits_path)
+    return sp
 
 
 def save_splits(splits: dict, path: str) -> None:
@@ -111,7 +224,10 @@ def load_splits(path: str) -> dict:
         return json.load(f)
 
 
-def splits_are_valid(splits: dict, n: int, seed: int, ratios: Sequence[float]) -> bool:
+def splits_are_valid(
+    splits: dict, n: int, seed: int, ratios: Sequence[float],
+    n_groups: Optional[int] = None,
+) -> bool:
     if not isinstance(splits, dict):
         return False
     if splits.get("n") != int(n) or splits.get("seed") != int(seed):
@@ -119,7 +235,13 @@ def splits_are_valid(splits: dict, n: int, seed: int, ratios: Sequence[float]) -
     sr = splits.get("ratios")
     if sr is None or len(sr) != len(ratios):
         return False
-    return all(abs(a - b) < 1e-9 for a, b in zip(sr, ratios))
+    if not all(abs(a - b) < 1e-9 for a, b in zip(sr, ratios)):
+        return False
+    # When a group-aware split is expected, a file without a matching n_groups
+    # (e.g. a legacy row-level split) is treated as stale and rebuilt.
+    if n_groups is not None and splits.get("n_groups") != int(n_groups):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -174,27 +296,48 @@ class PackedPerTokenCache:
         return h, m
 
 
-class PackedPerTokenDataset(Dataset):
-    """Per-row paired packed reader.
+def load_row_protein_idx(cache_dir: str) -> torch.Tensor:
+    """Load the CSV-row -> unique-protein-index map written by precompute."""
+    path = Path(cache_dir) / "row_protein_idx.pt"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} missing. This cache predates protein-dedup; rebuild with "
+            f"`python -m src.precompute`."
+        )
+    return torch.load(path, map_location="cpu")
 
-    Returns a dict of bf16 tensors and bool masks for one (protein, text) pair.
-    Collation pads to the batch's max length.
+
+class PackedPerTokenDataset(Dataset):
+    """Per-row paired packed reader over the protein-deduplicated cache.
+
+    The text cache has one row per CSV row; the protein cache has one row per
+    *unique* protein. `row_protein_idx[row]` maps a CSV row to its protein row.
+    Returns a dict of bf16 tensors and bool masks for one (protein, text) pair;
+    collation pads to the batch's max length. `idx` is the global CSV row index.
     """
 
     def __init__(self, cache_dir: str, indices: Sequence[int],
-                 protein_dim: int = 640, text_dim: int = 768):
+                 protein_dim: int = 640, text_dim: int = 768,
+                 row_protein_idx: Optional[torch.Tensor] = None):
         self.indices = list(indices)
         self.protein_cache = PackedPerTokenCache(cache_dir, "protein", protein_dim)
         self.text_cache = PackedPerTokenCache(cache_dir, "text", text_dim)
-        if len(self.protein_cache) != len(self.text_cache):
-            raise ValueError("protein/text cache row count mismatch")
+        if row_protein_idx is None:
+            row_protein_idx = load_row_protein_idx(cache_dir)
+        self.row_protein_idx = row_protein_idx
+        if len(self.text_cache) != int(self.row_protein_idx.numel()):
+            raise ValueError(
+                f"text cache rows ({len(self.text_cache)}) != row_protein_idx "
+                f"length ({int(self.row_protein_idx.numel())})")
+        if int(self.row_protein_idx.max()) >= len(self.protein_cache):
+            raise ValueError("row_protein_idx references a protein row past the cache")
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, i: int):
         idx = self.indices[i]
-        h_p, m_p = self.protein_cache.get(idx)
+        h_p, m_p = self.protein_cache.get(int(self.row_protein_idx[idx]))
         h_t, m_t = self.text_cache.get(idx)
         return {"h_p": h_p, "h_t": h_t, "mask_p": m_p, "mask_t": m_t, "idx": idx}
 
@@ -259,6 +402,10 @@ def cache_fingerprint(
     mask_text_specials: bool, mask_protein_specials: bool,
 ) -> dict:
     return {
+        # Bumped when the on-disk layout changes; v2 stores protein rows
+        # deduplicated by accession + a row_protein_idx map. A v1 cache will
+        # mismatch here and be flagged for rebuild.
+        "format": "v2_protein_dedup",
         "text_encoder_path": text_encoder_path,
         "protein_encoder_path": protein_encoder_path,
         "max_text_tokens": int(max_text_tokens),

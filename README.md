@@ -12,8 +12,10 @@ Four trained things in total:
 
 1. **Projection heads** (per-token, position-wise): encoder hidden → 32-d.
 2. **Expansion heads** (per-token, symmetric to projections): 32-d → encoder hidden.
-3. **Decoder cross-attention adapters** (text→protein direction: ProGen2-small;
-   protein→text direction: BioGPT). Trained per direction, independently.
+3. **Decoder cross-attention adapters** (text→protein direction: Dayhoff-3b-UR90,
+   a Jamba hybrid Mamba/attention MoE; protein→text direction: BioGPT). Trained
+   per direction, independently. Injection is architecture-dispatched, so a
+   direction can be re-pointed at a different decoder by changing its path.
 4. **Decoder LoRA on existing self-attn/FFN** (small, also per direction).
 
 The 32-d shared space serves as a universal interlingua: retrieval scores
@@ -41,7 +43,7 @@ You also need four pretrained models on disk. Default paths in `config.py`:
 |---|---|---|
 | text encoder | BioLinkBERT-base | `/Users/bryan/Documents/models/BioLinkBERT-base` |
 | protein encoder | SaAMPLIFY-120M | `/Users/bryan/Documents/models/SaAMPLIFY_120M` |
-| protein decoder (text→protein) | ProGen2-small | `/Users/bryan/Documents/models/progen2-small` |
+| protein decoder (text→protein) | Dayhoff-3b-UR90 (Jamba) | `/Users/bryan/Documents/models/Dayhoff-3b-UR90` |
 | text decoder (protein→text) | BioGPT | `/Users/bryan/Documents/models/biogpt` |
 
 Data source (default in `DataCfg.csv_path`): the SwissProt-full CSV with
@@ -110,10 +112,20 @@ epoch ~25s. The full pipeline finishes in under 5 minutes.
 | `--no-mask-protein-specials` | off | retain `<bos>`/`<eos>`/`<pad>` in the cache |
 
 Output files: `protein_h.bin`, `protein_offsets.pt`, `protein_mask.bin`,
-`text_h.bin`, `text_offsets.pt`, `text_mask.bin`, `pair_ids.json`,
-`fingerprint.json`. The fingerprint records the encoder paths, length caps,
-and special-token flags; a mismatch on rebuild aborts retrieval training
-with a clear error instead of silently training against the wrong cache.
+`protein_ids.json`, `text_h.bin`, `text_offsets.pt`, `text_mask.bin`,
+`pair_ids.json`, `row_protein_idx.pt`, `fingerprint.json`. The fingerprint
+records a format tag, the encoder paths, length caps, and special-token flags;
+a mismatch on rebuild aborts retrieval training with a clear error instead of
+silently training against the wrong cache.
+
+**Protein dedup.** The augmented corpus repeats each protein across ~8.87
+caption rows. The protein modality is encoded + stored once per *unique*
+protein (so `protein_*` has `N_unique` rows, `text_*` has `N_rows`), and
+`row_protein_idx.pt` (`[N_rows]`, CSV row → unique-protein index) joins them at
+read time. This avoids ~9× of the protein encoder pass and ~1.5 TB of cache.
+Splits are by accession (no protein straddles train/val/test); the retrieval
+InfoNCE and the val/round-trip recall mask same-protein siblings so the
+multiple captions per protein are not treated as false negatives.
 
 ### `src/train_retrieval`
 
@@ -310,6 +322,20 @@ and add re-materialization for whatever it surfaces.
 hits if the decoder tokenizer ships without one. The generation collator
 sets `pad_token = eos_token` for ProGen2 already; if you swap decoders,
 verify the collator still handles the new tokenizer.
+
+**Dayhoff-3b / Jamba decoder notes.** It is a hybrid Mamba/attention MoE, so
+the text→protein adapters are injected via forward hooks (not module
+replacement) to preserve Jamba's per-layer `isinstance` mask routing. It loads
+with `use_mamba_kernels=False` (the fused mamba-ssm/causal-conv1d CUDA kernels
+aren't available on Mac/XPU — the pure-PyTorch SSM path is used) and
+`output_router_logits=False`. Its custom char `ProteinTokenizer` (written for
+transformers 4.42) won't load through transformers-5 `AutoTokenizer`, so it is
+imported directly from the repo's `tokenizers.py`; the tokenizer adds no
+BOS/EOS, so the collator now wraps targets as `[BOS] … [EOS]` explicitly.
+LoRA covers the attention layers' self-attn and the dense MLPs; the fused MoE
+expert tensors and SSM mixers are left frozen. Generation passes
+`use_cache=True` (the model card sets `use_cache=False`, which would disable the
+KV/SSM cache and recompute the full sequence every step).
 
 **`You need to install sacremoses to use BioGptTokenizer`.** BioGPT's
 tokenizer needs `sacremoses`; it's in `environment.yml` already. If you

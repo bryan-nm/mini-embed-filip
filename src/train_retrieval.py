@@ -30,19 +30,18 @@ from config import default_cfg, Cfg
 from src.data import (
     PackedPerTokenDataset,
     RawPairsDataset,
+    build_or_load_splits,
+    group_ids_from_accessions,
     load_pairs,
     load_splits,
-    make_splits,
     packed_collate,
     raw_collate,
-    save_splits,
-    splits_are_valid,
     read_cache_fingerprint,
     fingerprint_matches,
     cache_fingerprint,
 )
 from src.dist import (
-    init_distributed, barrier, cleanup, grouped_all_gather,
+    init_distributed, barrier, cleanup, grouped_all_gather, grouped_all_gather_ids,
     broadcast_parameters, average_gradients,
 )
 from src.evaluate import evaluate_split
@@ -95,30 +94,31 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
                 f"Rebuild with `python -m src.precompute`."
             )
         with open(Path(cfg.retrieval.cache_dir) / "pair_ids.json") as f:
-            n = len(json.load(f))
+            accessions = json.load(f)
+        n = len(accessions)
         if env.is_main:
             print(f"[train] cache at {cfg.retrieval.cache_dir}; n={n}")
     else:
         if pairs is None:
             raise RuntimeError("pairs required when use_cache=False")
-        n = len(pairs)
+        accessions = [p.uid for p in pairs]
+        n = len(accessions)
         if env.is_main:
             print(f"[train] live mode; n={n}")
 
-    # Only rank 0 creates/repairs the splits file; everyone else reads it after
-    # a barrier (avoids a write race across ranks).
+    # Group-aware (by-accession) split: every caption of a protein stays on one
+    # side of the train/val/test boundary. row_group_ids (per global row) is also
+    # used by the R2 loss (false-negative masking) and the val recall, so it is
+    # built on every rank. Only rank 0 creates/repairs the split file; everyone
+    # reads it after a barrier (avoids a write race across ranks).
+    row_group_np = group_ids_from_accessions(accessions)
     if env.is_main:
-        if splits_path.exists():
-            splits = load_splits(str(splits_path))
-            if not splits_are_valid(splits, n, cfg.data.seed, cfg.data.splits):
-                print(f"[train] splits at {splits_path} stale; rebuilding")
-                splits = make_splits(n, cfg.data.splits, cfg.data.seed)
-                save_splits(splits, str(splits_path))
-        else:
-            splits = make_splits(n, cfg.data.splits, cfg.data.seed)
-            save_splits(splits, str(splits_path))
+        splits = build_or_load_splits(
+            str(splits_path), n, cfg.data.splits, cfg.data.seed, group_ids=row_group_np)
+        print(f"[train] splits: {n} rows over {splits['n_groups']} proteins")
     barrier()
     splits = load_splits(str(splits_path))
+    row_group_ids = torch.as_tensor(row_group_np, dtype=torch.long)
 
     # Subsample validation: `val` is already a random permutation slice, so the
     # first N is a deterministic random sample. Keeps the per-epoch rank-0 eval
@@ -179,7 +179,7 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
         )
     if env.is_main:
         print(f"[train] batches/epoch/rank: train={len(train_loader)} val={len(val_loader)} bs={bs}")
-    return train_loader, val_loader, train_sampler
+    return train_loader, val_loader, train_sampler, row_group_ids
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ def main() -> None:
         prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
         encoders = (text_model, text_tok, prot_model, prot_tok)
 
-    train_loader, val_loader, train_sampler = build_loaders(
+    train_loader, val_loader, train_sampler, row_group_ids = build_loaders(
         cfg, splits_path, env, pairs=pairs, val_subset=args.val_subset)
 
     model = MiniEmbedFilip(
@@ -354,6 +354,10 @@ def main() -> None:
                     mp_all = grouped_all_gather(mask_p.to(out["z_p"].dtype), env) > 0.5
                     mt_all = grouped_all_gather(mask_t.to(out["z_t"].dtype), env) > 0.5
                     local_offset = env.group_rank * out["z_p"].size(0)
+                    # Accession ids for false-negative masking: this rank's
+                    # anchors + the gathered subgroup columns (same order as z_*_all).
+                    groups_local = row_group_ids[batch["idx"]].to(device)
+                    groups_all = grouped_all_gather_ids(groups_local, env)
                     losses = phase_r2_loss_grouped(
                         out, h_p, h_t, mask_p, mask_t, core.logit_scale,
                         z_p_all=z_p_all, z_t_all=z_t_all,
@@ -362,6 +366,7 @@ def main() -> None:
                         align_aux_weight=cfg.retrieval.align_aux_weight,
                         recon_weight=cfg.retrieval.recon_weight,
                         chunk_rows=args.filip_chunk_rows,
+                        groups=groups_local, groups_all=groups_all,
                     )
 
             losses["loss"].backward()
@@ -396,6 +401,7 @@ def main() -> None:
                 metrics = evaluate_split(
                     core, val_loader, device, encoders,
                     cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
+                    row_group_ids=row_group_ids,
                 )
                 short = {k: round(v, 4) for k, v in metrics.items()
                          if k in ("R@1", "R@5", "R@10", "gap_l2",

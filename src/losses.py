@@ -20,7 +20,7 @@ PLAN_late_interaction.md sections 3c.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -88,6 +88,34 @@ def filip_score_matrix_chunked(
 def positive_pair_score(filip_matrix: torch.Tensor) -> torch.Tensor:
     """Mean of the diagonal of a [B, B] FILIP score matrix."""
     return filip_matrix.diagonal().mean()
+
+
+# Finite "−inf" for masked logits: well below scale*FILIP (|logit| <= ~100), and
+# safe across fp32/bf16/autocast (true -inf can poison reductions).
+_NEG_LOGIT = -1e4
+
+
+def mask_false_negatives(
+    logits: torch.Tensor,            # [R, C] scaled similarity logits
+    target: torch.Tensor,           # [R] index of each row's positive column
+    groups_row: Optional[torch.Tensor] = None,   # [R] accession id per row
+    groups_col: Optional[torch.Tensor] = None,   # [C] accession id per column
+) -> torch.Tensor:
+    """Mask same-protein non-target columns out of the InfoNCE denominator.
+
+    The augmented corpus has ~8.87 captions per protein, so a contrastive batch
+    can contain several captions of the same protein. Without masking, those
+    siblings act as false negatives — the loss would push a protein away from a
+    valid caption. We set every column sharing a row's accession (except that
+    row's designated positive) to a large negative, removing it from softmax.
+    No-op when group ids are not supplied.
+    """
+    if groups_row is None or groups_col is None:
+        return logits
+    same = groups_row[:, None] == groups_col[None, :]           # [R, C]
+    is_target = torch.zeros_like(same)
+    is_target[torch.arange(logits.size(0), device=logits.device), target] = True
+    return logits.masked_fill(same & ~is_target, _NEG_LOGIT)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +230,8 @@ def phase_r2_loss_grouped(
     align_aux_weight: float,
     recon_weight: float,
     chunk_rows: int = 0,
+    groups: Optional[torch.Tensor] = None,       # [B] accession id per local anchor
+    groups_all: Optional[torch.Tensor] = None,   # [G] accession id per gathered column
 ) -> dict:
     """Distributed Phase-R2 InfoNCE over a bounded subgroup of negatives.
 
@@ -210,6 +240,10 @@ def phase_r2_loss_grouped(
     inside the gathered batch (`local_offset .. local_offset+B`). Only the
     local slice of `z_*_all` carries gradient (see `dist.grouped_all_gather`),
     so this is the standard gather-with-grad contrastive loss — no double count.
+
+    When `groups`/`groups_all` are supplied, columns sharing an anchor's protein
+    (other than its own positive) are masked out of the denominator, so the
+    corpus's multiple captions per protein don't act as false negatives.
     """
     z_p, z_t = out["z_p"], out["z_t"]
     h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]
@@ -224,15 +258,18 @@ def phase_r2_loss_grouped(
     mat_t2p = builder(z_p_all, z_t, mask_p_all, mask_t).t()        # [B, G]
 
     target = torch.arange(B, device=z_p.device) + local_offset
-    loss_pt = F.cross_entropy(scale * mat_p2t, target)
-    loss_tp = F.cross_entropy(scale * mat_t2p, target)
+    # Both directions share the same row/column accession layout.
+    logits_pt = mask_false_negatives(scale * mat_p2t, target, groups, groups_all)
+    logits_tp = mask_false_negatives(scale * mat_t2p, target, groups, groups_all)
+    loss_pt = F.cross_entropy(logits_pt, target)
+    loss_tp = F.cross_entropy(logits_tp, target)
     l_nce = 0.5 * (loss_pt + loss_tp)
 
     with torch.no_grad():
-        acc_pt = (mat_p2t.argmax(dim=-1) == target).float().mean()
-        acc_tp = (mat_t2p.argmax(dim=-1) == target).float().mean()
+        acc_pt = (logits_pt.argmax(dim=-1) == target).float().mean()
+        acc_tp = (logits_tp.argmax(dim=-1) == target).float().mean()
         acc = 0.5 * (acc_pt + acc_tp)
-        # positive-pair score = diagonal entries at the local offset
+        # positive-pair score = the true-pair FILIP at the local offset (unmasked)
         filip_pos = mat_p2t.gather(1, target[:, None]).mean()
 
     l_align = 1.0 - filip_pos
@@ -264,8 +301,13 @@ def phase_r2_loss(
     align_aux_weight: float,
     recon_weight: float,
     chunk_rows: int = 0,
+    groups: Optional[torch.Tensor] = None,       # [B] accession id per pair
 ) -> dict:
-    """Phase R2: FILIP-based symmetric InfoNCE + small align aux + recon."""
+    """Phase R2: FILIP-based symmetric InfoNCE + small align aux + recon.
+
+    `groups` (per-pair accession ids) masks same-protein off-diagonal entries as
+    false negatives; no-op when omitted.
+    """
     z_p, z_t = out["z_p"], out["z_t"]
     h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]
 
@@ -275,9 +317,9 @@ def phase_r2_loss(
         filip_mat = filip_score_matrix(z_p, z_t, mask_p, mask_t)
 
     scale = logit_scale.exp()
-    logits_pt = scale * filip_mat
-    logits_tp = logits_pt.t()
     target = torch.arange(filip_mat.size(0), device=filip_mat.device)
+    logits_pt = mask_false_negatives(scale * filip_mat, target, groups, groups)
+    logits_tp = mask_false_negatives((scale * filip_mat).t(), target, groups, groups)
     loss_pt = F.cross_entropy(logits_pt, target)
     loss_tp = F.cross_entropy(logits_tp, target)
     l_nce = 0.5 * (loss_pt + loss_tp)

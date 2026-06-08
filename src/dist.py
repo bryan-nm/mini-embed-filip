@@ -283,3 +283,19 @@ def grouped_all_gather(local: torch.Tensor, env: DistEnv) -> torch.Tensor:
     # Splice the local (grad-carrying) tensor back into its slot.
     gathered[env.group_rank] = local
     return torch.cat(gathered, dim=0)
+
+
+def grouped_all_gather_ids(local: torch.Tensor, env: DistEnv) -> torch.Tensor:
+    """All-gather a 1-D int vector ([B]) within this rank's subgroup -> [G].
+
+    Used to carry per-sample accession group ids alongside `grouped_all_gather`
+    of the embeddings, so the contrastive loss can mask same-protein columns as
+    false negatives. No gradient (ids are integers); column order matches
+    `grouped_all_gather` (rank order within the subgroup). Per-rank B is constant
+    (DistributedSampler drop_last=True), so `empty_like` shapes agree.
+    """
+    if env.group is None or env.group_size <= 1:
+        return local
+    gathered = [torch.empty_like(local) for _ in range(env.group_size)]
+    torch.distributed.all_gather(gathered, local.contiguous(), group=env.group)
+    return torch.cat(gathered, dim=0)
