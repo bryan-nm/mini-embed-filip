@@ -129,6 +129,28 @@ def encode_text_batch(
 # ---------------------------------------------------------------------------
 # Protein encoder: SaAMPLIFY-120M
 # ---------------------------------------------------------------------------
+def _manual_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                 is_causal=False, scale=None, **kwargs):
+    """Plain matmul+softmax attention (q,k,v: [B, H, M, K]; additive attn_mask).
+
+    Drop-in for `torch.nn.functional.scaled_dot_product_attention` used by
+    AMPLIFY's XPU branch. The Aurora IPEX build has no xetla fused-attention
+    kernel ("Your IPEX version currently doesn't support xetla"), so AMPLIFY
+    falls back to an IPEX SDPA path that reads out of bounds (GPU "NotPresent"
+    page-fault segfault) once the sequence length exceeds ~512 with the dense
+    [B, H, L, L] additive mask AMPLIFY builds. Routing attention through
+    ordinary GEMM + softmax avoids that kernel entirely and works at any length.
+    """
+    scale = (query.size(-1) ** -0.5) if scale is None else scale
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    if attn_mask is not None:
+        scores = scores + attn_mask                      # additive (-inf at pads)
+    attn = torch.softmax(scores, dim=-1)
+    if dropout_p and dropout_p > 0.0:
+        attn = F.dropout(attn, p=dropout_p, training=True)
+    return torch.matmul(attn, value)
+
+
 def load_protein_encoder(path: str, device: torch.device):
     install_xformers_stub_if_missing()
     from transformers import AutoModel, AutoTokenizer
@@ -143,6 +165,14 @@ def load_protein_encoder(path: str, device: torch.device):
     model.freqs_cis = amp_mod.precompute_freqs_cis(
         head_dim, model.config.max_length
     ).to(device)
+
+    # On XPU, AMPLIFY's non-CUDA branch calls torch SDPA, which IPEX (no xetla
+    # on this build) routes to a fallback that segfaults for sequence lengths
+    # > ~512. Swap the module-global `scaled_dot_product_attention` AMPLIFY
+    # imported for a plain matmul+softmax so long proteins (max_protein_tokens
+    # up to AMPLIFY's 2048 context) encode without the GPU page fault.
+    if device.type == "xpu":
+        amp_mod.scaled_dot_product_attention = _manual_sdpa
 
     for p in model.parameters():
         p.requires_grad_(False)

@@ -135,6 +135,32 @@ def _pick_local_device(local_rank: int, device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
+def _warn_if_device_selector_doubled(device, rank: int) -> None:
+    """Catch the Aurora OpenCL+Level-Zero double-enumeration footgun early.
+
+    The `frameworks` module defaults `ONEAPI_DEVICE_SELECTOR` to
+    "opencl:gpu;level_zero:gpu", which enumerates every tile twice (once per
+    backend). `torch.xpu.device_count()` then reports ~2x the tiles, and
+    `local_rank % device_count` can pin a rank onto an OpenCL-backed handle;
+    IPEX/Level-Zero kernels run against it touch unmapped memory and the GPU
+    aborts with a "NotPresent" page-fault segfault. Run-1 fixed this with
+    ONEAPI_DEVICE_SELECTOR="level_zero:gpu". We can't change the selector after
+    the runtime has initialised, so fail loudly with the remedy instead.
+    """
+    if device.type != "xpu" or rank != 0:
+        return
+    sel = os.environ.get("ONEAPI_DEVICE_SELECTOR", "")
+    dc = torch.xpu.device_count()
+    if "opencl" in sel.lower():
+        print(
+            f"[dist] WARNING: ONEAPI_DEVICE_SELECTOR={sel!r} enumerates OpenCL+Level-Zero, "
+            f"doubling the device list (torch.xpu.device_count()={dc}). Ranks can mis-pin "
+            f"across backends and the GPU aborts with a 'NotPresent' page fault. "
+            f"Set ONEAPI_DEVICE_SELECTOR=level_zero:gpu in the launch script.",
+            flush=True,
+        )
+
+
 def init_distributed(device_name: str = "auto", group_size: int = 1, init_pg: bool = True) -> DistEnv:
     """Initialise the process group (if launched under MPI) and pin the tile.
 
@@ -148,6 +174,7 @@ def init_distributed(device_name: str = "auto", group_size: int = 1, init_pg: bo
     """
     rank, world, local = _detect_topology()
     device = _pick_local_device(local, device_name)
+    _warn_if_device_selector_doubled(device, rank)
 
     if world <= 1:
         return DistEnv(rank=0, world_size=1, local_rank=0, device=device,
