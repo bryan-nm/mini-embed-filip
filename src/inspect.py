@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -173,6 +174,23 @@ def top_k_alignments(out: dict, k: int = 5):
     return results
 
 
+def display_matrix(out: dict, max_dim: int = 1024) -> torch.Tensor:
+    """The valid-token (specials dropped), max_dim-clipped [P, T] matrix that the
+    heatmap renders — also what `write_matrix_npy` saves, so PNG and .npy agree.
+
+    Axes are valid tokens in order; cross-reference labels via the `valid==1`
+    rows of the `*_tokens.tsv` files (same order).
+    """
+    S = out["S"][out["mask_p"]][:, out["mask_t"]]
+    return S[:max_dim, :max_dim]
+
+
+def write_matrix_npy(out: dict, path: str, max_dim: int = 1024) -> None:
+    """Save the plotted similarity values as a .npy float array [P_valid, T_valid]."""
+    np.save(path, display_matrix(out, max_dim).numpy())
+    print(f"[inspect] wrote {path}")
+
+
 def plot_heatmap(out: dict, path: str = None, max_dim: int = 1024):
     """Optional matplotlib heatmap. Truncates very long sequences for display."""
     try:
@@ -181,15 +199,7 @@ def plot_heatmap(out: dict, path: str = None, max_dim: int = 1024):
         print("matplotlib not available; skipping plot")
         return
 
-    S = out["S"]
-    mask_p = out["mask_p"]
-    mask_t = out["mask_t"]
-    # Keep only valid rows/cols
-    S = S[mask_p][:, mask_t]
-    if S.size(0) > max_dim:
-        S = S[:max_dim]
-    if S.size(1) > max_dim:
-        S = S[:, :max_dim]
+    S = display_matrix(out, max_dim)
 
     fig, ax = plt.subplots(figsize=(8, 8))
     im = ax.imshow(S.numpy(), aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
@@ -240,13 +250,18 @@ def report(out: dict, top_k: int) -> None:
               f"scores={[round(s, 3) for s in r['top_scores']]}")
 
 
-def write_token_tsvs(out: dict, out_dir: str, uid: str) -> None:
-    """Write index->token TSVs so heatmap columns/rows and top-k `text_idxs`
-    can be read back to actual tokens. One file per modality; the `valid` column
-    flags real tokens vs masked specials ([CLS]/[SEP]/<bos>/<eos>/pad).
+def write_token_tsvs(out: dict, out_dir: str, uid: str, max_dim: int = 1024) -> None:
+    """Write index->token TSVs, one file per modality, with two index columns:
 
-    Token indices match the similarity-matrix axes exactly (text = columns,
-    protein = rows), so they cross-reference directly with `top_k_alignments`.
+      index       raw token position — matches the full `out["S"]` axes and the
+                  `top_k_alignments` `text_idxs` (includes specials).
+      plot_index  row/col position in the rendered heatmap / `<uid>.npy` (valid
+                  tokens only, same `max_dim` clip); -1 if the token isn't shown
+                  (a masked special, or clipped past `max_dim`).
+
+    `valid` flags real tokens vs masked specials ([CLS]/[SEP]/<bos>/<eos>/pad).
+    Keep `max_dim` in sync with `display_matrix`/`write_matrix_npy` so plot_index
+    lines up with the saved array.
     """
     import csv as _csv
     for modality, tok_key, mask_key in (("text", "tokens_t", "mask_t"),
@@ -258,10 +273,16 @@ def write_token_tsvs(out: dict, out_dir: str, uid: str) -> None:
         path = Path(out_dir) / f"{uid}_{modality}_tokens.tsv"
         with open(path, "w", newline="") as f:
             w = _csv.writer(f, delimiter="\t")
-            w.writerow(["index", "token", "valid"])
+            w.writerow(["index", "token", "valid", "plot_index"])
+            valid_ord = 0                         # position among valid tokens
             for i, tok in enumerate(tokens):
                 valid = int(i < len(mask) and bool(mask[i]))
-                w.writerow([i, tok, valid])
+                if valid:
+                    plot_index = valid_ord if valid_ord < max_dim else -1
+                    valid_ord += 1
+                else:
+                    plot_index = -1
+                w.writerow([i, tok, valid, plot_index])
 
 
 def main() -> None:
@@ -306,6 +327,7 @@ def main() -> None:
         out = compute_similarity_matrix_from_cache(model, args.cache_dir, idx, device)
         report(out, args.top_k)
         if args.plot:
+            write_matrix_npy(out, str(Path(args.plot).with_suffix(".npy")))
             plot_heatmap(out, args.plot)
         return
 
@@ -348,8 +370,10 @@ def main() -> None:
         report(out, args.top_k)
         if args.plot_dir:
             write_token_tsvs(out, args.plot_dir, uid)
+            write_matrix_npy(out, str(Path(args.plot_dir) / f"{uid}.npy"))
             plot_heatmap(out, str(Path(args.plot_dir) / f"{uid}.png"))
         elif args.plot:
+            write_matrix_npy(out, str(Path(args.plot).with_suffix(".npy")))
             plot_heatmap(out, args.plot)
 
 
