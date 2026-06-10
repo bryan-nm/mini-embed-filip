@@ -186,19 +186,36 @@ Config knobs in `GenerationCfg` not on the CLI: `lora_rank=16`,
 
 Returns the token×token similarity matrix for one pair, plus top-k
 alignments. Used both as a per-pair interpretability tool and as the
-fundamental measurement for dimensionality-sweep studies.
+fundamental measurement for dimensionality-sweep studies. Three input modes:
+
+- **Cache** (`--pair-id` / `--pair-idx`): reads a pair out of the precomputed
+  cache. Dedup-aware (maps the CSV row to its unique-protein row).
+- **Live, explicit** (`--protein` + `--text`): encode one raw pair fresh.
+- **Live, by accession** (`--protein-id`/`--id-file` + `--csv`): look the
+  accession(s) up in a CSV and encode live. Encoders + model load once and are
+  reused across all accessions; the CSV is streamed in a single pass. Useful
+  with an *old* checkpoint when its cache no longer exists (the live path never
+  touches the cache).
 
 | flag | default | meaning |
 |---|---|---|
 | `--ckpt` | required | retrieval checkpoint |
-| `--cache-dir` | `cache/` | |
-| `--pair-id` | none | UniProt accession; looked up in `pair_ids.json` |
-| `--pair-idx` | none | direct row index into the cache |
+| `--device` | `cpu` | `cpu` is fine for a handful of proteins |
+| `--cache-dir` | `cache/` | cache mode only |
+| `--pair-id` | none | accession; looked up in `pair_ids.json` (cache mode) |
+| `--pair-idx` | none | direct CSV-row index into the cache |
+| `--protein` / `--text` | none | raw sequence + caption for a single live pair |
+| `--csv` | none | CSV to resolve `--protein-id` / `--id-file` accessions |
+| `--protein-id` | none | one or more accessions to inspect live (needs `--csv`) |
+| `--id-file` | none | file with one accession per line (needs `--csv`) |
 | `--top-k` | `5` | top-k text matches reported per protein position |
-| `--plot` | none | path to save heatmap PNG (requires matplotlib) |
+| `--plot` | none | heatmap PNG path (single-pair modes) |
+| `--plot-dir` | none | directory for per-accession heatmaps (`<uid>.png` each) |
 
-`compute_similarity_matrix_live` is also available as a Python API for pairs
-not yet in the cache.
+`inspect.pbs` wraps the by-accession live mode for an Aurora batch job: it reads
+`protein_ids.txt`, pulls sequence+caption from the legacy SwissProt CSV, and
+writes a heatmap per accession. `compute_similarity_matrix_live` /
+`load_inspect_encoders` are also available as a Python API.
 
 ---
 

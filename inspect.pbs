@@ -1,0 +1,47 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_inspect
+#PBS -l walltime=00:20:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+# ---------------------------------------------------------------------------
+# Live token x token inspection for a list of proteins, using run-1 retrieval
+# weights. Reads protein_ids.txt (one primary_Accession per line), pulls the
+# sequence + caption from the legacy SwissProt CSV, encodes each pair fresh
+# (no cache needed), and writes a heatmap per accession to $OUT.
+#
+# Single process / single tile — inspection is light, no mpiexec needed.
+# Runs on CPU: robust, no XPU/IPEX setup, and fine for a handful of proteins.
+# ---------------------------------------------------------------------------
+
+# --- edit these ---
+CKPT=checkpoints/retrieval/epoch50.pt   # run-1 retrieval checkpoint
+IDS=protein_ids.txt                     # one primary_Accession per line
+OUT=inspect_out                         # heatmaps written here as <accession>.png
+TOPK=5
+CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv
+
+export OMP_NUM_THREADS=32
+
+echo "inspecting $(wc -l < "$IDS") accessions from ${CSV}"
+mkdir -p "$OUT"
+
+python -m src.inspect \
+    --ckpt "$CKPT" \
+    --csv "$CSV" \
+    --id-file "$IDS" \
+    --device cpu \
+    --top-k "$TOPK" \
+    --plot-dir "$OUT"
+
+echo "done; heatmaps in ${OUT}/"

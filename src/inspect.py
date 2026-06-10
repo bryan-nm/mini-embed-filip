@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import default_cfg
 from src.data import (
     PackedPerTokenCache,
-    load_pairs,
+    load_row_protein_idx,
 )
 from src.model import MiniEmbedFilip
 
@@ -63,7 +63,10 @@ def compute_similarity_matrix_from_cache(
     p_cache = PackedPerTokenCache(cache_dir, "protein", cfg.model.protein_hidden)
     t_cache = PackedPerTokenCache(cache_dir, "text", cfg.model.text_hidden)
 
-    h_p, m_p = p_cache.get(pair_idx)
+    # Protein-dedup layout: the text cache is per CSV row, the protein cache is
+    # per unique protein. Map the row index to its protein row before reading.
+    row_protein_idx = load_row_protein_idx(cache_dir)
+    h_p, m_p = p_cache.get(int(row_protein_idx[pair_idx]))
     h_t, m_t = t_cache.get(pair_idx)
     h_p = h_p.to(device).float().unsqueeze(0)               # [1, L_p, 640]
     h_t = h_t.to(device).float().unsqueeze(0)               # [1, L_t, 768]
@@ -87,24 +90,37 @@ def compute_similarity_matrix_from_cache(
     }
 
 
+def load_inspect_encoders(device: torch.device):
+    """Load the two frozen encoders once, to reuse across many live pairs."""
+    cfg = default_cfg()
+    from src.encoders import load_protein_encoder, load_text_encoder
+    text_model, text_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+    prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
+    return text_model, text_tok, prot_model, prot_tok
+
+
 def compute_similarity_matrix_live(
     model: MiniEmbedFilip,
     protein_seq: str,
     text: str,
     device: torch.device,
+    *,
+    encoders=None,
+    uid: Optional[str] = None,
     mask_text_specials: bool = True,
     mask_protein_specials: bool = True,
     max_protein_tokens: int = 1024,
     max_text_tokens: int = 1024,
 ) -> dict:
-    """Same as cache version, but encodes fresh inputs (used for novel pairs)."""
-    cfg = default_cfg()
-    from src.encoders import (
-        load_protein_encoder, load_text_encoder,
-        encode_protein_batch, encode_text_batch,
-    )
-    text_model, text_tok = load_text_encoder(cfg.model.text_encoder_path, device)
-    prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
+    """Same as cache version, but encodes fresh inputs (used for novel pairs).
+
+    Pass `encoders` (from `load_inspect_encoders`) to avoid reloading the frozen
+    encoders for every protein when inspecting a batch.
+    """
+    from src.encoders import encode_protein_batch, encode_text_batch
+    if encoders is None:
+        encoders = load_inspect_encoders(device)
+    text_model, text_tok, prot_model, prot_tok = encoders
 
     h_t, m_t = encode_text_batch(text_model, text_tok, [text], device,
                                  max_text_tokens, mask_text_specials)
@@ -127,6 +143,7 @@ def compute_similarity_matrix_live(
         protein_tokens = [str(int(i)) for i in protein_ids.tolist()]
 
     return {
+        "uid": uid,
         "S": S,
         "mask_p": m_p[0].cpu(),
         "mask_t": m_t[0].cpu(),
@@ -186,47 +203,129 @@ def plot_heatmap(out: dict, path: str = None, max_dim: int = 200):
         plt.show()
 
 
+def lookup_pairs_in_csv(csv_path: str, accessions, cfg) -> dict:
+    """Stream the CSV once, returning {accession: (protein_seq, text)} for the
+    requested accessions (those present). One pass, so it scales to many ids."""
+    import csv as _csv
+    want = list(dict.fromkeys(accessions))            # de-dup, keep order
+    want_set = set(want)
+    found: dict = {}
+    with open(csv_path, newline="") as f:
+        reader = _csv.DictReader(f)
+        for col in (cfg.data.csv_id_col, cfg.data.csv_protein_col, cfg.data.csv_text_col):
+            if col not in (reader.fieldnames or []):
+                raise SystemExit(f"CSV {csv_path} missing column {col!r}; "
+                                 f"has {reader.fieldnames}")
+        for row in reader:
+            a = row[cfg.data.csv_id_col]
+            if a in want_set and a not in found:
+                found[a] = (row[cfg.data.csv_protein_col], row[cfg.data.csv_text_col])
+                if len(found) == len(want_set):
+                    break
+    return found
+
+
+def report(out: dict, top_k: int) -> None:
+    """Print the per-pair summary + top-k alignments for one similarity result."""
+    S, mp, mt = out["S"], out["mask_p"], out["mask_t"]
+    uid = out.get("uid")
+    filip = 0.5 * (
+        S.max(dim=1).values[mp].mean().item() + S.max(dim=0).values[mt].mean().item()
+    )
+    tag = f"uid={uid}  " if uid else ""
+    print(f"[inspect] {tag}S.shape={tuple(S.shape)}  valid_p={int(mp.sum())}  "
+          f"valid_t={int(mt.sum())}  FILIP={filip:.4f}")
+    for r in top_k_alignments(out, top_k)[:5]:
+        print(f"  p_idx={r['p_idx']:4d}  text_idxs={r['top_text_idxs']}  "
+              f"scores={[round(s, 3) for s in r['top_scores']]}")
+
+
 def main() -> None:
     cfg = default_cfg()
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--top-k", type=int, default=5)
+    # Cache mode (run-2 cache, dedup-aware)
     ap.add_argument("--cache-dir", default=cfg.retrieval.cache_dir)
     ap.add_argument("--pair-id", type=str, default=None,
-                    help="UniProt ID to look up in pair_ids.json")
+                    help="accession to look up in the cache's pair_ids.json")
     ap.add_argument("--pair-idx", type=int, default=None,
-                    help="Direct row index into the cache")
-    ap.add_argument("--top-k", type=int, default=5)
+                    help="direct CSV-row index into the cache")
+    # Live mode: a single explicit pair
+    ap.add_argument("--protein", type=str, default=None, help="raw protein sequence")
+    ap.add_argument("--text", type=str, default=None, help="raw caption text")
+    # Live mode: look accessions up in a CSV
+    ap.add_argument("--csv", type=str, default=None,
+                    help="CSV to resolve --protein-id / --id-file accessions")
+    ap.add_argument("--protein-id", nargs="+", default=None,
+                    help="one or more primary_Accession to inspect live (needs --csv)")
+    ap.add_argument("--id-file", type=str, default=None,
+                    help="file with one primary_Accession per line (needs --csv)")
+    # Output
     ap.add_argument("--plot", type=str, default=None,
-                    help="path to save heatmap PNG")
-    ap.add_argument("--device", default="cpu")
+                    help="heatmap PNG path (single-pair modes)")
+    ap.add_argument("--plot-dir", type=str, default=None,
+                    help="directory for per-accession heatmaps (one <uid>.png each)")
     args = ap.parse_args()
 
     device = torch.device(args.device)
     model = _load_model(args.ckpt, device)
 
-    if args.pair_idx is not None:
-        idx = args.pair_idx
-    elif args.pair_id is not None:
-        with open(Path(args.cache_dir) / "pair_ids.json") as f:
-            ids = json.load(f)
-        idx = ids.index(args.pair_id)
+    # --- Cache mode (no live encoders needed) ---
+    if args.pair_id is not None or args.pair_idx is not None:
+        if args.pair_idx is not None:
+            idx = args.pair_idx
+        else:
+            with open(Path(args.cache_dir) / "pair_ids.json") as f:
+                idx = json.load(f).index(args.pair_id)
+        out = compute_similarity_matrix_from_cache(model, args.cache_dir, idx, device)
+        report(out, args.top_k)
+        if args.plot:
+            plot_heatmap(out, args.plot)
+        return
+
+    # --- Live mode: build the worklist of (uid, protein, text) ---
+    worklist = []
+    if args.protein and args.text:
+        worklist.append(("query", args.protein, args.text))
+    elif args.protein_id or args.id_file:
+        if not args.csv:
+            raise SystemExit("--protein-id / --id-file require --csv")
+        ids = list(args.protein_id or [])
+        if args.id_file:
+            ids += [ln.strip() for ln in open(args.id_file) if ln.strip()]
+        if not ids:
+            raise SystemExit("no accessions provided")
+        found = lookup_pairs_in_csv(args.csv, ids, cfg)
+        missing = [a for a in ids if a not in found]
+        if missing:
+            print(f"[inspect] WARNING: not found in CSV: {missing}")
+        worklist = [(a, found[a][0], found[a][1]) for a in ids if a in found]
     else:
-        raise SystemExit("Provide --pair-id or --pair-idx")
+        raise SystemExit(
+            "Provide one of: --protein + --text, --protein-id/--id-file + --csv, "
+            "or --pair-id/--pair-idx (cache).")
 
-    out = compute_similarity_matrix_from_cache(model, args.cache_dir, idx, device)
-    print(f"[inspect] uid={out['uid']}  S.shape={tuple(out['S'].shape)}  "
-          f"valid_p={int(out['mask_p'].sum())}  valid_t={int(out['mask_t'].sum())}")
-    print(f"[inspect] FILIP score (mean of max-sim, both dirs): "
-          f"{0.5 * (out['S'].max(dim=1).values[out['mask_p']].mean().item() + out['S'].max(dim=0).values[out['mask_t']].mean().item()):.4f}")
+    if not worklist:
+        raise SystemExit("nothing to inspect")
 
-    tops = top_k_alignments(out, args.top_k)
-    print(f"[inspect] top-{args.top_k} text matches for the first 5 protein positions:")
-    for r in tops[:5]:
-        print(f"  p_idx={r['p_idx']:4d}  text_idxs={r['top_text_idxs']}  "
-              f"scores={[round(s, 3) for s in r['top_scores']]}")
-
-    if args.plot:
-        plot_heatmap(out, args.plot)
+    encoders = load_inspect_encoders(device)          # loaded once, reused
+    if args.plot_dir:
+        Path(args.plot_dir).mkdir(parents=True, exist_ok=True)
+    for uid, protein, text in worklist:
+        out = compute_similarity_matrix_live(
+            model, protein, text, device, encoders=encoders, uid=uid,
+            mask_text_specials=cfg.retrieval.mask_text_special_tokens,
+            mask_protein_specials=cfg.retrieval.mask_protein_special_tokens,
+            max_protein_tokens=cfg.data.max_protein_tokens,
+            max_text_tokens=cfg.data.max_text_tokens,
+        )
+        report(out, args.top_k)
+        if args.plot_dir:
+            plot_heatmap(out, str(Path(args.plot_dir) / f"{uid}.png"))
+        elif args.plot:
+            plot_heatmap(out, args.plot)
 
 
 if __name__ == "__main__":
