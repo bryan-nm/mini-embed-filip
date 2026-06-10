@@ -173,7 +173,7 @@ def top_k_alignments(out: dict, k: int = 5):
     return results
 
 
-def plot_heatmap(out: dict, path: str = None, max_dim: int = 512):
+def plot_heatmap(out: dict, path: str = None, max_dim: int = 1024):
     """Optional matplotlib heatmap. Truncates very long sequences for display."""
     try:
         import matplotlib.pyplot as plt
