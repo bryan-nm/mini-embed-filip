@@ -210,7 +210,7 @@ fundamental measurement for dimensionality-sweep studies. Three input modes:
 | `--id-file` | none | file with one accession per line (needs `--csv`) |
 | `--top-k` | `5` | top-k text matches reported per protein position |
 | `--plot` | none | heatmap PNG path (single-pair modes) |
-| `--plot-dir` | none | directory for per-accession heatmaps (`<uid>.png` each) |
+| `--plot-dir` | none | per-accession heatmaps (`<uid>.png`) + index→token TSVs (`<uid>_text_tokens.tsv`, `<uid>_protein_tokens.tsv`) |
 
 `inspect.pbs` wraps the by-accession live mode for an Aurora batch job: it reads
 `protein_ids.txt`, pulls sequence+caption from the legacy SwissProt CSV, and

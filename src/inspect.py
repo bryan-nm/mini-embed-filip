@@ -240,6 +240,30 @@ def report(out: dict, top_k: int) -> None:
               f"scores={[round(s, 3) for s in r['top_scores']]}")
 
 
+def write_token_tsvs(out: dict, out_dir: str, uid: str) -> None:
+    """Write index->token TSVs so heatmap columns/rows and top-k `text_idxs`
+    can be read back to actual tokens. One file per modality; the `valid` column
+    flags real tokens vs masked specials ([CLS]/[SEP]/<bos>/<eos>/pad).
+
+    Token indices match the similarity-matrix axes exactly (text = columns,
+    protein = rows), so they cross-reference directly with `top_k_alignments`.
+    """
+    import csv as _csv
+    for modality, tok_key, mask_key in (("text", "tokens_t", "mask_t"),
+                                        ("protein", "tokens_p", "mask_p")):
+        tokens = out.get(tok_key)
+        if tokens is None:                        # cache mode carries no labels
+            continue
+        mask = out[mask_key].tolist()
+        path = Path(out_dir) / f"{uid}_{modality}_tokens.tsv"
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f, delimiter="\t")
+            w.writerow(["index", "token", "valid"])
+            for i, tok in enumerate(tokens):
+                valid = int(i < len(mask) and bool(mask[i]))
+                w.writerow([i, tok, valid])
+
+
 def main() -> None:
     cfg = default_cfg()
     ap = argparse.ArgumentParser()
@@ -323,6 +347,7 @@ def main() -> None:
         )
         report(out, args.top_k)
         if args.plot_dir:
+            write_token_tsvs(out, args.plot_dir, uid)
             plot_heatmap(out, str(Path(args.plot_dir) / f"{uid}.png"))
         elif args.plot:
             plot_heatmap(out, args.plot)
