@@ -405,7 +405,8 @@ def main() -> None:
                 )
                 short = {k: round(v, 4) for k, v in metrics.items()
                          if k in ("R@1", "R@5", "R@10", "gap_l2",
-                                  "mean_cross_token_cos", "uniformity_p_tokens")}
+                                  "mean_cross_token_cos", "mean_pos_token_cos",
+                                  "uniformity_p_tokens")}
                 print(f"[val] epoch={epoch}  {short}")
                 log.append({"epoch": epoch, "phase": phase_name, **metrics})
 

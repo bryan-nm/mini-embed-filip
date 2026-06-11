@@ -83,9 +83,21 @@ def modality_gap_metrics(
     eye_p = torch.eye(np_, device=cross.device, dtype=torch.bool)
     eye_t = torch.eye(nt, device=cross.device, dtype=torch.bool)
 
+    # Mean within-positive-pair token cosine: the complement to
+    # mean_cross_token_cos (which is the across-random-pairs background). Row k of
+    # z_p / z_t is a correct pair. mean_{i,j}<z_p[i], z_t[j]> over a pair equals
+    # <mean_i z_p[i], mean_j z_t[j]>, so this is just the per-pair dot of the
+    # mean-pooled token vectors — no per-pair matmul.
+    vp = mask_p.sum(dim=1, keepdim=True).clamp_min(1).to(z_p.dtype)
+    vt = mask_t.sum(dim=1, keepdim=True).clamp_min(1).to(z_t.dtype)
+    mean_p_pair = (z_p * mask_p.unsqueeze(-1)).sum(dim=1) / vp     # [N, D]
+    mean_t_pair = (z_t * mask_t.unsqueeze(-1)).sum(dim=1) / vt     # [N, D]
+    mean_pos_token_cos = (mean_p_pair * mean_t_pair).sum(dim=-1).mean().item()
+
     return {
         "gap_l2": gap_l2,
         "mean_cross_token_cos": cross.mean().item(),
+        "mean_pos_token_cos": mean_pos_token_cos,
         "mean_intra_p_token_cos": intra_p.masked_fill(eye_p, 0).sum().item()
             / max(np_ * (np_ - 1), 1),
         "mean_intra_t_token_cos": intra_t.masked_fill(eye_t, 0).sum().item()
