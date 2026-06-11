@@ -34,10 +34,12 @@ CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_a
 OUT=embeddings_live
 NAME=legacy        # outputs <OUT>/<NAME>_pooled.npz
 POOLING=mean       # or "none" for full per-token packed
+BATCH=64           # encoder batch: keep small (== precompute). Attention memory is
+                   # O(BATCH * seqlen^2); larger values OOM the XPU at seqlen 1024.
 
 echo "live embedding export: ${NNODES} nodes / ${NRANKS} ranks"
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
     python -m src.export_embeddings \
-        --csv "$CSV" --ckpt "$CKPT" \
+        --csv "$CSV" --ckpt "$CKPT" --batch-size "$BATCH" \
         --out-dir "$OUT" --name "$NAME" --pooling "$POOLING" --device xpu
 echo "done; embeddings in ${OUT}/"

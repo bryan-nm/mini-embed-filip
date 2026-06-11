@@ -427,10 +427,19 @@ def main() -> None:
                     help="mean = one vector per item; none = full per-token packed")
     ap.add_argument("--renormalize", action="store_true",
                     help="L2-normalize pooled vectors (pooling=mean)")
-    ap.add_argument("--batch-size", type=int, default=512)
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="rows per batch; default 512 cached (projection only) / "
+                         "64 live (the batch runs through the encoders, where "
+                         "attention memory is O(batch * seqlen^2))")
     ap.add_argument("--subset-size", type=int, default=0, help="live mode: first N CSV rows")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
+
+    # Live runs the encoders (AMPLIFY attention is materialized full, ~[B,H,L,L],
+    # by the non-fused XPU path), so it needs a small batch like precompute; the
+    # cached path only feeds the tiny projection head and can go large.
+    if args.batch_size is None:
+        args.batch_size = 64 if args.csv else 512
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
