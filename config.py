@@ -9,18 +9,31 @@ adapters listed in each `*Cfg` block.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 
-DATA_CSV = "/Users/bryan/Documents/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv"
+# Paths default to the local dev (Mac) layout but are environment-overridable, so
+# a config.py synced from the dev machine doesn't clobber the cluster's paths.
+# On Aurora, set these in the job script, e.g.:
+#   export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+#   export FILIP_DATA_CSV=/flare/.../SwissProt_full/fully_annotated_...csv
+# FILIP_MODELS_DIR swaps the base dir for all four models at once (subdir names
+# are assumed identical); the per-model vars override an individual path.
+MODELS_DIR = os.environ.get("FILIP_MODELS_DIR", "/Users/bryan/Documents/models")
 
-TEXT_ENCODER_PATH = "/Users/bryan/Documents/models/BioLinkBERT-base"
-PROTEIN_ENCODER_PATH = "/Users/bryan/Documents/models/SaAMPLIFY_120M"
-PROTEIN_DECODER_PATH = "/Users/bryan/Documents/models/Dayhoff-3b-UR90"  # Jamba (hybrid Mamba/attn MoE)
-TEXT_DECODER_PATH = "/Users/bryan/Documents/models/biogpt"
+DATA_CSV = os.environ.get(
+    "FILIP_DATA_CSV",
+    "/Users/bryan/Documents/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv",
+)
+
+TEXT_ENCODER_PATH = os.environ.get("FILIP_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
+PROTEIN_ENCODER_PATH = os.environ.get("FILIP_PROTEIN_ENCODER", f"{MODELS_DIR}/SaAMPLIFY_120M")
+PROTEIN_DECODER_PATH = os.environ.get("FILIP_PROTEIN_DECODER", f"{MODELS_DIR}/Dayhoff-3b-UR90")  # Jamba
+TEXT_DECODER_PATH = os.environ.get("FILIP_TEXT_DECODER", f"{MODELS_DIR}/biogpt")
 
 
 @dataclass

@@ -31,11 +31,16 @@ NRANKS=$(( NNODES * RANKS_PER_NODE ))
 # --- edit these ---
 CKPT=checkpoints/retrieval/epoch50.pt
 CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv
+MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models  # <-- VERIFY: dir holding BioLinkBERT-base, SaAMPLIFY_120M, ...
 OUT=embeddings_live
 NAME=legacy        # outputs <OUT>/<NAME>_pooled.npz
 POOLING=mean       # or "none" for full per-token packed
 BATCH=64           # encoder batch: keep small (== precompute). Attention memory is
                    # O(BATCH * seqlen^2); larger values OOM the XPU at seqlen 1024.
+
+# config.py defaults to the dev (Mac) model paths; point it at the cluster models
+# so a synced config.py doesn't send HF looking for /Users/... (or the Hub).
+export FILIP_MODELS_DIR="$MODELS_DIR"
 
 echo "live embedding export: ${NNODES} nodes / ${NRANKS} ranks"
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
