@@ -43,9 +43,12 @@ from src.data import (
     build_or_load_splits,
     group_ids_from_accessions,
     load_pairs,
+    load_row_protein_idx,
     load_splits,
 )
-from src.dist import init_distributed, barrier, cleanup
+from src.dist import (
+    init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
+)
 from src.decoder_adapters import (
     LoRACfg,
     clear_cross_memory,
@@ -54,6 +57,8 @@ from src.decoder_adapters import (
     set_cross_memory,
     unfreeze_top_blocks,
 )
+from src.cvae import build_cvae, beta_at
+from src.losses import masked_mean
 from src.model import MiniEmbedFilip
 
 
@@ -81,29 +86,53 @@ class GenerationDataset(Dataset):
 
        For direction='protein2text':
        inputs from protein cache, targets are raw text annotations.
+
+    Protein-side access always goes through `row_protein_idx` (CSV row -> unique
+    protein row), because the protein cache is deduplicated. When `need_target` is
+    set (CVAE training), the opposite modality's per-token hidden states are also
+    returned so the posterior q(w|source,target) can pool the target embedding.
     """
 
     def __init__(self, direction: str, cache_dir: str, pairs, indices,
-                 protein_dim: int, text_dim: int):
+                 protein_dim: int, text_dim: int, need_target: bool = False,
+                 row_protein_idx=None):
+        if direction not in ("text2protein", "protein2text"):
+            raise ValueError(direction)
         self.direction = direction
         self.pairs = pairs
         self.indices = list(indices)
-        if direction == "text2protein":
-            self.input_cache = PackedPerTokenCache(cache_dir, "text", text_dim)
-        elif direction == "protein2text":
-            self.input_cache = PackedPerTokenCache(cache_dir, "protein", protein_dim)
-        else:
-            raise ValueError(direction)
+        self.need_target = need_target
+        self.text_cache = PackedPerTokenCache(cache_dir, "text", text_dim)
+        self.protein_cache = PackedPerTokenCache(cache_dir, "protein", protein_dim)
+        if row_protein_idx is None:
+            row_protein_idx = load_row_protein_idx(cache_dir)
+        self.row_protein_idx = row_protein_idx
 
     def __len__(self):
         return len(self.indices)
 
+    def _protein(self, idx: int):
+        return self.protein_cache.get(int(self.row_protein_idx[idx]))
+
+    def _text(self, idx: int):
+        return self.text_cache.get(idx)
+
     def __getitem__(self, i: int):
         idx = self.indices[i]
-        h, m = self.input_cache.get(idx)                 # bf16, bool
-        pair = self.pairs[idx]
-        target = pair.protein if self.direction == "text2protein" else pair.text
-        return {"h": h, "m": m, "target": target, "idx": idx}
+        if self.direction == "text2protein":
+            h, m = self._text(idx)                       # source = text
+            target = self.pairs[idx].protein
+        else:
+            h, m = self._protein(idx)                    # source = protein
+            target = self.pairs[idx].text
+        item = {"h": h, "m": m, "target": target, "idx": idx}
+        if self.need_target:
+            # Opposite modality (the generated side) for the CVAE posterior.
+            h_t, m_t = (self._protein(idx) if self.direction == "text2protein"
+                        else self._text(idx))
+            item["h_tgt"] = h_t
+            item["m_tgt"] = m_t
+        return item
 
 
 def make_collate(target_tokenizer, max_target_tokens: int):
@@ -154,10 +183,26 @@ def make_collate(target_tokenizer, max_target_tokens: int):
         labels = input_ids.clone()
         labels[attn_mask == 0] = -100
 
-        return {
+        out = {
             "h": h_pad, "m": m_pad,
             "input_ids": input_ids, "attn_mask": attn_mask, "labels": labels,
         }
+
+        # Optional target-side per-token hidden states (CVAE posterior). Padded
+        # to the batch max; pooled through the frozen target projection later.
+        if "h_tgt" in batch[0]:
+            L_t = max(b["h_tgt"].size(0) for b in batch)
+            d_t = batch[0]["h_tgt"].size(-1)
+            ht_pad = torch.zeros(B, L_t, d_t, dtype=torch.bfloat16)
+            mt_pad = torch.zeros(B, L_t, dtype=torch.bool)
+            for i, b in enumerate(batch):
+                lt = b["h_tgt"].size(0)
+                ht_pad[i, :lt] = b["h_tgt"]
+                mt_pad[i, :lt] = b["m_tgt"]
+            out["h_tgt"] = ht_pad
+            out["m_tgt"] = mt_pad
+
+        return out
 
     return collate
 
@@ -212,7 +257,20 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
                     help="evaluate on the first N val pairs each epoch (0 = full val split)")
+    # Generation-side CVAE (Feature 1).
+    ap.add_argument("--use-cvae", action="store_true", default=cfg.generation.use_cvae,
+                    help="train a conditional VAE latent injected as extra cross-attn memory tokens")
+    ap.add_argument("--cvae-d-w", type=int, default=cfg.generation.cvae_d_w)
+    ap.add_argument("--cvae-n-latent-tokens", type=int,
+                    default=cfg.generation.cvae_n_latent_tokens)
+    ap.add_argument("--cvae-beta-max", type=float, default=cfg.generation.cvae_beta_max)
     args = ap.parse_args()
+
+    # Fold CVAE CLI overrides back into the config block build_cvae reads.
+    cfg.generation.use_cvae = args.use_cvae
+    cfg.generation.cvae_d_w = args.cvae_d_w
+    cfg.generation.cvae_n_latent_tokens = args.cvae_n_latent_tokens
+    cfg.generation.cvae_beta_max = args.cvae_beta_max
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -269,6 +327,30 @@ def main() -> None:
         print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
         print(f"[gen] num cross-attention adapters: {len(adapters)}")
 
+    # Direction-specific frozen retrieval handles: source side (project+expand for
+    # the cross-attn memory) and target projection (for the CVAE posterior).
+    if args.direction == "text2protein":
+        src_proj, src_expand, tgt_proj = (
+            retrieval.text_proj, retrieval.text_expand, retrieval.protein_proj)
+    else:
+        src_proj, src_expand, tgt_proj = (
+            retrieval.protein_proj, retrieval.protein_expand, retrieval.text_proj)
+
+    # 2b) Generation-side CVAE heads (Feature 1). Trained alongside the adapters;
+    # injected as extra cross-attention memory tokens.
+    cvae = None
+    n_latent = 0
+    if args.use_cvae:
+        cvae = build_cvae(cfg.generation, mem_dim, cfg.model.embed_dim).to(device)
+        n_latent = cvae.cfg.n_latent_tokens
+        if env.distributed:
+            broadcast_parameters(cvae)            # all ranks start from rank-0 weights
+        if env.is_main:
+            n_cvae = sum(p.numel() for p in cvae.parameters())
+            print(f"[gen] CVAE enabled: d_w={cvae.cfg.d_w} "
+                  f"latent_tokens={n_latent} beta_max={cvae.cfg.beta_max} "
+                  f"({n_cvae:,} params)")
+
     # 3) Data
     pairs = load_pairs(
         cfg.data.csv_path,
@@ -296,12 +378,16 @@ def main() -> None:
     if args.val_subset and args.val_subset > 0:
         val_indices = val_indices[:args.val_subset]
 
+    # Only train needs the target side (CVAE posterior); val conditions on the
+    # prior mean, so it never loads the target modality.
     train_ds = GenerationDataset(args.direction, args.cache_dir, pairs,
                                  splits["train"],
-                                 cfg.model.protein_hidden, cfg.model.text_hidden)
+                                 cfg.model.protein_hidden, cfg.model.text_hidden,
+                                 need_target=args.use_cvae)
     val_ds = GenerationDataset(args.direction, args.cache_dir, pairs,
                                val_indices,
-                               cfg.model.protein_hidden, cfg.model.text_hidden)
+                               cfg.model.protein_hidden, cfg.model.text_hidden,
+                               need_target=False)
 
     collate = make_collate(target_tok, cfg.generation.max_target_tokens)
     if env.distributed:
@@ -338,10 +424,12 @@ def main() -> None:
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=True)
     core = decoder.module if env.distributed else decoder
 
-    # 4) Optim
+    # 4) Optim — decoder adapters/LoRA (+ unfrozen blocks) and the CVAE heads.
+    train_params = [p for p in decoder.parameters() if p.requires_grad]
+    if cvae is not None:
+        train_params += list(cvae.parameters())
     optim = torch.optim.AdamW(
-        (p for p in decoder.parameters() if p.requires_grad),
-        lr=args.lr, weight_decay=cfg.generation.weight_decay,
+        train_params, lr=args.lr, weight_decay=cfg.generation.weight_decay,
     )
     total_steps = args.epochs * len(train_loader)
     warmup = max(int(cfg.generation.warmup_frac * total_steps), 1)
@@ -371,14 +459,29 @@ def main() -> None:
             attn_mask = batch["attn_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Encoder front-end (frozen): project then expand the appropriate side.
+            # Encoder front-end (frozen): project then expand the source side.
             with torch.no_grad():
-                if args.direction == "text2protein":
-                    z = retrieval.text_proj(h)
-                    mem = retrieval.text_expand(z)
-                else:
-                    z = retrieval.protein_proj(h)
-                    mem = retrieval.protein_expand(z)
+                z = src_proj(h)
+                mem = src_expand(z)
+
+            kl = torch.zeros((), device=device)
+            if cvae is not None:
+                # Posterior sees pooled source + target (both frozen embeddings);
+                # sampled latent -> extra cross-attn memory tokens. KL pulls the
+                # posterior toward the learned conditional prior p(w|source).
+                with torch.no_grad():
+                    z_src_pool = masked_mean(z, mask)
+                    h_tgt = batch["h_tgt"].to(device).float()
+                    m_tgt = batch["m_tgt"].to(device)
+                    z_tgt_pool = masked_mean(tgt_proj(h_tgt), m_tgt)
+                qmu, qlv = cvae.posterior_params(z_src_pool, z_tgt_pool)
+                pmu, plv = cvae.prior_params(z_src_pool)
+                w = cvae.reparam(qmu, qlv)
+                w_tok = cvae.latent_tokens(w)                # [B, k, mem_dim], carries grad
+                mem = torch.cat([mem, w_tok], dim=1)
+                k_mask = torch.ones(mem.size(0), n_latent, dtype=torch.bool, device=device)
+                mask = torch.cat([mask, k_mask], dim=1)
+                kl = cvae.kl(qmu, qlv, pmu, plv)
 
             set_cross_memory(adapters, mem, mask)
             out = decoder(input_ids=input_ids, attention_mask=attn_mask)
@@ -387,27 +490,30 @@ def main() -> None:
             logits = out.logits                              # [B, L, V]
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
+            ce = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            beta = beta_at(global_step, total_steps, cvae.cfg) if cvae is not None else 0.0
+            loss = ce + beta * kl
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                (p for p in decoder.parameters() if p.requires_grad),
-                cfg.generation.grad_clip,
-            )
+            # DDP syncs the decoder grads; the CVAE heads live outside its forward,
+            # so average their grads manually (mirrors the retrieval trainer).
+            if cvae is not None:
+                average_gradients(cvae)
+            torch.nn.utils.clip_grad_norm_(train_params, cfg.generation.grad_clip)
             optim.step()
             global_step += 1
 
             if env.is_main and ((it + 1) % cfg.generation.log_every == 0 or it == 0):
                 with torch.no_grad():
-                    ppl = torch.exp(loss).item()
-                print(
-                    f"[{args.direction}] epoch={epoch} step={it+1}/{len(train_loader)} "
-                    f"lr={lr:.2e} ce={loss.item():.4f} ppl={ppl:.2f}",
-                    flush=True,
-                )
+                    ppl = torch.exp(ce).item()
+                msg = (f"[{args.direction}] epoch={epoch} step={it+1}/{len(train_loader)} "
+                       f"lr={lr:.2e} ce={ce.item():.4f} ppl={ppl:.2f}")
+                if cvae is not None:
+                    msg += f" kl={kl.item():.4f} beta={beta:.3f}"
+                print(msg, flush=True)
 
         dt = time.time() - t0
         if env.is_main:
@@ -417,6 +523,8 @@ def main() -> None:
         if env.is_main:
             core.eval()
             val_losses = []
+            if cvae is not None:
+                cvae.eval()
             with torch.no_grad():
                 for batch in val_loader:
                     h = batch["h"].to(device).float()
@@ -424,10 +532,14 @@ def main() -> None:
                     input_ids = batch["input_ids"].to(device)
                     attn_mask = batch["attn_mask"].to(device)
                     labels = batch["labels"].to(device)
-                    if args.direction == "text2protein":
-                        mem = retrieval.text_expand(retrieval.text_proj(h))
-                    else:
-                        mem = retrieval.protein_expand(retrieval.protein_proj(h))
+                    z = src_proj(h)
+                    mem = src_expand(z)
+                    # Inference-time conditioning: prior mean (no target available).
+                    if cvae is not None:
+                        pmu, _ = cvae.prior_params(masked_mean(z, mask))
+                        mem = torch.cat([mem, cvae.latent_tokens(pmu)], dim=1)
+                        k_mask = torch.ones(mem.size(0), n_latent, dtype=torch.bool, device=device)
+                        mask = torch.cat([mask, k_mask], dim=1)
                     set_cross_memory(adapters, mem, mask)
                     out = core(input_ids=input_ids, attention_mask=attn_mask)
                     clear_cross_memory(adapters)
@@ -440,6 +552,8 @@ def main() -> None:
                         ignore_index=-100,
                     )
                     val_losses.append(loss.item())
+            if cvae is not None:
+                cvae.train()
             val_ce = sum(val_losses) / max(len(val_losses), 1)
             print(f"[val] epoch={epoch} ce={val_ce:.4f} ppl={math.exp(val_ce):.2f}")
             log.append({"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)})
@@ -448,10 +562,18 @@ def main() -> None:
             # blocks), keyed by requires_grad so partial-unfreeze weights persist.
             trainable = {n for n, p in core.named_parameters() if p.requires_grad}
             adapter_state = {k: v for k, v in core.state_dict().items() if k in trainable}
+            payload = {"epoch": epoch, "adapter_state": adapter_state,
+                       "cross_attn_every": args.cross_attn_every,
+                       "unfreeze_top": args.unfreeze_top}
+            # CVAE heads (Feature 1); absent => downstream loads run without a latent.
+            if cvae is not None:
+                payload["cvae_state"] = cvae.state_dict()
+                payload["cvae_cfg"] = {
+                    "d_w": cvae.cfg.d_w, "n_latent_tokens": cvae.cfg.n_latent_tokens,
+                    "hidden": cvae.cfg.hidden, "mem_dim": cvae.cfg.mem_dim,
+                }
             path = ckpt_dir / f"epoch{epoch:02d}.pt"
-            torch.save({"epoch": epoch, "adapter_state": adapter_state,
-                        "cross_attn_every": args.cross_attn_every,
-                        "unfreeze_top": args.unfreeze_top}, path)
+            torch.save(payload, path)
             print(f"[ckpt] saved {path}")
         barrier()
 

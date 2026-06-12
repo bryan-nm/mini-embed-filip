@@ -49,6 +49,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
+from src.best_of_n import pad_stack, select_best_of_n
+from src.cvae import load_cvae
 from src.data import group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
     LoRACfg, load_decoder_with_cross_attn, set_cross_memory, clear_cross_memory,
@@ -58,7 +60,7 @@ from src.encoders import (
     encode_protein_batch, encode_text_batch,
     load_protein_encoder, load_text_encoder,
 )
-from src.losses import filip_score_matrix_chunked
+from src.losses import filip_score_matrix_chunked, masked_mean
 from src.model import MiniEmbedFilip
 
 
@@ -98,7 +100,7 @@ def load_retrieval(ckpt_path: str, device) -> MiniEmbedFilip:
 # Generation phase: each rank generates + encodes its slice -> shard file
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
+def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> None:
     device = env.device
     shards_dir = Path(args.shards_dir)
     shards_dir.mkdir(parents=True, exist_ok=True)
@@ -134,17 +136,21 @@ def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
         )
         dec.load_state_dict(ck["adapter_state"], strict=False)
         dec.eval()
+        cvae = load_cvae(ck, cfg.model.embed_dim, device)   # None if pre-CVAE ckpt
         if dtok.pad_token is None:
             dtok.pad_token = dtok.eos_token
         dtok.padding_side = "left"   # correct for batched decoder generation
-        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters
+        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, cvae
 
     if env.is_main:
         models = _load_models()
     barrier()
     if not env.is_main:
         models = _load_models()
-    retrieval, text_model, text_tok, prot_model, prot_tok, decoder, dtok, adapters = models
+    retrieval, text_model, text_tok, prot_model, prot_tok, decoder, dtok, adapters, cvae = models
+    if env.is_main and cvae is not None:
+        print(f"[rt] CVAE conditioning enabled (latent_tokens={cvae.cfg.n_latent_tokens})",
+              flush=True)
 
     # Direction-specific encode/project handles (source = conditioning input,
     # target = generated modality).
@@ -167,6 +173,20 @@ def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
 
     bos = dtok.bos_token_id if dtok.bos_token_id is not None else dtok.eos_token_id
     pad_id = dtok.pad_token_id if dtok.pad_token_id is not None else dtok.eos_token_id
+    N = max(args.num_candidates, 1)
+
+    # Reference panel for margin selection: source-modality embeddings of train
+    # rows (disjoint from the scored set, so selection doesn't peek at the metric).
+    z_panel = panel_mask = None
+    if N > 1 and args.selection == "margin" and panel_indices:
+        with torch.no_grad():
+            h_pn, m_pn = enc_src([get_src(pairs[i]) for i in panel_indices])
+            z_pn = src_proj(h_pn.float())
+            z_panel, panel_mask = pad_stack(
+                [z_pn[i][m_pn[i]].cpu() for i in range(len(panel_indices))], 32, device)
+        if env.is_main:
+            print(f"[rt] best-of-{N} selection={args.selection} "
+                  f"panel={len(panel_indices)}", flush=True)
 
     records = []
     bs = args.batch_size
@@ -177,33 +197,57 @@ def generate_shard(args, cfg, env, sel_indices, pairs) -> None:
         srcs = [get_src(pairs[i]) for i in chunk]
         true_tgts = [get_tgt(pairs[i]) for i in chunk]
         uids = [pairs[i].uid for i in chunk]
+        B = len(chunk)
 
         # Source -> 32-d (retrieval candidate) + expanded cross-attn memory.
         h_src, mask_src = enc_src(srcs)
         z_src = src_proj(h_src.float())
         mem = src_expand(z_src)
 
-        set_cross_memory(adapters, mem, mask_src)
-        input_ids = torch.full((len(chunk), 1), bos, device=device, dtype=torch.long)
+        # N candidates per source: replicate the memory, add N latent samples
+        # (CVAE) for structured diversity; temperature supplies the rest.
+        mem_b = mem.repeat_interleave(N, dim=0)
+        mask_b = mask_src.repeat_interleave(N, dim=0)
+        if cvae is not None:
+            z_src_pool = masked_mean(z_src, mask_src)
+            w = cvae.sample_prior(z_src_pool.repeat_interleave(N, dim=0))
+            mem_b = torch.cat([mem_b, cvae.latent_tokens(w)], dim=1)
+            kmask = torch.ones(mem_b.size(0), cvae.cfg.n_latent_tokens,
+                               dtype=torch.bool, device=device)
+            mask_b = torch.cat([mask_b, kmask], dim=1)
+
+        set_cross_memory(adapters, mem_b, mask_b)
+        input_ids = torch.full((B * N, 1), bos, device=device, dtype=torch.long)
         gen = decoder.generate(
             input_ids, max_new_tokens=args.max_new_tokens,
             do_sample=args.temperature > 0, temperature=max(args.temperature, 1e-6),
             top_p=args.top_p, pad_token_id=pad_id, use_cache=True,
         )
         clear_cross_memory(adapters)
-        gen_tgts = [dtok.decode(row, skip_special_tokens=True).strip() for row in gen]
+        cand_tgts = [dtok.decode(row, skip_special_tokens=True).strip() for row in gen]
 
-        # Re-encode generated + true targets -> 32-d. Guard empty generations.
-        enc_in = [t if t.strip() else empty_tgt for t in gen_tgts]
+        # Re-encode all B*N candidates -> 32-d. Guard empty generations.
+        enc_in = [t if t.strip() else empty_tgt for t in cand_tgts]
         h_gen, mask_gen = enc_tgt(enc_in)
         z_gen = tgt_proj(h_gen.float())
         h_true, mask_true = enc_tgt(true_tgts)
         z_true = tgt_proj(h_true.float())
 
-        for b in range(len(chunk)):
+        for b in range(B):
+            # Select the best of this source's N candidates by round-trip margin.
+            js = list(range(b * N, b * N + N))
+            cand_z = [z_gen[j][mask_gen[j]].float().cpu() for j in js]
+            if N > 1:
+                zc, mc = pad_stack(cand_z, 32, device)
+                zs, ms = pad_stack([z_src[b][mask_src[b]].float().cpu()], 32, device)
+                best_j, _ = select_best_of_n(
+                    zc, mc, zs, ms, z_panel, panel_mask, mode=args.selection)
+            else:
+                best_j = 0
             records.append({
-                "uid": uids[b], "true_target": true_tgts[b], "gen_target": gen_tgts[b],
-                "z_gen": z_gen[b][mask_gen[b]].float().cpu(),    # generated target
+                "uid": uids[b], "true_target": true_tgts[b],
+                "gen_target": cand_tgts[js[best_j]],
+                "z_gen": cand_z[best_j],                          # selected candidate
                 "z_true": z_true[b][mask_true[b]].float().cpu(),  # true target (ceiling)
                 "z_src": z_src[b][mask_src[b]].float().cpu(),     # source (candidate)
             })
@@ -303,6 +347,7 @@ def score_and_write(args, device) -> None:
         "num_samples": args.num_samples, "split": args.split,
         "temperature": args.temperature, "top_p": args.top_p,
         "max_new_tokens": args.max_new_tokens,
+        "num_candidates": args.num_candidates, "selection": args.selection,
         f"generated_{tgt}_to_{src}": gen2src,
         f"{src}_to_generated_{tgt}": src2gen,
         f"true_{tgt}_to_{src}_ceiling": ceiling,
@@ -357,6 +402,11 @@ def main() -> None:
     ap.add_argument("--filip-chunk-rows", type=int, default=8)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
+    # Best-of-N (Feature 3): generate N per source, keep the best round-trip margin.
+    ap.add_argument("--num-candidates", type=int, default=1)
+    ap.add_argument("--selection", choices=["margin", "pos"], default="margin")
+    ap.add_argument("--panel-size", type=int, default=256,
+                    help="train rows sampled as the selection reference panel")
     ap.add_argument("--score-only", action="store_true",
                     help="skip generation; merge+score existing shards (single process)")
     args = ap.parse_args()
@@ -397,7 +447,12 @@ def main() -> None:
     if args.num_samples > 0:
         sel = sel[:args.num_samples]
 
-    generate_shard(args, cfg, env, sel, pairs)
+    # Margin-selection panel: train rows, disjoint from the scored split.
+    panel_indices = None
+    if args.num_candidates > 1 and args.selection == "margin" and args.panel_size > 0:
+        panel_indices = list(splits["train"])[:args.panel_size]
+
+    generate_shard(args, cfg, env, sel, pairs, panel_indices=panel_indices)
     barrier()
     if env.is_main:
         score_and_write(args, env.device)

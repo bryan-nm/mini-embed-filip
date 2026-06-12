@@ -161,6 +161,18 @@ def reconstruction_loss(
     return (diff * valid).sum() / valid.sum().clamp_min(1.0)
 
 
+def masked_mean(z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean over valid tokens. z [B, L, D], mask [B, L] bool -> [B, D].
+
+    Used to pool a per-token sequence into a single vector (e.g. the source/target
+    conditioning vectors for the generation-side CVAE).
+    """
+    valid = mask.unsqueeze(-1).to(z.dtype)          # [B, L, 1]
+    summed = (z * valid).sum(dim=1)                 # [B, D]
+    count = valid.sum(dim=1).clamp_min(1.0)         # [B, 1]
+    return summed / count
+
+
 # ---------------------------------------------------------------------------
 # Phase-R1 / Phase-R2 composites
 # ---------------------------------------------------------------------------

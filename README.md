@@ -8,20 +8,30 @@ generation-side cross-attention. Only the projection and expansion heads
 train during the retrieval phase; cross-attention adapters + LoRA train
 during the per-direction generation phase.
 
-Four trained things in total:
+Trained things:
 
 1. **Projection heads** (per-token, position-wise): encoder hidden → 32-d.
 2. **Expansion heads** (per-token, symmetric to projections): 32-d → encoder hidden.
+   A small auxiliary reconstruction term trains them during retrieval; an optional
+   **expansion-only reconstruction phase** then sharpens them further at zero
+   retrieval cost (see `src/train_reconstruction`).
 3. **Decoder cross-attention adapters** (text→protein direction: Dayhoff-3b-UR90,
    a Jamba hybrid Mamba/attention MoE; protein→text direction: BioGPT). Trained
    per direction, independently. Injection is architecture-dispatched, so a
    direction can be re-pointed at a different decoder by changing its path.
 4. **Decoder LoRA on existing self-attn/FFN** (small, also per direction).
+5. **CVAE heads** (optional, per direction): a learned conditional prior +
+   posterior over a latent `w` that captures the one-to-many residual
+   `p(target|source)`; injected as extra cross-attention memory tokens. Trained
+   alongside the adapters when `--use-cvae` is set; absent by default.
+
+Items 1–2 train in the retrieval phase; 3–5 in the per-direction generation phase.
 
 The 32-d shared space serves as a universal interlingua: retrieval scores
 flow through it, generation conditioning flows through it. See
 [PLAN_late_interaction.md](PLAN_late_interaction.md) for the architectural
-rationale.
+rationale, and [PLAN_generativity.md](PLAN_generativity.md) for the
+reconstruction phase, generation-side CVAE, and best-of-N round-trip selection.
 
 ---
 
@@ -46,6 +56,20 @@ You also need four pretrained models on disk. Default paths in `config.py`:
 | protein decoder (text→protein) | Dayhoff-3b-UR90 (Jamba) | `/Users/bryan/Documents/models/Dayhoff-3b-UR90` |
 | text decoder (protein→text) | BioGPT | `/Users/bryan/Documents/models/biogpt` |
 
+These defaults are the dev-machine layout but are **environment-overridable**, so
+a `config.py` synced from the dev box doesn't clobber a cluster's paths. Set in
+the job script:
+
+```bash
+export FILIP_MODELS_DIR=/path/to/models   # swaps the base dir for all four (subdir names assumed equal)
+export FILIP_DATA_CSV=/path/to/data.csv   # overrides DATA_CSV
+# per-model overrides if a name/location differs:
+export FILIP_TEXT_ENCODER=...  FILIP_PROTEIN_ENCODER=...  FILIP_PROTEIN_DECODER=...  FILIP_TEXT_DECODER=...
+```
+
+(If you see `HFValidationError: Repo id must be in the form ...` for a `/Users/...`
+path, it's this — a dev `config.py` on the cluster with no override set.)
+
 Data source (default in `DataCfg.csv_path`): the SwissProt-full CSV with
 columns `primary_Accession`, `protein_sequence`, `[final]text_caption`,
 `pfam_label`.
@@ -54,9 +78,10 @@ columns `primary_Accession`, `protein_sequence`, `[final]text_caption`,
 
 ## End-to-end workflow
 
-There are four scripts; run them in order. The first is one-shot, the next
-two are training, the fourth is inference. Inspection can run at any point
-after retrieval training.
+Run the stages in order. Precompute is one-shot, retrieval and generation are
+training, generate is inference. The reconstruction phase (2b) is optional but
+recommended before generation; round-trip eval and inspection can run at any
+point after retrieval training.
 
 ```bash
 # 1) One-shot per-token cache build (encoder forwards over the dataset).
@@ -65,20 +90,41 @@ python -m src.precompute --device cuda --batch-size 64
 # 2) Retrieval (FILIP) training.
 python -m src.train_retrieval --use-cache --device cuda
 
-# 3a) Generation training: text → protein (ProGen2-small).
+# 2b) OPTIONAL: expansion-only reconstruction phase. Freezes the projection
+#     heads (R@K unchanged) and trains only the expansion heads harder, so the
+#     generation conditioning memory expand(project(h)) is less lossy. Produces a
+#     retrieval-format checkpoint that the generation stage consumes in place of
+#     the raw retrieval checkpoint.
+python -m src.train_reconstruction \
+    --ckpt checkpoints/retrieval/epochNN.pt --device cuda
+
+# 3a) Generation training: text → protein (Dayhoff-3b by default).
+#     Add --use-cvae to also train the conditional-VAE latent.
 python -m src.train_generation --direction text2protein \
-    --retrieval-ckpt checkpoints/retrieval/epochNN.pt --device cuda
+    --retrieval-ckpt checkpoints/reconstruction/epochNN.pt --device cuda
 
 # 3b) Generation training: protein → text (BioGPT).
 python -m src.train_generation --direction protein2text \
-    --retrieval-ckpt checkpoints/retrieval/epochNN.pt --device cuda
+    --retrieval-ckpt checkpoints/reconstruction/epochNN.pt --device cuda
 
-# 4) Inference (either direction).
+# 4) Inference (either direction). --num-candidates>1 enables best-of-N with
+#    contrastive round-trip selection.
 python -m src.generate --direction text2protein \
-    --retrieval-ckpt checkpoints/retrieval/epochNN.pt \
+    --retrieval-ckpt checkpoints/reconstruction/epochNN.pt \
     --decoder-ckpt   checkpoints/generation/text2protein/epochNN.pt \
-    --input "PROTEIN NAME: DNA helicase. FUNCTION: Unwinds DNA duplex..."
+    --input "PROTEIN NAME: DNA helicase. FUNCTION: Unwinds DNA duplex..." \
+    --num-candidates 8 --selection margin
+
+# 5) Round-trip eval: generate -> re-encode -> FILIP-retrieve the source.
+python -m src.roundtrip_eval --direction text2protein \
+    --retrieval-ckpt checkpoints/reconstruction/epochNN.pt \
+    --decoder-ckpt   checkpoints/generation/text2protein/epochNN.pt \
+    --num-samples 1000 --split test --device cuda
 ```
+
+The retrieval checkpoint passed to generation/inference can be either a
+`train_retrieval` or a `train_reconstruction` checkpoint — they share the same
+format. Use the reconstruction one when you have it.
 
 ## Local smoke test (no cluster, no cache)
 
@@ -86,13 +132,31 @@ python -m src.generate --direction text2protein \
 python -m src.precompute --subset-size 512 --batch-size 16 --device cpu
 python -m src.train_retrieval --use-cache --batch-size 32 \
     --phase1-epochs 1 --phase2-epochs 2 --device cpu
+
+# Optional reconstruction phase (expansion heads only; R@K unchanged).
+python -m src.train_reconstruction --ckpt checkpoints/retrieval/epoch02.pt \
+    --subset-size 512 --batch-size 32 --epochs 2 --device cpu
+
+# Generation. The default text2protein decoder is Dayhoff-3b (a 3B Jamba MoE,
+# impractical on CPU); point the direction at a small decoder for the smoke test.
+# --subset-size must match the cache so the by-accession split lines up.
+FILIP_PROTEIN_DECODER=/path/to/progen2-small \
 python -m src.train_generation --direction text2protein \
-    --retrieval-ckpt checkpoints/retrieval/epoch02.pt \
-    --subset-size 64 --batch-size 4 --epochs 1 --device cpu
+    --retrieval-ckpt checkpoints/reconstruction/epoch01.pt \
+    --subset-size 512 --batch-size 4 --epochs 1 --device cpu --use-cvae
+
+# Best-of-N inference (re-encodes candidates; loads the target encoder too).
+FILIP_PROTEIN_DECODER=/path/to/progen2-small \
+python -m src.generate --direction text2protein \
+    --retrieval-ckpt checkpoints/reconstruction/epoch01.pt \
+    --decoder-ckpt checkpoints/generation/text2protein/epoch00.pt \
+    --input "Catalytic protein involved in metabolism." \
+    --num-candidates 4 --selection margin --max-new-tokens 24 --device cpu
 ```
 
-512 pairs precompute in ~100s on Mac CPU. Retrieval epoch ~20s. Generation
-epoch ~25s. The full pipeline finishes in under 5 minutes.
+512 pairs precompute in ~100s on Mac CPU. Retrieval epoch ~20s. Reconstruction
+epoch is a few seconds (no decoder). Generation epoch with a small decoder is a
+minute or two on CPU.
 
 ---
 
@@ -149,12 +213,33 @@ Config knobs in `config.py` (`RetrievalCfg`) not on the CLI:
 - `recon_weight = 0.05` — autoencoder loop weight throughout both phases.
 - `init_temperature = 0.07` — learnable CLIP temperature, clamped to ≤ 100.
 
+### `src/train_reconstruction`
+
+Optional phase between retrieval and generation. Loads a retrieval checkpoint,
+**freezes the projection heads + temperature, trains only the expansion heads**
+on reconstruction MSE, and writes the same checkpoint format. Because retrieval
+scoring depends only on the projection, R@K is mathematically unchanged (the
+per-epoch log re-runs the eval to confirm); the gain is a less-lossy
+`expand(project(h))` conditioning memory for generation.
+
+| flag | default | meaning |
+|---|---|---|
+| `--ckpt` | required | trained retrieval checkpoint to refine |
+| `--device` | `auto` | |
+| `--cache-dir` | `cache/` | per-token cache to reconstruct |
+| `--ckpt-dir` | `checkpoints/reconstruction/` | per-epoch checkpoints + `train_log.json` |
+| `--batch-size` | `128` | |
+| `--epochs` | `5` | |
+| `--lr` | `1e-3` | recon tolerates a higher LR than joint retrieval |
+| `--subset-size` | `0` | must match the cache when <full |
+| `--val-subset` | `1000` | recon MSE + R@K-unchanged check each epoch |
+
 ### `src/train_generation`
 
 | flag | default | meaning |
 |---|---|---|
 | `--direction` | required | `text2protein` or `protein2text` |
-| `--retrieval-ckpt` | required | path to a `train_retrieval` checkpoint |
+| `--retrieval-ckpt` | required | path to a `train_retrieval` *or* `train_reconstruction` checkpoint |
 | `--device` | `auto` | |
 | `--cache-dir` | `cache/` | per-token encoder cache used as cross-attn memory source |
 | `--ckpt-dir` | `checkpoints/generation/<direction>/` | adapter-only checkpoints |
@@ -162,12 +247,28 @@ Config knobs in `config.py` (`RetrievalCfg`) not on the CLI:
 | `--epochs` | `3` | |
 | `--lr` | `1e-4` | |
 | `--cross-attn-every` | `2` | inject cross-attention into every Nth block |
-| `--subset-size` | `0` | |
+| `--unfreeze-top` | `0` | fully fine-tune the top N decoder blocks (on top of adapters/LoRA) |
+| `--subset-size` | `0` | must match the cache when <full |
 | `--seed` | `0` | reuses retrieval splits when the dataset size matches |
+| `--use-cvae` | off | train the conditional-VAE latent (see below) |
+| `--cvae-d-w` | `32` | latent dimension |
+| `--cvae-n-latent-tokens` | `4` | extra cross-attn memory tokens decoded from `w` |
+| `--cvae-beta-max` | `0.1` | KL weight after warmup |
 
 Config knobs in `GenerationCfg` not on the CLI: `lora_rank=16`,
 `lora_alpha=32`, `lora_dropout=0.05`, `lora_targets_self_attn=True`,
-`lora_targets_ffn=True`, `max_target_tokens=512`.
+`lora_targets_ffn=True`, `max_target_tokens=512`, `cvae_hidden=256`,
+`cvae_free_bits=0.5`, `cvae_kl_warmup_frac=0.3`.
+
+**CVAE (`--use-cvae`).** Adds a latent `w` capturing the one-to-many residual
+`p(target|source)`. A posterior `q(w|source,target)` (sees both pooled 32-d
+embeddings, both frozen) is trained against a learned conditional prior
+`p(w|source)`; `w` is decoded to `cvae_n_latent_tokens` extra cross-attention
+memory tokens. Loss is `CE + β·KL`, with β warming 0→`cvae_beta_max` and per-dim
+free bits guarding against posterior collapse. The CVAE heads are saved under
+`cvae_state` in the checkpoint (absent ⇒ downstream runs without a latent). At
+inference, `w` is sampled from the prior — sampling N latents yields N distinct
+candidates for best-of-N. See [PLAN_generativity.md](PLAN_generativity.md).
 
 ### `src/generate`
 
@@ -180,7 +281,45 @@ Config knobs in `GenerationCfg` not on the CLI: `lora_rank=16`,
 | `--max-new-tokens` | `256` | |
 | `--temperature` | `1.0` | sampling temperature |
 | `--top-p` | `0.9` | nucleus sampling |
+| `--num-candidates` | `1` | >1 enables best-of-N selection |
+| `--selection` | `margin` | `margin` (pos − best panel) or `pos` |
+| `--panel-size` | `256` | reference negatives sampled from `--panel-csv` |
+| `--panel-csv` | `DATA_CSV` | source of the margin reference panel |
 | `--device` | `auto` | |
+
+If the decoder checkpoint carries `cvae_state`, the conditioning memory is
+augmented with a latent sampled from the prior `p(w|source)`; with
+`--num-candidates > 1`, N independent latent samples give N distinct candidates,
+re-encoded and ranked by round-trip score (the loaded target encoder closes the
+loop). The ranked list is printed and the best candidate is the output.
+
+### `src/roundtrip_eval`
+
+Generate → re-encode the generation → FILIP-retrieve the source, reporting R@K
+against a ceiling (true output re-encoded → source). Distributed like precompute
+(one rank per tile generates+encodes a shard; rank 0 merges and scores). With
+`--num-candidates > 1` it does best-of-N per source before scoring; the
+selection panel is drawn from the **train** split (disjoint from the scored set,
+so selection doesn't inflate the reported metric).
+
+| flag | default | meaning |
+|---|---|---|
+| `--direction` | `text2protein` | `text2protein` or `protein2text` |
+| `--retrieval-ckpt` | required | retrieval / reconstruction checkpoint |
+| `--decoder-ckpt` | required | generation checkpoint (CVAE auto-detected) |
+| `--split` | `test` | `train` / `val` / `test` |
+| `--num-samples` | `1000` | sources to evaluate (0 = whole split) |
+| `--num-candidates` | `1` | best-of-N per source |
+| `--selection` | `margin` | `margin` or `pos` |
+| `--panel-size` | `256` | train rows used as the margin reference panel |
+| `--temperature` / `--top-p` | `1.0` / `0.9` | sampling |
+| `--max-new-tokens` | `256` | |
+| `--score-only` | off | re-score existing shards (single process) |
+| `--device` | `auto` | |
+
+Outputs (`eval/<direction>/`): `roundtrip_metrics.json` (R@K both directions +
+ceiling + config, including `num_candidates`/`selection`), `roundtrip_pairs.tsv`,
+and `roundtrip_sequences.fasta` (text2protein only).
 
 ### `src/inspect`
 
@@ -216,6 +355,50 @@ fundamental measurement for dimensionality-sweep studies. Three input modes:
 `protein_ids.txt`, pulls sequence+caption from the legacy SwissProt CSV, and
 writes a heatmap per accession. `compute_similarity_matrix_live` /
 `load_inspect_encoders` are also available as a Python API.
+
+### `src/export_embeddings`
+
+Dumps the 32-d retrieval embeddings (`z_p`, `z_t`), keyed by primary accession,
+for latent-space structure work (clustering, UMAP, modality gap) that training
+never emitted. Two sources, with **different parallelism**:
+
+- **Cached** (default): projects the precomputed cache for whole train/val/test
+  splits. Just the projection head over cached hidden states — tiny compute,
+  I/O-bound — so it runs **single process** (plain `python`, not mpiexec).
+  ```bash
+  python -m src.export_embeddings --ckpt checkpoints/retrieval/epochNN.pt \
+      --splits train,test --device xpu
+  ```
+- **Live** (`--csv PATH`): encodes every row of a CSV (no cache, no splits — all
+  sequences). This runs the frozen **encoders**, the expensive part, so it is
+  **distributed** — launch under `mpiexec` (`export_embeddings.pbs`) and it
+  shards proteins/rows across tiles like precompute (one process falls back
+  cleanly). Proteins are deduped (encoded once per unique accession).
+  ```bash
+  mpiexec -n <12*nodes> -ppn 12 python -m src.export_embeddings \
+      --csv data.csv --ckpt checkpoints/retrieval/epochNN.pt --name mydata --device xpu
+  ```
+
+| flag | default | meaning |
+|---|---|---|
+| `--ckpt` | required | retrieval checkpoint |
+| `--cache-dir` | `cache/` | cached mode: per-token cache to project |
+| `--csv` | none | live mode: encode this CSV (no cache/splits); distributed under mpiexec |
+| `--out-dir` | `embeddings/` | output directory |
+| `--name` | `live` | live mode: output basename (`<name>_pooled.npz`) |
+| `--splits` | `train,test` | cached mode: comma list of `train`/`val`/`test`, or `all` |
+| `--modalities` | `protein,text` | which to export |
+| `--pooling` | `mean` | `mean` = one vector per item; `none` = full per-token packed |
+| `--renormalize` | off | L2-normalize pooled vectors |
+| `--batch-size` | `512` | rows per batch |
+| `--subset-size` | `0` | live mode: first N CSV rows |
+| `--device` | `auto` | `cpu`/`xpu`/`cuda` |
+
+`--pooling mean` writes a `_pooled.npz` (`<split>_pooled.npz` cached, or
+`<name>_pooled.npz` live) with `z_p [Np,D]`+`acc_p`, `z_t [Nt,D]`+`acc_t`+`row_t`
+— proteins deduped (one per unique accession), captions per CSV row. `--pooling
+none` streams `<...>_<mod>_z.f32.bin` + `_offsets.npy` + `_accessions.json`
+(packed like the cache; text can be tens of GB).
 
 ---
 
@@ -254,7 +437,8 @@ shorter on-screen view shows:
 |---|---|---|
 | `R@1`, `R@5`, `R@10` | symmetric retrieval recall over the val split | climbs from random; R@10 above ~0.5 indicates real alignment |
 | `gap_l2` | distance between mean text-token and mean protein-token in 32-d | falls during Phase R1, may rebound in Phase R2 |
-| `mean_cross_token_cos` | average cosine between random protein-token and random text-token | should NOT be close to 1 |
+| `mean_cross_token_cos` | average cosine between random protein-token and random text-token (background, across non-matching pairs) | should NOT be close to 1 |
+| `mean_pos_token_cos` | average cosine between protein-token and text-token within a *correct* pair | should sit clearly above `mean_cross_token_cos`; the gap between them is the per-token alignment signal |
 | `uniformity_p_tokens` | per-modality Wang-Isola spread; lower (more negative) = better-spread | approaches `-3.7` for fully-spread 32-d on the sphere |
 
 Also in the full dict: `mean_intra_p_token_cos`, `mean_intra_t_token_cos`
@@ -265,17 +449,21 @@ Also in the full dict: `mean_intra_p_token_cos`, `mean_intra_t_token_cos`
 
 ```
 [text2protein] epoch=0 step=1/14 lr=1.00e-04 ce=2.8933 ppl=18.05
+[text2protein] epoch=0 step=1/14 lr=1.00e-04 ce=2.8933 ppl=18.05 kl=24.6 beta=0.000   # with --use-cvae
 ```
 
 | field | meaning |
 |---|---|
 | `ce` | cross-entropy on the target sequence, teacher-forced |
-| `ppl` | `exp(ce)`; perplexity. Random baseline = vocab size (32 for ProGen2, 42384 for BioGPT) |
+| `ppl` | `exp(ce)`; perplexity. Random baseline = vocab size (≈32 for ProGen2/Dayhoff char vocab, 42384 for BioGPT) |
+| `kl` | (CVAE only) KL(posterior‖prior), floored at `cvae_free_bits × cvae_d_w` |
+| `beta` | (CVAE only) current KL weight, warming 0 → `cvae_beta_max` |
 
 The decoder cross-attention adapters and LoRA layers are zero-initialized,
 so the first forward equals the pretrained decoder's unconditional prior.
 `ce` at step 0 should already be below random; learning is visible as it
-drops further over the first epoch.
+drops further over the first epoch. With `--use-cvae`, val CE conditions on the
+prior **mean** (no target at inference), so it reflects the inference-time path.
 
 ---
 
@@ -306,6 +494,13 @@ pretrained model's unconditional perplexity, and outputs from different
 `z_t` look interchangeable. Cross-attention is not being used. Try
 `--cross-attn-every 1` (more injection points), then check the auxiliary
 facilitator-style ideas in the design doc.
+
+**CVAE posterior collapse.** `kl` falls to its free-bits floor early and stays
+there, and decoding two latent samples for one source gives identical outputs —
+the decoder is ignoring `w`. Lower `cvae_beta_max`, raise `cvae_free_bits`,
+inject the latent at more layers (`--cross-attn-every 1`), or add latent tokens
+(`--cvae-n-latent-tokens`). Until samples are visibly diverse, best-of-N over
+latents has nothing to select from.
 
 ---
 
@@ -387,14 +582,21 @@ Precompute time, Mac CPU: ~5 pairs/s; single Aurora GPU: a few hundred
 pairs/s. Full SwissProt precompute on a single 6-GPU Aurora node is a
 ~4–6 hour one-time cost.
 
-Trainable parameter counts (default config):
+Trainable parameter counts:
 
 | stage | params |
 |---|---|
 | retrieval (projection + expansion heads + temperature) | ~2.0M |
-| generation text→protein (ProGen2 cross-attn @ every-2 + LoRA) | ~25M |
+| reconstruction (expansion heads only, refines existing weights) | ~1.0M |
+| generation text→protein (ProGen2-class cross-attn @ every-2 + LoRA) | ~25M |
 | generation protein→text (BioGPT cross-attn @ every-2 + LoRA) | ~48M |
-| **total across all three trainings** | **~75M** |
+| CVAE heads, per direction (optional, `--use-cvae`) | ~0.2M |
+
+The text→protein figure is for a ProGen2-class decoder (what training run 1
+used); the shipped default decoder is the larger Dayhoff-3b Jamba MoE, whose
+cross-attention adapters scale with its hidden size and layer count.
+Reconstruction trains the same expansion-head tensors as retrieval (no new
+parameters); the CVAE heads are tiny relative to the adapters.
 
 See [PLAN_late_interaction.md](PLAN_late_interaction.md) for the full
 design rationale, the rejected alternatives (Q-former, soft prefixes,
