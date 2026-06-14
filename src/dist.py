@@ -271,14 +271,26 @@ def average_gradients(model) -> None:
     forward, which DDP's reducer can't track (it double-marks `logit_scale`).
     The set of params receiving a grad is identical across ranks within a step
     (phase-consistent), so iterating in parameter order stays collective-safe.
+
+    Gradients are flattened into a single buffer for ONE all-reduce, rather than
+    one collective per parameter tensor. The model is ~40 small tensors (~2M
+    params total), so the per-tensor pattern fired ~40 latency-bound collectives
+    per step; at thousands of ranks that latency dominates and per-step time
+    blows up (the cost barely depends on payload, only rank count). Coalescing to
+    a single 8 MB all-reduce collapses those ~40 latency hits into one — the
+    difference between comm-bound and compute-bound at high node counts.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return
     world = torch.distributed.get_world_size()
-    for p in model.parameters():
-        if p.grad is not None:
-            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
-            p.grad /= world
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return
+    flat = torch._utils._flatten_dense_tensors(grads)
+    torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+    flat /= world
+    for g, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
+        g.copy_(synced)
 
 
 # ---------------------------------------------------------------------------
