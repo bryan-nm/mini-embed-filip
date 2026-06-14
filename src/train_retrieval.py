@@ -229,6 +229,9 @@ def main() -> None:
     ap.add_argument("--phase1-uniformity-weight", type=float,
                     default=cfg.retrieval.phase1_uniformity_weight,
                     help="R1 token-spread weight; raise toward 0.3 if R1 collapses")
+    ap.add_argument("--r2-uniformity-weight", type=float,
+                    default=cfg.retrieval.r2_uniformity_weight,
+                    help="R2 token-spread weight; counters per-token crowding under contrastive")
     ap.add_argument("--align-aux-weight", type=float, default=cfg.retrieval.align_aux_weight,
                     help="R2 positive-pair maintenance weight")
     ap.add_argument("--recon-weight", type=float, default=cfg.retrieval.recon_weight,
@@ -243,6 +246,7 @@ def main() -> None:
     cfg.retrieval.phase2_epochs = args.phase2_epochs
     cfg.retrieval.lr = args.lr
     cfg.retrieval.phase1_uniformity_weight = args.phase1_uniformity_weight
+    cfg.retrieval.r2_uniformity_weight = args.r2_uniformity_weight
     cfg.retrieval.align_aux_weight = args.align_aux_weight
     cfg.retrieval.recon_weight = args.recon_weight
     cfg.data.seed = args.seed
@@ -365,6 +369,8 @@ def main() -> None:
                         local_offset=local_offset,
                         align_aux_weight=cfg.retrieval.align_aux_weight,
                         recon_weight=cfg.retrieval.recon_weight,
+                        uniformity_weight=cfg.retrieval.r2_uniformity_weight,
+                        uniformity_t=cfg.retrieval.uniformity_t,
                         chunk_rows=args.filip_chunk_rows,
                         groups=groups_local, groups_all=groups_all,
                     )

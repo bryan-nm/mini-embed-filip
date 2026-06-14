@@ -241,6 +241,8 @@ def phase_r2_loss_grouped(
     local_offset: int,            # row index of this rank's first sample within [0, G)
     align_aux_weight: float,
     recon_weight: float,
+    uniformity_weight: float = 0.0,
+    uniformity_t: float = 2.0,
     chunk_rows: int = 0,
     groups: Optional[torch.Tensor] = None,       # [B] accession id per local anchor
     groups_all: Optional[torch.Tensor] = None,   # [G] accession id per gathered column
@@ -290,11 +292,24 @@ def phase_r2_loss_grouped(
         + reconstruction_loss(h_t_hat, h_t, mask_t)
     )
 
-    total = l_nce + align_aux_weight * l_align + recon_weight * l_recon
+    # Token-spread regularizer: the contrastive negatives alone don't keep the
+    # space uniform when many tokens are legitimately shared across proteins
+    # (templated captions), so the per-token cloud crowds. Computed on the local
+    # batch's tokens, matching phase_r1_loss.
+    if uniformity_weight > 0:
+        l_unif = 0.5 * (
+            token_uniformity_loss(z_p, mask_p, uniformity_t)
+            + token_uniformity_loss(z_t, mask_t, uniformity_t)
+        )
+    else:
+        l_unif = torch.zeros((), device=z_p.device)
+
+    total = (l_nce + align_aux_weight * l_align + recon_weight * l_recon
+             + uniformity_weight * l_unif)
     return {
         "loss": total,
         "align": l_align,
-        "unif": torch.zeros((), device=z_p.device),
+        "unif": l_unif,
         "recon": l_recon,
         "nce": l_nce,
         "acc": acc,
@@ -312,10 +327,13 @@ def phase_r2_loss(
     *,
     align_aux_weight: float,
     recon_weight: float,
+    uniformity_weight: float = 0.0,
+    uniformity_t: float = 2.0,
     chunk_rows: int = 0,
     groups: Optional[torch.Tensor] = None,       # [B] accession id per pair
 ) -> dict:
-    """Phase R2: FILIP-based symmetric InfoNCE + small align aux + recon.
+    """Phase R2: FILIP-based symmetric InfoNCE + small align aux + recon
+    (+ optional token-uniformity regularizer).
 
     `groups` (per-pair accession ids) masks same-protein off-diagonal entries as
     false negatives; no-op when omitted.
@@ -349,11 +367,20 @@ def phase_r2_loss(
         + reconstruction_loss(h_t_hat, h_t, mask_t)
     )
 
-    total = l_nce + align_aux_weight * l_align + recon_weight * l_recon
+    if uniformity_weight > 0:
+        l_unif = 0.5 * (
+            token_uniformity_loss(z_p, mask_p, uniformity_t)
+            + token_uniformity_loss(z_t, mask_t, uniformity_t)
+        )
+    else:
+        l_unif = torch.zeros((), device=z_p.device)
+
+    total = (l_nce + align_aux_weight * l_align + recon_weight * l_recon
+             + uniformity_weight * l_unif)
     return {
         "loss": total,
         "align": l_align,
-        "unif": torch.zeros((), device=z_p.device),
+        "unif": l_unif,
         "recon": l_recon,
         "nce": l_nce,
         "acc": acc,

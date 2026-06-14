@@ -88,6 +88,7 @@ class RetrievalCfg:
 
     # Loss weights
     phase1_uniformity_weight: float = 0.1
+    r2_uniformity_weight: float = 0.1         # token-spread regularizer during R2 (contrastive)
     align_aux_weight: float = 0.1
     recon_weight: float = 0.05
 
@@ -109,6 +110,29 @@ class RetrievalCfg:
 
     log_every: int = 50
     eval_every_epoch: bool = True
+
+
+@dataclass
+class ReconCfg:
+    """Expansion-only reconstruction phase (Feature 2).
+
+    Freezes the projection heads + temperature and trains only the expansion
+    heads on reconstruction MSE. Retrieval metrics depend only on the projection,
+    so they are unchanged; this sharpens the generation conditioning memory
+    expand(project(h)) at zero retrieval cost. Operates on an existing retrieval
+    checkpoint and writes the same checkpoint format, so downstream generation /
+    inference / round-trip load it transparently.
+    """
+    cache_dir: str = str(REPO_ROOT / "cache")
+    ckpt_dir: str = str(REPO_ROOT / "checkpoints" / "reconstruction")
+    device: str = "auto"
+    batch_size: int = 128
+    epochs: int = 5
+    lr: float = 1e-3                          # recon tolerates a higher LR than joint retrieval
+    weight_decay: float = 0.0
+    warmup_frac: float = 0.05
+    grad_clip: float = 1.0
+    log_every: int = 50
 
 
 @dataclass
@@ -135,6 +159,17 @@ class GenerationCfg:
     # Generation tokenizer caps (max target length)
     max_target_tokens: int = 512
 
+    # Generation-side CVAE (Feature 1). Off by default; --use-cvae enables. The
+    # latent w captures the one-to-many residual p(target|source) and is injected
+    # as `cvae_n_latent_tokens` extra cross-attention memory tokens.
+    use_cvae: bool = False
+    cvae_d_w: int = 32                        # latent dim
+    cvae_n_latent_tokens: int = 4             # memory tokens decoded from w
+    cvae_hidden: int = 256                    # prior/posterior MLP width
+    cvae_beta_max: float = 0.1                # KL weight after warmup
+    cvae_free_bits: float = 0.5               # per-dim KL floor (anti-collapse)
+    cvae_kl_warmup_frac: float = 0.3          # fraction of training to ramp beta 0->max
+
     batch_size: int = 16
     num_workers: int = 0
 
@@ -152,6 +187,7 @@ class Cfg:
     data: DataCfg = field(default_factory=DataCfg)
     model: ModelCfg = field(default_factory=ModelCfg)
     retrieval: RetrievalCfg = field(default_factory=RetrievalCfg)
+    recon: ReconCfg = field(default_factory=ReconCfg)
     generation: GenerationCfg = field(default_factory=GenerationCfg)
 
 

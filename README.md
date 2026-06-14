@@ -209,6 +209,7 @@ multiple captions per protein are not treated as false negatives.
 Config knobs in `config.py` (`RetrievalCfg`) not on the CLI:
 
 - `phase1_uniformity_weight = 0.1` — Phase R1 within-modality spread.
+- `r2_uniformity_weight = 0.1` — Phase R2 token-spread regularizer (CLI: `--r2-uniformity-weight`). Counters per-token crowding under the contrastive objective, which the InfoNCE negatives alone don't prevent when captions share heavy boilerplate.
 - `align_aux_weight = 0.1` — Phase R2 positive-pair maintenance.
 - `recon_weight = 0.05` — autoencoder loop weight throughout both phases.
 - `init_temperature = 0.07` — learnable CLIP temperature, clamped to ≤ 100.
