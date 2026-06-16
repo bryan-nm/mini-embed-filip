@@ -253,6 +253,9 @@ def main() -> None:
     ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every)
     ap.add_argument("--unfreeze-top", type=int, default=0,
                     help="fully fine-tune the top N decoder blocks (0 = adapters/LoRA only)")
+    ap.add_argument("--grad-checkpointing", action="store_true",
+                    help="recompute layer activations in backward to fit large decoders "
+                         "(e.g. the 3B Dayhoff/Jamba); ~30%% slower, much less memory")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -315,6 +318,7 @@ def main() -> None:
     barrier()
     if not env.is_main:
         decoder, target_tok, adapters = _load_decoder()
+    assert decoder is not None and adapters is not None  # always loaded on both branches
 
     # Optional partial unfreeze of the top decoder blocks (all ranks, identically,
     # before DDP captures requires_grad state).
@@ -326,6 +330,31 @@ def main() -> None:
         n_train = count_trainable(decoder)
         print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
         print(f"[gen] num cross-attention adapters: {len(adapters)}")
+
+    # Gradient checkpointing: recompute layer activations in backward instead of
+    # storing them across the deep stack. Essential for the 3B Jamba decoder,
+    # whose pure-PyTorch Mamba scan materializes large fp32 [B, d_inner, L,
+    # d_state] tensors per layer that otherwise OOM the tile.
+    #   - use_reentrant=False is REQUIRED: the backbone is frozen (only adapters/
+    #     LoRA train), and reentrant checkpointing demands an input that requires
+    #     grad, which a frozen layer input doesn't have.
+    #   - Incompatible with the KV/SSM cache, so disable use_cache for training.
+    # Applied before the DDP wrap so `decoder` is still the raw model. For the
+    # Jamba path the cross-attn adapters are forward hooks inside the layer
+    # __call__, so they fall inside the checkpointed region and recompute
+    # correctly; the ProGen2/BioGPT paths replace the block module (those decoders
+    # are small and don't need this).
+    if args.grad_checkpointing:
+        decoder.config.use_cache = False
+        if hasattr(decoder, "gradient_checkpointing_enable"):
+            decoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+            if env.is_main:
+                print("[gen] gradient checkpointing ON "
+                      "(use_reentrant=False, use_cache=False)")
+        elif env.is_main:
+            print("[gen] WARNING: decoder has no gradient_checkpointing_enable(); "
+                  "skipping (--grad-checkpointing had no effect)")
 
     # Direction-specific frozen retrieval handles: source side (project+expand for
     # the cross-attn memory) and target projection (for the CVAE posterior).
