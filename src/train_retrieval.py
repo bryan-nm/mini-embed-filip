@@ -404,17 +404,20 @@ def main() -> None:
         # Evaluation + checkpointing on rank 0 only (uses the unwrapped model).
         if env.is_main:
             if cfg.retrieval.eval_every_epoch:
+                t_eval = time.time()
                 metrics = evaluate_split(
                     core, val_loader, device, encoders,
                     cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
                     row_group_ids=row_group_ids,
                 )
+                eval_dt = time.time() - t_eval
                 short = {k: round(v, 4) for k, v in metrics.items()
                          if k in ("R@1", "R@5", "R@10", "gap_l2",
                                   "mean_cross_token_cos", "mean_pos_token_cos",
                                   "uniformity_p_tokens")}
-                print(f"[val] epoch={epoch}  {short}")
-                log.append({"epoch": epoch, "phase": phase_name, **metrics})
+                print(f"[val] epoch={epoch}  {short}  eval_time={eval_dt:.1f}s")
+                log.append({"epoch": epoch, "phase": phase_name,
+                            "eval_time": eval_dt, **metrics})
 
             ckpt = ckpt_dir / f"epoch{epoch:02d}.pt"
             torch.save({"epoch": epoch, "model_state": core.state_dict()}, ckpt)

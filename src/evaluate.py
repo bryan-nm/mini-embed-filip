@@ -114,13 +114,20 @@ def modality_gap_metrics(
 @torch.no_grad()
 def evaluate_split(model, loader, device: torch.device, encoders=None,
                    max_protein_tokens: int = 1024, max_text_tokens: int = 1024,
-                   filip_chunk_rows: int = 16,
+                   filip_chunk_rows: int = 8,
                    row_group_ids: torch.Tensor = None) -> Dict[str, float]:
     """Run a full eval pass. Works for both cached and live modes.
 
     `row_group_ids` (global row -> accession id) enables accession-grouped
     recall, so multiple captions of one protein in the val set are scored as
     positives rather than distractors.
+
+    Scoring stays on `device`: the projected embeddings are tiny (val_subset x
+    L x 32), so the FILIP recall + gap metrics run on the GPU instead of being
+    copied to CPU — the CPU einsum over the O(N^2 . L_p . L_t) score tensor was
+    the eval bottleneck. `filip_chunk_rows` bounds the per-chunk transient so the
+    on-device score matrix doesn't blow the tile (no autograd graph here, so only
+    the transient matters).
     """
     model.eval()
     z_ps, z_ts, mps, mts = [], [], [], []
@@ -146,11 +153,11 @@ def evaluate_split(model, loader, device: torch.device, encoders=None,
                 prot_model, prot_tok, batch["protein"], device, max_protein_tokens
             )
         z_p, z_t = model.project(h_p, h_t)
-        # Pad to max in batch shouldn't be needed within one batch.
-        z_ps.append(z_p.float().cpu()); z_ts.append(z_t.float().cpu())
-        mps.append(mask_p.cpu()); mts.append(mask_t.cpu())
+        # Keep on device (tensors are small); scoring runs on the GPU.
+        z_ps.append(z_p.float()); z_ts.append(z_t.float())
+        mps.append(mask_p); mts.append(mask_t)
 
-    # Concat with padding to global max length
+    # Concat with padding to global max length (pads allocated on z's device).
     def _pad_cat(zs, ms):
         Lmax = max(z.size(1) for z in zs)
         D = zs[0].size(-1)
@@ -158,8 +165,8 @@ def evaluate_split(model, loader, device: torch.device, encoders=None,
         for z, m in zip(zs, ms):
             B, L, _ = z.shape
             if L < Lmax:
-                pad_z = torch.zeros(B, Lmax - L, D, dtype=z.dtype)
-                pad_m = torch.zeros(B, Lmax - L, dtype=torch.bool)
+                pad_z = torch.zeros(B, Lmax - L, D, dtype=z.dtype, device=z.device)
+                pad_m = torch.zeros(B, Lmax - L, dtype=torch.bool, device=m.device)
                 z = torch.cat([z, pad_z], dim=1)
                 m = torch.cat([m, pad_m], dim=1)
             chunks_z.append(z); chunks_m.append(m)
