@@ -514,7 +514,6 @@ def main() -> None:
 
             set_cross_memory(adapters, mem, mask)
             out = decoder(input_ids=input_ids, attention_mask=attn_mask)
-            clear_cross_memory(adapters)
 
             logits = out.logits                              # [B, L, V]
             shift_logits = logits[:, :-1, :].contiguous()
@@ -527,6 +526,14 @@ def main() -> None:
             beta = beta_at(global_step, total_steps, cvae.cfg) if cvae is not None else 0.0
             loss = ce + beta * kl
             loss.backward()
+            # Clear AFTER backward, not before: with gradient checkpointing the
+            # decoder layers (and their cross-attn adapter hooks) are recomputed
+            # during backward, so the memory must still be set then. Clearing it
+            # before backward made the recomputed forward take the adapters'
+            # pass-through branch, tripping the checkpoint tensor-count check.
+            # (Harmless without checkpointing — next step's set_cross_memory
+            # overwrites it.)
+            clear_cross_memory(adapters)
             # DDP syncs the decoder grads; the CVAE heads live outside its forward,
             # so average their grads manually (mirrors the retrieval trainer).
             if cvae is not None:
