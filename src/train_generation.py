@@ -255,7 +255,12 @@ def main() -> None:
                     help="fully fine-tune the top N decoder blocks (0 = adapters/LoRA only)")
     ap.add_argument("--grad-checkpointing", action="store_true",
                     help="recompute layer activations in backward to fit large decoders "
-                         "(e.g. the 3B Dayhoff/Jamba); ~30%% slower, much less memory")
+                         "(e.g. the 3B Dayhoff/Jamba); ~30%% slower, much less memory. "
+                         "NOTE: incompatible with the Jamba MoE on XPU — routing isn't "
+                         "bit-reproducible on recompute, so non-reentrant checkpoint aborts")
+    ap.add_argument("--max-target-tokens", type=int, default=cfg.generation.max_target_tokens,
+                    help="cap on the generated/teacher-forced target length; lower it to "
+                         "cut decoder activation memory (truncates long targets)")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -274,6 +279,7 @@ def main() -> None:
     cfg.generation.cvae_d_w = args.cvae_d_w
     cfg.generation.cvae_n_latent_tokens = args.cvae_n_latent_tokens
     cfg.generation.cvae_beta_max = args.cvae_beta_max
+    cfg.generation.max_target_tokens = args.max_target_tokens
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
