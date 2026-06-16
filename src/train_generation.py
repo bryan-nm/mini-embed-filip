@@ -296,6 +296,19 @@ def main() -> None:
     # head outputs). For text2protein, input is text -> text_expand -> 768-d.
     mem_dim = cfg.model.text_hidden if args.direction == "text2protein" else cfg.model.protein_hidden
 
+    # Gradient checkpointing recomputes the forward during backward, but dropout
+    # RNG is not reliably preserved across recomputation on XPU. A non-zero LoRA
+    # dropout then makes the recomputed hidden states differ from the original,
+    # which — through Jamba's MoE router — changes per-expert token counts and
+    # trips the non-reentrant checkpoint metadata check. Zero it for checkpointed
+    # runs (negligible regularization on a frozen-backbone finetune); the
+    # cross-attn adapter dropout is already 0.
+    if args.grad_checkpointing and cfg.generation.lora_dropout > 0:
+        if env.is_main:
+            print(f"[gen] grad-checkpointing: forcing LoRA dropout "
+                  f"{cfg.generation.lora_dropout} -> 0 (dropout RNG not preserved on recompute)")
+        cfg.generation.lora_dropout = 0.0
+
     lora_cfg = LoRACfg(
         rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
         dropout=cfg.generation.lora_dropout,
