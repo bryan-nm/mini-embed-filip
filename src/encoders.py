@@ -129,6 +129,20 @@ def encode_text_batch(
 # ---------------------------------------------------------------------------
 # Protein encoder: AMPLIFY-350M
 # ---------------------------------------------------------------------------
+def _view_safe(out: torch.Tensor) -> torch.Tensor:
+    """Return `out` ([B, H, M, K]) with a stride that survives AMPLIFY's reshape.
+
+    AMPLIFY-350M's `_att_block` does `sdpa(...).transpose(1, 2).view(...)`. A
+    `view` requires the post-transpose tensor to be contiguous, but a plain
+    [B, H, M, K] attention output is contiguous, so its `.transpose(1, 2)` is
+    NOT — and the view raises "view size is not compatible ... use .reshape()".
+    (AMPLIFY-120M uses `.reshape` here and is immune; the 350M remote code
+    regressed to `.view`.) We return a tensor whose `.transpose(1, 2)` IS
+    contiguous, so AMPLIFY's view succeeds; harmless under the 120M `.reshape`.
+    """
+    return out.transpose(1, 2).contiguous().transpose(1, 2)
+
+
 def _manual_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                  is_causal=False, scale=None, **kwargs):
     """Plain matmul+softmax attention (q,k,v: [B, H, M, K]; additive attn_mask).
@@ -148,7 +162,25 @@ def _manual_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
     attn = torch.softmax(scores, dim=-1)
     if dropout_p and dropout_p > 0.0:
         attn = F.dropout(attn, p=dropout_p, training=True)
-    return torch.matmul(attn, value)
+    return _view_safe(torch.matmul(attn, value))
+
+
+def _view_safe_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                    is_causal=False, scale=None, **kwargs):
+    """Real torch SDPA, returned in a layout AMPLIFY-350M's `view` accepts.
+
+    On CPU (and any non-XPU/non-CUDA host) the fused kernel is fine, but the
+    350M remote code still does `sdpa(...).transpose(1, 2).view(...)`, which can
+    raise whenever the backend's output stride leaves that transpose
+    non-contiguous. Delegate to the stock kernel and fix up the stride
+    defensively so the layout never depends on the chosen SDPA backend. See
+    `_view_safe`.
+    """
+    out = F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+        is_causal=is_causal, scale=scale,
+    )
+    return _view_safe(out)
 
 
 def load_protein_encoder(path: str, device: torch.device):
@@ -166,13 +198,21 @@ def load_protein_encoder(path: str, device: torch.device):
         head_dim, model.config.max_length
     ).to(device)
 
-    # On XPU, AMPLIFY's non-CUDA branch calls torch SDPA, which IPEX (no xetla
-    # on this build) routes to a fallback that segfaults for sequence lengths
-    # > ~512. Swap the module-global `scaled_dot_product_attention` AMPLIFY
-    # imported for a plain matmul+softmax so long proteins (max_protein_tokens
-    # up to AMPLIFY's 2048 context) encode without the GPU page fault.
+    # AMPLIFY's non-CUDA attention path (everything except `x.is_cuda`) has two
+    # problems we patch by swapping the module-global `scaled_dot_product_attention`
+    # AMPLIFY imported:
+    #   1. On XPU the Aurora IPEX build (no xetla) segfaults for seqlen > ~512 —
+    #      route through plain matmul+softmax (`_manual_sdpa`) at any length.
+    #   2. AMPLIFY-350M's `_att_block` reshapes the attention output with `.view`
+    #      on `sdpa(...).transpose(1, 2)`. That transpose is non-contiguous for a
+    #      plain [B,H,M,K] output (e.g. our matmul on XPU, or some CPU/IPEX SDPA
+    #      backends), so the view raises (the 120M used `.reshape` and is immune).
+    #      Both replacements return a view-safe layout; CPU's is defensive.
+    # CUDA is left alone: it takes AMPLIFY's xformers branch, not SDPA.
     if device.type == "xpu":
         amp_mod.scaled_dot_product_attention = _manual_sdpa
+    elif device.type != "cuda":
+        amp_mod.scaled_dot_product_attention = _view_safe_sdpa
 
     for p in model.parameters():
         p.requires_grad_(False)
