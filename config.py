@@ -31,7 +31,7 @@ DATA_CSV = os.environ.get(
 )
 
 TEXT_ENCODER_PATH = os.environ.get("FILIP_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
-PROTEIN_ENCODER_PATH = os.environ.get("FILIP_PROTEIN_ENCODER", f"{MODELS_DIR}/SaAMPLIFY_120M")
+PROTEIN_ENCODER_PATH = os.environ.get("FILIP_PROTEIN_ENCODER", f"{MODELS_DIR}/AMPLIFY_350M")
 PROTEIN_DECODER_PATH = os.environ.get("FILIP_PROTEIN_DECODER", f"{MODELS_DIR}/Dayhoff-170m-UR90")  # Jamba
 TEXT_DECODER_PATH = os.environ.get("FILIP_TEXT_DECODER", f"{MODELS_DIR}/biogpt")
 
@@ -57,11 +57,11 @@ class ModelCfg:
     text_encoder_path: str = TEXT_ENCODER_PATH
     protein_encoder_path: str = PROTEIN_ENCODER_PATH
     text_hidden: int = 768                    # BioLinkBERT-base
-    protein_hidden: int = 640                 # SaAMPLIFY-120M
+    protein_hidden: int = 960                 # AMPLIFY-350M
 
     proj_d_hidden: int = 512
     proj_d_mid: int = 256
-    embed_dim: int = 32
+    embed_dim: int = 64
     proj_dropout: float = 0.1
 
     expand_d_mid: int = 256

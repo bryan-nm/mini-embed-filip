@@ -2,14 +2,14 @@
 
 Both heads are position-wise (no token mixing inside the head). The encoder
 already did the contextualization; the heads' job is to map between encoder
-hidden space and the 32-d shared space.
+hidden space and the 64-d shared space.
 
 Projection head:
-    d_in (768 or 640) -> d_hidden -> d_mid -> d_out (32)
+    d_in (768 or 960) -> d_hidden -> d_mid -> d_out (64)
     Linear, LayerNorm, GELU, Dropout. Output L2-normalized along the last dim.
 
 Expansion head:
-    d_out (32) -> d_mid -> d_hidden -> d_in (768 or 640)
+    d_out (64) -> d_mid -> d_hidden -> d_in (768 or 960)
     Mirrored architecture; separate weights. Output NOT normalized.
 
 The reconstruction loop expand(project(h)) ~= h ties them together via an

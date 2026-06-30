@@ -30,7 +30,7 @@ IDS=protein_ids.txt                     # one primary_Accession per line
 OUT=inspect_out                         # heatmaps written here as <accession>.png
 TOPK=5
 CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv
-MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models  # <-- VERIFY: dir holding BioLinkBERT-base, SaAMPLIFY_120M, ...
+MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models 
 
 # config.py defaults to dev (Mac) model paths; point it at the cluster models.
 export FILIP_MODELS_DIR="$MODELS_DIR"

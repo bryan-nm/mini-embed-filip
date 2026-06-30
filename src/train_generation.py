@@ -10,8 +10,8 @@ What's frozen vs trainable:
   trains:   cross-attention adapter layers + LoRA on decoder self-attn / FFN
 
 Directions:
-  text2protein:  text -> BioLinkBERT -> proj -> expand -> ProGen2 -> protein
-  protein2text:  protein -> SaAMPLIFY -> proj -> expand -> BioGPT  -> text
+  text2protein:  text -> BioLinkBERT -> proj -> expand -> Dayhoff-170M -> protein
+  protein2text:  protein -> AMPLIFY-350M -> proj -> expand -> BioGPT     -> text
 
 Usage:
   python -m src.train_generation --direction text2protein \\

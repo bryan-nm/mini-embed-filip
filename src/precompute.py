@@ -17,7 +17,7 @@ map joins them at read time. This avoids ~9x of the protein encoder pass (the
 precompute bottleneck) and ~1.5 TB of duplicated protein cache.
 
 Final output layout (under cache_dir):
-  protein_h.bin       bf16, total_protein_tokens × 640   (UNIQUE proteins)
+  protein_h.bin       bf16, total_protein_tokens × 960   (UNIQUE proteins)
   protein_offsets.pt  int64 [N_unique+1]
   protein_mask.bin    uint8, total_protein_tokens
   protein_ids.json    list of accessions, unique-protein order [N_unique]

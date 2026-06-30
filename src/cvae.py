@@ -27,7 +27,7 @@ import torch.nn as nn
 
 @dataclass
 class CVAECfg:
-    d_pool: int = 32          # pooled retrieval-embedding dim (== model embed_dim)
+    d_pool: int = 64          # pooled retrieval-embedding dim (== model embed_dim)
     d_w: int = 32             # latent dim
     n_latent_tokens: int = 4  # memory tokens produced from w
     hidden: int = 256         # prior/posterior MLP width

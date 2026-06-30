@@ -3,7 +3,7 @@
 BioLinkBERT-base: standard HuggingFace BertModel; we return its full last
 hidden state along with a "valid token" mask that excludes [PAD], [CLS], [SEP].
 
-SaAMPLIFY-120M: custom AMPLIFY model loaded via trust_remote_code. We return
+AMPLIFY-350M: custom AMPLIFY model loaded via trust_remote_code. We return
 the post-layer-norm final hidden state plus a mask that excludes <pad>, <bos>,
 <eos>.
 
@@ -127,7 +127,7 @@ def encode_text_batch(
 
 
 # ---------------------------------------------------------------------------
-# Protein encoder: SaAMPLIFY-120M
+# Protein encoder: AMPLIFY-350M
 # ---------------------------------------------------------------------------
 def _manual_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                  is_causal=False, scale=None, **kwargs):
@@ -210,7 +210,7 @@ def encode_protein_batch(
     model, tokenizer, seqs: List[str], device: torch.device,
     max_len: int, mask_specials: bool = True,
 ):
-    """Returns (h_p, valid_mask) where h_p is [B, L, 640] and mask is [B, L]."""
+    """Returns (h_p, valid_mask) where h_p is [B, L, 960] and mask is [B, L]."""
     enc = tokenizer(
         seqs, padding=True, truncation=True, max_length=max_len,
         return_tensors="pt",
@@ -221,7 +221,7 @@ def encode_protein_batch(
 
     out = model(input_ids=input_ids, attention_mask=additive,
                 output_hidden_states=True)
-    last = out.hidden_states[-1]                          # [B, L, 640]
+    last = out.hidden_states[-1]                          # [B, L, 960]
     if getattr(model.config, "layer_norm_before_last_layer", False):
         last = model.layer_norm_2(last)
 
