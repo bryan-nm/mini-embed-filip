@@ -1,25 +1,22 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
-#PBS -N filip_recon
-#PBS -l walltime=03:00:00
+#PBS -N filip_retrieval
+#PBS -l walltime=16:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
 #PBS -q capacity
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
-#PBS -m abe
+#PBS -m be
 
 module load frameworks
 source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
 cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))           # 16*12 = 192 ranks
+NRANKS=$(( NNODES * RANKS_PER_NODE ))           # 16*12 = 192 ranks, 12 groups of 16
 
-# Reconstruction reads the per-token cache + a trained retrieval checkpoint only
-# (no encoders, no CSV, no contrastive subgroups), so the model/data env is
-# minimal; the CCL/fabric block is the same as retrieval.
 export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
 export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_annotated/swissprot_augmented.csv
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
@@ -31,11 +28,9 @@ export FI_PROVIDER=cxi
 export CCL_ZE_IPC_EXCHANGE=pidfd
 export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 
-# Point --ckpt at the converged retrieval checkpoint. Freezes the projection
-# heads (R@K unchanged) and trains only the expansion heads on reconstruction
-# MSE; writes the same checkpoint format to checkpoints/reconstruction/.
-# Plain data-parallel (group_size=1): no FILIP, no grouped all-gather.
+# 192 ranks -> ~168 steps/epoch. Saner epoch counts than the prod version.
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
-    python -m src.train_reconstruction --device xpu \
-        --ckpt checkpoints/retrieval/epoch18.pt \
-        --batch-size 128 --epochs 5 --lr 1e-3
+    python -m src.train_retrieval --use-cache --device xpu \
+        --batch-size 16 --group-size 16 \
+        --phase1-epochs 1 --phase2-epochs 20 --lr 2e-4 \
+        --phase1-uniformity-weight 0.3 --filip-chunk-rows 8

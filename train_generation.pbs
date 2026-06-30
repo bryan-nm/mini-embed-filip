@@ -1,0 +1,40 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_generation
+#PBS -l walltime=12:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m abe
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+: "${DIRECTION:?set -v DIRECTION=text2protein|protein2text}"
+: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+
+NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_annotated/swissprot_augmented.csv
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=2950$([ "$DIRECTION" = protein2text ] && echo 3 || echo 2)
+export OMP_NUM_THREADS=8
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
+    python -m src.train_generation --direction "${DIRECTION}" \
+    --retrieval-ckpt "${RCKPT}" --device xpu \
+    --batch-size 8 --epochs 20 --lr 5e-5 --max-target-tokens 512 \
+    --cross-attn-every 2 --unfreeze-top 0 --use-cvae --val-subset 100
+

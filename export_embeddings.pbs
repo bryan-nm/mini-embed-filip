@@ -31,7 +31,7 @@ NRANKS=$(( NNODES * RANKS_PER_NODE ))
 # --- edit these ---
 CKPT=checkpoints/retrieval/epoch50.pt
 CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv
-MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models  # <-- VERIFY: dir holding BioLinkBERT-base, SaAMPLIFY_120M, ...
+MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
 OUT=embeddings_live
 NAME=legacy        # outputs <OUT>/<NAME>_pooled.npz
 POOLING=mean       # or "none" for full per-token packed

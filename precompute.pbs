@@ -1,0 +1,39 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_precompute
+#PBS -l walltime=03:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+
+# --- topology: 12 tiles/node ---
+NNODES=$(wc -l < "$PBS_NODEFILE")
+RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+# --- tiles individually addressable + rendezvous for any torch.distributed init ---
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29500
+export OMP_NUM_THREADS=8
+
+# --- oneCCL / fabric (VERIFY against current ALCF Aurora docs) ---
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+echo "precompute on ${NNODES} nodes / ${NRANKS} ranks"
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
+    python -m src.precompute --device xpu --batch-size 64
+# ^ all ranks encode their shard; rank 0 auto-merges into cache/ at the end.
