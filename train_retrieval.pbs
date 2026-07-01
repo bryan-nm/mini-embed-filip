@@ -18,7 +18,8 @@ NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))           # 16*12 = 192 ranks, 12 groups of 16
 
 export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_annotated/swissprot_augmented.csv
+# FILIP_DATA_CSV intentionally unset: --use-cache reads the precomputed token
+# cache + pair_ids.json only; the CSV is touched solely in the no-cache branch.
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE"); export MASTER_PORT=29501
 export OMP_NUM_THREADS=8
@@ -37,7 +38,8 @@ mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
     python -m src.train_retrieval --use-cache --device xpu \
         --batch-size 16 --group-size 16 \
         --phase1-epochs 1 --phase2-epochs 20 --lr 2e-4 \
-        --phase1-uniformity-weight 0.3 --filip-chunk-rows 8
+        --phase1-uniformity-weight 0.3 --filip-chunk-rows 8 \
+        --align-aux-weight 0 --r2-uniformity-weight 0
 
 # push stop notifications to slack
 rc=$?
