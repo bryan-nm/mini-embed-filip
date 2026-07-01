@@ -88,7 +88,7 @@ class RetrievalCfg:
 
     # Loss weights
     phase1_uniformity_weight: float = 0.1
-    r2_uniformity_weight: float = 0.1         # token-spread regularizer during R2 (contrastive)
+    r2_uniformity_weight: float = 0.01         # token-spread regularizer during R2 (contrastive)
     align_aux_weight: float = 0.1
     recon_weight: float = 0.05
 
