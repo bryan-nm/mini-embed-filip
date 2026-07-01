@@ -75,6 +75,24 @@ def cosine_warmup_lr(step: int, total: int, warmup: int, base: float) -> float:
     return base * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def resolve_resume_path(resume: str, ckpt_dir: Path) -> Path:
+    """Resolve --resume into a checkpoint file.
+
+    "auto" picks the highest-numbered `epochNN.pt` in ckpt_dir; anything else is
+    treated as a direct path to a checkpoint file.
+    """
+    if resume == "auto":
+        ckpts = sorted(ckpt_dir.glob("epoch*.pt"))
+        if not ckpts:
+            raise FileNotFoundError(
+                f"--resume auto found no epoch*.pt checkpoints in {ckpt_dir}")
+        return ckpts[-1]
+    path = Path(resume)
+    if not path.is_file():
+        raise FileNotFoundError(f"--resume checkpoint not found: {path}")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Build data loaders
 # ---------------------------------------------------------------------------
@@ -214,6 +232,9 @@ def main() -> None:
     ap.add_argument("--no-cache", dest="use_cache", action="store_false")
     ap.add_argument("--cache-dir", default=cfg.retrieval.cache_dir)
     ap.add_argument("--ckpt-dir", default=cfg.retrieval.ckpt_dir)
+    ap.add_argument("--resume", default=None,
+                    help="resume from a checkpoint: a path to an epochNN.pt file, "
+                         "or 'auto' to pick the latest in --ckpt-dir")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--phase1-epochs", type=int, default=cfg.retrieval.phase1_epochs)
@@ -326,7 +347,32 @@ def main() -> None:
 
     log = []
     global_step = 0
-    for epoch in range(total_epochs):
+    start_epoch = 0
+
+    # Resume: restore model/optimizer/step and continue after the saved epoch.
+    # Every rank loads the same file (shared FS) so states stay in sync; the
+    # subsequent broadcast_parameters is skipped since weights already match.
+    if args.resume is not None:
+        resume_path = resolve_resume_path(args.resume, ckpt_dir)
+        ckpt = torch.load(resume_path, map_location=device)
+        core.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        elif env.is_main:
+            print("[resume] checkpoint has no optimizer_state; "
+                  "optimizer restarts from scratch")
+        start_epoch = ckpt["epoch"] + 1
+        global_step = ckpt.get("global_step", start_epoch * steps_per_epoch)
+        if start_epoch >= total_epochs:
+            raise RuntimeError(
+                f"--resume epoch {ckpt['epoch']} already at/past total_epochs "
+                f"{total_epochs}; increase --phase1-epochs/--phase2-epochs to continue")
+        if env.is_main:
+            print(f"[resume] loaded {resume_path}; resuming at epoch {start_epoch} "
+                  f"(global_step={global_step})")
+        log = ckpt.get("train_log", [])
+
+    for epoch in range(start_epoch, total_epochs):
         in_phase1 = epoch < cfg.retrieval.phase1_epochs
         phase_name = "R1-warm" if in_phase1 else "R2-NCE"
         if train_sampler is not None:
@@ -420,7 +466,13 @@ def main() -> None:
                             "eval_time": eval_dt, **metrics})
 
             ckpt = ckpt_dir / f"epoch{epoch:02d}.pt"
-            torch.save({"epoch": epoch, "model_state": core.state_dict()}, ckpt)
+            torch.save({
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state": core.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "train_log": log,
+            }, ckpt)
             print(f"[ckpt] saved {ckpt}")
         barrier()
 

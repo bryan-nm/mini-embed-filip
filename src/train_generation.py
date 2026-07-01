@@ -238,6 +238,24 @@ def cosine_warmup_lr(step: int, total: int, warmup: int, base: float) -> float:
     return base * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def resolve_resume_path(resume: str, ckpt_dir: Path) -> Path:
+    """Resolve --resume into a checkpoint file.
+
+    "auto" picks the highest-numbered `epochNN.pt` in ckpt_dir; anything else is
+    treated as a direct path to a checkpoint file.
+    """
+    if resume == "auto":
+        ckpts = sorted(ckpt_dir.glob("epoch*.pt"))
+        if not ckpts:
+            raise FileNotFoundError(
+                f"--resume auto found no epoch*.pt checkpoints in {ckpt_dir}")
+        return ckpts[-1]
+    path = Path(resume)
+    if not path.is_file():
+        raise FileNotFoundError(f"--resume checkpoint not found: {path}")
+    return path
+
+
 # ---------------------------------------------------------------------------
 def main() -> None:
     cfg = default_cfg()
@@ -247,6 +265,9 @@ def main() -> None:
     ap.add_argument("--device", default=cfg.generation.device)
     ap.add_argument("--cache-dir", default=cfg.retrieval.cache_dir)
     ap.add_argument("--ckpt-dir", default=cfg.generation.ckpt_dir)
+    ap.add_argument("--resume", default=None,
+                    help="resume from a checkpoint: a path to an epochNN.pt file, "
+                         "or 'auto' to pick the latest in --ckpt-dir/<direction>")
     ap.add_argument("--batch-size", type=int, default=cfg.generation.batch_size)
     ap.add_argument("--epochs", type=int, default=cfg.generation.epochs)
     ap.add_argument("--lr", type=float, default=cfg.generation.lr)
@@ -490,7 +511,51 @@ def main() -> None:
 
     global_step = 0
     log = []
-    for epoch in range(args.epochs):
+    start_epoch = 0
+
+    # Resume: restore the trainable adapter/LoRA weights (+ any unfrozen blocks),
+    # the CVAE heads, the optimizer, and the step counter, then continue after the
+    # saved epoch. Every rank loads the same file (shared FS) so states stay in
+    # sync. adapter_state is a partial state_dict (trainable tensors only), so it
+    # loads with strict=False against the full decoder.
+    if args.resume is not None:
+        resume_path = resolve_resume_path(args.resume, ckpt_dir)
+        ckpt = torch.load(resume_path, map_location=device)
+        if ckpt.get("cross_attn_every") != args.cross_attn_every or \
+           ckpt.get("unfreeze_top") != args.unfreeze_top:
+            raise RuntimeError(
+                f"--resume checkpoint architecture mismatch: "
+                f"cross_attn_every={ckpt.get('cross_attn_every')} unfreeze_top={ckpt.get('unfreeze_top')} "
+                f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top}")
+        # `missing` keys are expected (the frozen backbone isn't in adapter_state);
+        # only unexpected keys signal a real mismatch.
+        _, unexpected = core.load_state_dict(ckpt["adapter_state"], strict=False)
+        if unexpected:
+            raise RuntimeError(f"--resume unexpected keys in adapter_state: {unexpected}")
+        if cvae is not None:
+            if "cvae_state" not in ckpt:
+                raise RuntimeError(
+                    "--resume: --use-cvae set but checkpoint has no cvae_state")
+            cvae.load_state_dict(ckpt["cvae_state"])
+        elif "cvae_state" in ckpt and env.is_main:
+            print("[resume] checkpoint has cvae_state but --use-cvae not set; ignoring it")
+        if "optimizer_state" in ckpt:
+            optim.load_state_dict(ckpt["optimizer_state"])
+        elif env.is_main:
+            print("[resume] checkpoint has no optimizer_state; "
+                  "optimizer restarts from scratch")
+        start_epoch = ckpt["epoch"] + 1
+        global_step = ckpt.get("global_step", start_epoch * len(train_loader))
+        if start_epoch >= args.epochs:
+            raise RuntimeError(
+                f"--resume epoch {ckpt['epoch']} already at/past --epochs {args.epochs}; "
+                f"increase --epochs to continue")
+        log = ckpt.get("train_log", [])
+        if env.is_main:
+            print(f"[resume] loaded {resume_path}; resuming at epoch {start_epoch} "
+                  f"(global_step={global_step})")
+
+    for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         decoder.train()
@@ -617,7 +682,10 @@ def main() -> None:
             # blocks), keyed by requires_grad so partial-unfreeze weights persist.
             trainable = {n for n, p in core.named_parameters() if p.requires_grad}
             adapter_state = {k: v for k, v in core.state_dict().items() if k in trainable}
-            payload = {"epoch": epoch, "adapter_state": adapter_state,
+            payload = {"epoch": epoch, "global_step": global_step,
+                       "adapter_state": adapter_state,
+                       "optimizer_state": optim.state_dict(),
+                       "train_log": log,
                        "cross_attn_every": args.cross_attn_every,
                        "unfreeze_top": args.unfreeze_top}
             # CVAE heads (Feature 1); absent => downstream loads run without a latent.
