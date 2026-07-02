@@ -95,12 +95,24 @@ def _encode_modality(items, ids, start, end, prefix, encode_fn,
     h_fh = open(shards_dir / f"{prefix}_h.{tag}.bin", "wb")
     mask_fh = open(shards_dir / f"{prefix}_mask.{tag}.bin", "wb")
     lens: list[int] = []
+    # Running corpus sum over kept tokens, for the de-anisotropizing mean the
+    # projection heads subtract (see src/compute_means.py). Accumulated here at
+    # ~zero cost since every token is already in memory; merged into
+    # {prefix}_mean.pt. Summed from the bf16-rounded values we actually store, so
+    # the mean matches what training reads back. float64 accumulator: ~1e8 terms.
+    tok_sum = None
+    tok_count = 0
     m = len(items)
     t0 = time.time()
     last_log = t0
     for s in range(0, m, bs):
         e = min(s + bs, m)
         h, mask = encode_fn(items[s:e])
+        hb = h.to(torch.bfloat16).float()          # bf16-rounded, matches storage
+        keep_all = mask.bool()
+        batch_sum = hb[keep_all].sum(dim=0).double().cpu()   # [d]
+        tok_sum = batch_sum if tok_sum is None else tok_sum + batch_sum
+        tok_count += int(keep_all.sum().item())
         for row in range(h.size(0)):
             keep = mask[row]
             h_row = h[row][keep].to(torch.bfloat16)
@@ -114,6 +126,10 @@ def _encode_modality(items, ids, start, end, prefix, encode_fn,
             last_log = time.time()
     h_fh.close()
     mask_fh.close()
+    if tok_sum is None:                              # empty shard (world > n_rows)
+        tok_sum = torch.zeros(0, dtype=torch.float64)
+    torch.save({"sum": tok_sum, "count": tok_count},
+               shards_dir / f"{prefix}_sum.{tag}.pt")
     with open(shards_dir / f"{prefix}meta.{tag}.json", "w") as f:
         json.dump({"rank": env.rank, "start": start, "end": end,
                    "lens": lens, "ids": ids}, f)
@@ -215,6 +231,9 @@ def _merge_modality(shards_dir: Path, cache_dir: Path, prefix: str,
     offsets = [0]
     ids: list[str] = []
     expect_start = 0
+    mean_sum = None            # corpus token-sum accumulated across shards
+    mean_count = 0
+    have_all_sums = True
     for mp in metas:
         with open(mp) as f:
             meta = json.load(f)
@@ -229,6 +248,16 @@ def _merge_modality(shards_dir: Path, cache_dir: Path, prefix: str,
         for l in meta["lens"]:
             offsets.append(offsets[-1] + l)
         ids.extend(meta["ids"])
+        # Fold in this shard's token-sum (skip empty shards; tolerate shard dirs
+        # from before the sum hook existed).
+        sum_path = shards_dir / f"{prefix}_sum.{tag}.pt"
+        if sum_path.exists():
+            rec = torch.load(sum_path, map_location="cpu")
+            if int(rec["count"]) > 0:
+                mean_sum = rec["sum"] if mean_sum is None else mean_sum + rec["sum"]
+                mean_count += int(rec["count"])
+        else:
+            have_all_sums = False
     h_out.close()
     mask_out.close()
     if expect_start != expected_total:
@@ -237,6 +266,14 @@ def _merge_modality(shards_dir: Path, cache_dir: Path, prefix: str,
             f"[0,{expected_total}). Missing or extra shards.")
     off = torch.tensor(offsets, dtype=torch.long)
     torch.save(off, cache_dir / f"{prefix}_offsets.pt")
+
+    if have_all_sums and mean_sum is not None and mean_count > 0:
+        torch.save((mean_sum / mean_count).float(), cache_dir / f"{prefix}_mean.pt")
+        print(f"[merge][{prefix}] wrote mean over {mean_count} tokens "
+              f"(|mean|={(mean_sum / mean_count).float().norm():.3f})", flush=True)
+    else:
+        print(f"[merge][{prefix}] no per-shard sums found; skipping {prefix}_mean.pt "
+              f"(train_retrieval will compute it on first use)", flush=True)
     return off, ids
 
 
