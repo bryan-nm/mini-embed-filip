@@ -18,13 +18,14 @@ from config import default_cfg
 from src.data import PackedPerTokenCache
 
 
-def modality_report(name: str, cache: PackedPerTokenCache, idxs, n_probe: int) -> None:
+def modality_report(name: str, cache: PackedPerTokenCache, n_probe: int) -> None:
     within = []          # mean within-sequence pairwise cos of valid tokens
     valid_counts, raw_counts = [], []
     first_valid_vecs = []   # first valid token of each seq (unit-norm) -> cross-seq check
+    idxs = torch.randperm(len(cache))[:n_probe].tolist()   # indices valid for THIS cache
     for i in idxs:
-        h, m = cache.get(int(i))            # h [1, L, D], m [1, L] bool
-        h, m = h[0].float(), m[0].bool()
+        h, m = cache.get(int(i))            # h [L, D] bf16, m [L] bool (no batch dim)
+        h, m = h.float(), m.bool()
         raw_counts.append(m.numel())
         valid_counts.append(int(m.sum()))
         v = h[m]                             # [V, D] valid tokens only
@@ -64,10 +65,9 @@ def main() -> None:
 
     p_cache = PackedPerTokenCache(args.cache_dir, "protein", cfg.model.protein_hidden)
     t_cache = PackedPerTokenCache(args.cache_dir, "text", cfg.model.text_hidden)
-    idxs = torch.randperm(len(t_cache))[: args.n].tolist()
 
-    modality_report("PROTEIN (AMPLIFY-350M, 960-d)", p_cache, idxs, args.n)
-    modality_report("TEXT (BioLinkBERT, 768-d)", t_cache, idxs, args.n)
+    modality_report("PROTEIN (AMPLIFY-350M, 960-d)", p_cache, args.n)
+    modality_report("TEXT (BioLinkBERT, 768-d)", t_cache, args.n)
     print("\nInterpretation:")
     print("  - within-seq cos ~1 in a modality  => that encoder's cached tokens are")
     print("    degenerate (precompute/layer/mask bug); no loss tweak will fix it.")
