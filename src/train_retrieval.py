@@ -45,6 +45,7 @@ from src.dist import (
     broadcast_parameters, average_gradients,
 )
 from src.evaluate import evaluate_split
+from src.compute_means import ensure_means, load_means
 from src.losses import phase_r1_loss, phase_r2_loss_grouped
 from src.model import MiniEmbedFilip
 
@@ -336,6 +337,23 @@ def main() -> None:
     if env.distributed:
         broadcast_parameters(model)
 
+    # De-anisotropize the projection input: install corpus-mean token vectors as
+    # model buffers (subtracted inside each ProjectionHead). Without this the
+    # AMPLIFY-350M features are near-rank-1 and FILIP max-sim collapses. Rank 0
+    # computes+caches the means from the packed cache; all ranks load the same
+    # file so buffers match. The buffers save into the checkpoint, so a resume
+    # (below) restores them and reconstruction/generation inherit the centering.
+    if cfg.retrieval.use_cache:
+        if env.is_main:
+            ensure_means(cfg.retrieval.cache_dir, cfg.model.protein_hidden,
+                         cfg.model.text_hidden, verbose=True)
+        barrier()
+        mean_p, mean_t = load_means(cfg.retrieval.cache_dir)
+        core.set_feature_means(mean_p, mean_t)
+    elif env.is_main:
+        print("[train] WARNING: --no-cache => projection-input means not set; "
+              "features are un-centered and FILIP may collapse.")
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.retrieval.lr,
         weight_decay=cfg.retrieval.weight_decay,
@@ -388,9 +406,12 @@ def main() -> None:
             h_p, h_t, mask_p, mask_t = fetch_batch(batch, device, encoders, cfg)
             with autocast_ctx(device):
                 out = model(h_p, h_t)
+                # Reconstruction targets live in centered space (expansion heads
+                # reconstruct h - mean); project() already centers internally.
+                h_p_c, h_t_c = core.center(h_p, h_t)
                 if in_phase1:
                     losses = phase_r1_loss(
-                        out, h_p, h_t, mask_p, mask_t,
+                        out, h_p_c, h_t_c, mask_p, mask_t,
                         uniformity_weight=cfg.retrieval.phase1_uniformity_weight,
                         uniformity_t=cfg.retrieval.uniformity_t,
                         recon_weight=cfg.retrieval.recon_weight,
@@ -409,7 +430,7 @@ def main() -> None:
                     groups_local = row_group_ids[batch["idx"]].to(device)
                     groups_all = grouped_all_gather_ids(groups_local, env)
                     losses = phase_r2_loss_grouped(
-                        out, h_p, h_t, mask_p, mask_t, core.logit_scale,
+                        out, h_p_c, h_t_c, mask_p, mask_t, core.logit_scale,
                         z_p_all=z_p_all, z_t_all=z_t_all,
                         mask_p_all=mp_all, mask_t_all=mt_all,
                         local_offset=local_offset,

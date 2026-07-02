@@ -145,9 +145,10 @@ def main() -> None:
                 # Projection is frozen: compute z without grad, reconstruct with grad.
                 with torch.no_grad():
                     z_p, z_t = model.project(h_p, h_t)
+                    h_p_c, h_t_c = model.center(h_p, h_t)   # centered recon target
                 h_p_hat, h_t_hat = model.expand(z_p, z_t)
-                l_p = reconstruction_loss(h_p_hat, h_p, mask_p)
-                l_t = reconstruction_loss(h_t_hat, h_t, mask_t)
+                l_p = reconstruction_loss(h_p_hat, h_p_c, mask_p)
+                l_t = reconstruction_loss(h_t_hat, h_t_c, mask_t)
                 loss = 0.5 * (l_p + l_t)
 
             loss.backward()
@@ -179,9 +180,10 @@ def main() -> None:
                     mask_p = batch["mask_p"].to(device)
                     mask_t = batch["mask_t"].to(device)
                     z_p, z_t = model.project(h_p, h_t)
+                    h_p_c, h_t_c = model.center(h_p, h_t)
                     h_p_hat, h_t_hat = model.expand(z_p, z_t)
-                    val_p += reconstruction_loss(h_p_hat, h_p, mask_p).item()
-                    val_t += reconstruction_loss(h_t_hat, h_t, mask_t).item()
+                    val_p += reconstruction_loss(h_p_hat, h_p_c, mask_p).item()
+                    val_t += reconstruction_loss(h_t_hat, h_t_c, mask_t).item()
                     nb += 1
             val_p /= max(nb, 1)
             val_t /= max(nb, 1)

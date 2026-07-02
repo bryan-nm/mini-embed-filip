@@ -46,8 +46,16 @@ class ProjectionHead(nn.Module):
         self.fc3 = nn.Linear(d_mid, d_out)
         self.drop = nn.Dropout(dropout)
         self.act = nn.GELU()
+        # Corpus-mean token vector, subtracted at the input to de-anisotropize the
+        # encoder features (AMPLIFY-350M tokens are ~0.89 aligned with one rogue
+        # mean direction; that dominates every dot product and collapses FILIP
+        # max-sim). Set via MiniEmbedFilip.set_feature_means; zero => no-op. A
+        # buffer, so it saves into the checkpoint and every caller of this head
+        # (retrieval, generation memory front-end) centers identically.
+        self.register_buffer("mean_in", torch.zeros(d_in))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - self.mean_in
         x = self.fc1(x)
         x = self.act(x)
         x = self.norm1(x)
@@ -131,12 +139,36 @@ class MiniEmbedFilip(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale, dtype=torch.float32))
         self.max_logit_scale = math.log(max_temperature)
 
+    @torch.no_grad()
+    def set_feature_means(self, mean_p: torch.Tensor | None = None,
+                          mean_t: torch.Tensor | None = None) -> None:
+        """Install the corpus-mean token vectors into the projection heads.
+
+        The whole pipeline then operates in centered space: project() subtracts
+        the mean, and center() produces the matching centered reconstruction
+        targets for the expansion heads.
+        """
+        if mean_p is not None:
+            self.protein_proj.mean_in.copy_(mean_p.to(self.protein_proj.mean_in))
+        if mean_t is not None:
+            self.text_proj.mean_in.copy_(mean_t.to(self.text_proj.mean_in))
+
+    def center(self, h_p: torch.Tensor, h_t: torch.Tensor):
+        """Mean-centered encoder features — the reconstruction target space.
+
+        Expansion reconstructs h - mean (not raw h): the mean is constant across
+        the corpus, so it carries no per-token signal, and keeping the generation
+        conditioning memory centered de-anisotropizes the decoder's cross-attention
+        the same way it de-anisotropizes FILIP.
+        """
+        return h_p - self.protein_proj.mean_in, h_t - self.text_proj.mean_in
+
     def project(self, h_p: torch.Tensor, h_t: torch.Tensor):
-        """Returns (z_p, z_t) per-token, L2-normalized in 32-d."""
+        """Returns (z_p, z_t) per-token, L2-normalized. Heads center h internally."""
         return self.protein_proj(h_p), self.text_proj(h_t)
 
     def expand(self, z_p: torch.Tensor, z_t: torch.Tensor):
-        """Returns (h_p_hat, h_t_hat) per-token, in encoder hidden space."""
+        """Returns (h_p_hat, h_t_hat) per-token, in *centered* encoder hidden space."""
         return self.protein_expand(z_p), self.text_expand(z_t)
 
     def forward(self, h_p: torch.Tensor, h_t: torch.Tensor):
