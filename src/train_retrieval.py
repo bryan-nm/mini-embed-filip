@@ -45,7 +45,7 @@ from src.dist import (
     broadcast_parameters, average_gradients,
 )
 from src.evaluate import evaluate_split
-from src.compute_means import ensure_means, load_means
+from src.compute_means import load_means
 from src.losses import phase_r1_loss, phase_r2_loss_grouped
 from src.model import MiniEmbedFilip
 
@@ -339,17 +339,23 @@ def main() -> None:
 
     # De-anisotropize the projection input: install corpus-mean token vectors as
     # model buffers (subtracted inside each ProjectionHead). Without this the
-    # AMPLIFY-350M features are near-rank-1 and FILIP max-sim collapses. Rank 0
-    # computes+caches the means from the packed cache; all ranks load the same
-    # file so buffers match. The buffers save into the checkpoint, so a resume
-    # (below) restores them and reconstruction/generation inherit the centering.
+    # AMPLIFY-350M features are near-rank-1 and FILIP max-sim collapses. The means
+    # are computed OFFLINE (src/compute_means.py, or written by precompute) — here
+    # every rank only LOADS the small .pt files. Deliberately no rank-0 compute
+    # under a barrier: 560 GB of serial I/O on one rank while the others block is
+    # a debug-queue timeout, and a crash there would deadlock the whole job.
     if cfg.retrieval.use_cache:
-        if env.is_main:
-            ensure_means(cfg.retrieval.cache_dir, cfg.model.protein_hidden,
-                         cfg.model.text_hidden, verbose=True)
-        barrier()
         mean_p, mean_t = load_means(cfg.retrieval.cache_dir)
-        core.set_feature_means(mean_p, mean_t)
+        if mean_p is not None and mean_t is not None:
+            core.set_feature_means(mean_p, mean_t)
+        elif args.resume is None:
+            raise RuntimeError(
+                f"Feature means not found in {cfg.retrieval.cache_dir} "
+                f"(protein_mean.pt / text_mean.pt). Compute them once, offline:\n"
+                f"    python -m src.compute_means --cache-dir {cfg.retrieval.cache_dir}\n"
+                f"(or re-run precompute, which now writes them). Every rank raises "
+                f"this together, so the job exits cleanly rather than hanging.")
+        # else: resuming — the checkpoint's buffers carry the means (restored below).
     elif env.is_main:
         print("[train] WARNING: --no-cache => projection-input means not set; "
               "features are un-centered and FILIP may collapse.")

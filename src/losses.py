@@ -283,9 +283,12 @@ def phase_r2_loss_grouped(
         acc_pt = (logits_pt.argmax(dim=-1) == target).float().mean()
         acc_tp = (logits_tp.argmax(dim=-1) == target).float().mean()
         acc = 0.5 * (acc_pt + acc_tp)
-        # positive-pair score = the true-pair FILIP at the local offset (unmasked)
-        filip_pos = mat_p2t.gather(1, target[:, None]).mean()
 
+    # positive-pair score = the true-pair FILIP at the local offset (unmasked).
+    # Kept OUTSIDE no_grad so align_aux_weight * l_align actually backprops —
+    # matching phase_r2_loss's diagonal filip_pos. (Under no_grad this term was a
+    # silent no-op in the distributed path.)
+    filip_pos = mat_p2t.gather(1, target[:, None]).mean()
     l_align = 1.0 - filip_pos
     l_recon = 0.5 * (
         reconstruction_loss(h_p_hat, h_p, mask_p)

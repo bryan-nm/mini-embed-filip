@@ -110,8 +110,10 @@ def _encode_modality(items, ids, start, end, prefix, encode_fn,
         h, mask = encode_fn(items[s:e])
         hb = h.to(torch.bfloat16).float()          # bf16-rounded, matches storage
         keep_all = mask.bool()
-        batch_sum = hb[keep_all].sum(dim=0).double().cpu()   # [d]
-        tok_sum = batch_sum if tok_sum is None else tok_sum + batch_sum
+        # Sum on-device in fp32, then accumulate in fp64 on CPU (XPU float64 is
+        # unreliable; keep double() off the device).
+        batch_sum = hb[keep_all].sum(dim=0).cpu()            # [d] fp32
+        tok_sum = batch_sum.double() if tok_sum is None else tok_sum + batch_sum
         tok_count += int(keep_all.sum().item())
         for row in range(h.size(0)):
             keep = mask[row]
