@@ -22,6 +22,9 @@ NRANKS=$(( NNODES * RANKS_PER_NODE ))
 
 export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+# text2protein decoder: ProtGPT3-112M-dpo (Mixtral MoE). Stated explicitly rather
+# than left to the config default so the job fails loudly if it isn't staged.
+export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
 export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_annotated/swissprot_augmented.csv
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
@@ -36,11 +39,22 @@ export CCL_ZE_IPC_EXCHANGE=pidfd
 source ~/bin/slack_notify.sh
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 
+# Per-direction decoder sizing. text2protein now runs on ProtGPT3-112M-dpo (an
+# 8-layer Mixtral MoE), so a cross-attn adapter on EVERY layer is still cheap and
+# gives the conditioning many more entry points than every-other-layer did on the
+# 3B Dayhoff stack; the small decoder also has headroom for a much larger batch.
+# protein2text is unchanged (BioGPT, 24 layers) — keep its old settings.
+if [ "$DIRECTION" = text2protein ]; then
+    BS=32; CAE=1
+else
+    BS=8;  CAE=2
+fi
+
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
     python -m src.train_generation --direction "${DIRECTION}" \
     --retrieval-ckpt "${RCKPT}" --device xpu \
-    --batch-size 8 --epochs 20 --lr 5e-5 --max-target-tokens 512 \
-    --cross-attn-every 2 --unfreeze-top 0 --use-cvae --val-subset 100
+    --batch-size "${BS}" --epochs 20 --lr 5e-5 --max-target-tokens 512 \
+    --cross-attn-every "${CAE}" --unfreeze-top 0 --use-cvae --val-subset 100
 
 # push stop notifications to slack
 rc=$?

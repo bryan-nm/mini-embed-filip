@@ -53,7 +53,8 @@ from src.best_of_n import pad_stack, select_best_of_n
 from src.cvae import load_cvae
 from src.data import group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
-    LoRACfg, load_decoder_with_cross_attn, set_cross_memory, clear_cross_memory,
+    LoRACfg, decode_target, load_decoder_with_cross_attn, set_cross_memory,
+    clear_cross_memory, target_prefix_ids,
 )
 from src.dist import init_distributed, barrier, cleanup
 from src.encoders import (
@@ -173,6 +174,9 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
 
     bos = dtok.bos_token_id if dtok.bos_token_id is not None else dtok.eos_token_id
     pad_id = dtok.pad_token_id if dtok.pad_token_id is not None else dtok.eos_token_id
+    # BOS + any decoder control tokens (ProtGPT3's direction marker), matching the
+    # prompt the adapters were trained against.
+    prompt = [bos] + target_prefix_ids(decoder, dtok)
     N = max(args.num_candidates, 1)
 
     # Reference panel for margin selection: source-modality embeddings of train
@@ -217,14 +221,14 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
             mask_b = torch.cat([mask_b, kmask], dim=1)
 
         set_cross_memory(adapters, mem_b, mask_b)
-        input_ids = torch.full((B * N, 1), bos, device=device, dtype=torch.long)
+        input_ids = torch.tensor([prompt] * (B * N), device=device, dtype=torch.long)
         gen = decoder.generate(
             input_ids, max_new_tokens=args.max_new_tokens,
             do_sample=args.temperature > 0, temperature=max(args.temperature, 1e-6),
             top_p=args.top_p, pad_token_id=pad_id, use_cache=True,
         )
         clear_cross_memory(adapters)
-        cand_tgts = [dtok.decode(row, skip_special_tokens=True).strip() for row in gen]
+        cand_tgts = [decode_target(decoder, dtok, row) for row in gen]
 
         # Re-encode all B*N candidates -> 32-d. Guard empty generations.
         enc_in = [t if t.strip() else empty_tgt for t in cand_tgts]

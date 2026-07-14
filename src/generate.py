@@ -35,8 +35,8 @@ from src.best_of_n import pad_stack, select_best_of_n
 from src.cvae import load_cvae
 from src.data import load_pairs
 from src.decoder_adapters import (
-    LoRACfg, load_decoder_with_cross_attn,
-    set_cross_memory, clear_cross_memory,
+    LoRACfg, decode_target, load_decoder_with_cross_attn,
+    set_cross_memory, clear_cross_memory, target_prefix_ids,
 )
 from src.encoders import (
     encode_protein_batch, encode_text_batch,
@@ -163,7 +163,10 @@ def main() -> None:
         mask_b = torch.cat([mask_b, kmask], dim=1)
 
     set_cross_memory(adapters, mem_b, mask_b)
-    input_ids = torch.full((N, 1), bos, device=device, dtype=torch.long)
+    # Seed with BOS + the decoder's control tokens (ProtGPT3's direction marker),
+    # matching how training targets were built.
+    prompt = [bos] + target_prefix_ids(decoder, target_tok)
+    input_ids = torch.tensor([prompt] * N, device=device, dtype=torch.long)
     with torch.no_grad():
         generated = decoder.generate(
             input_ids,
@@ -175,7 +178,7 @@ def main() -> None:
             use_cache=True,
         )
     clear_cross_memory(adapters)
-    cands = [target_tok.decode(row, skip_special_tokens=True).strip() for row in generated]
+    cands = [decode_target(decoder, target_tok, row) for row in generated]
 
     if N == 1:
         best, scores = cands[0], None

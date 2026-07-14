@@ -1,6 +1,9 @@
-"""Cross-attention adapters for ProGen2 and BioGPT decoders.
+"""Cross-attention adapters for the generation decoders.
 
-Both decoders are loaded as their pretrained `ForCausalLM` classes. We inject
+Supported architectures: Mixtral (ProtGPT3, the default text->protein decoder),
+Jamba (Dayhoff), ProGen2, and BioGPT.
+
+Decoders are loaded as their pretrained `ForCausalLM` classes. We inject
 a `CrossAttentionAdapter` into a subset of decoder blocks (every Nth, by
 default) and freeze everything else. Optionally, LoRA is added on top of the
 existing self-attention QKV projections and FFN.
@@ -12,16 +15,21 @@ stateful approach avoids monkey-patching the underlying transformer's
 forward signature.
 
 The injection points differ slightly:
-  ProGen2 block: parallel attn + MLP, both reading from ln_1(h). We append a
-                 cross-attention "residual update" after the parallel block.
-  BioGPT block:  standard pre-norm self-attn + FFN. We insert cross-attention
-                 between them, also as a residual update.
+  ProGen2 block:  parallel attn + MLP, both reading from ln_1(h). We append a
+                  cross-attention "residual update" after the parallel block.
+  BioGPT block:   standard pre-norm self-attn + FFN. We insert cross-attention
+                  between them, also as a residual update.
+  Mixtral/Jamba:  the layer is left intact and a forward hook applies the
+                  cross-attention residual to its output (see
+                  `_make_cross_attn_hook`).
 
 The user-facing API:
   load_decoder_with_cross_attn(direction, path, cross_attn_every, memory_dim,
                                lora_cfg, device)
       -> (model, tokenizer, adapter_blocks)
   set_cross_memory(adapter_blocks, memory, mask) -> None
+  target_prefix_ids(model, tokenizer) -> List[int]   # decoder control tokens
+  decode_target(model, tokenizer, ids) -> str        # inverse of the above
   count_trainable(model) -> int
 
 `memory_dim` is the dimension of the per-token expansion-head output (e.g.
@@ -212,12 +220,18 @@ def _freeze(model: nn.Module) -> None:
         p.requires_grad_(False)
 
 
+def _unwrap(model: nn.Module) -> nn.Module:
+    """The raw model behind a DDP wrapper (a no-op for an unwrapped model)."""
+    return getattr(model, "module", model)
+
+
 def _decoder_arch(model: nn.Module) -> str:
     """Identify the decoder family from a loaded model, so injection/unfreezing
     work regardless of which checkpoint a direction is pointed at."""
+    model = _unwrap(model)
     mt = getattr(getattr(model, "config", None), "model_type", "")
-    if mt == "jamba":
-        return "jamba"
+    if mt in ("jamba", "mixtral"):
+        return mt
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return "progen"
     if hasattr(model, "biogpt"):
@@ -228,11 +242,12 @@ def _decoder_arch(model: nn.Module) -> str:
 def _decoder_blocks(model: nn.Module):
     """The ordered list of decoder blocks/layers for the model's architecture."""
     arch = _decoder_arch(model)
+    model = _unwrap(model)
     if arch == "progen":
         return model.transformer.h            # ProGen2
     if arch == "biogpt":
         return model.biogpt.layers            # BioGPT
-    return model.model.layers                 # Jamba (Dayhoff)
+    return model.model.layers                 # Jamba / Mixtral (ProtGPT3)
 
 
 def unfreeze_top_blocks(model: nn.Module, direction: str, n: int) -> int:
@@ -325,16 +340,17 @@ def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
 
 
 # ---------------------------------------------------------------------------
-# Jamba (Dayhoff) injection — via forward hooks
+# Jamba (Dayhoff) / Mixtral (ProtGPT3) injection — via forward hooks
 # ---------------------------------------------------------------------------
 def _make_cross_attn_hook(adapter: CrossAttentionAdapter):
     """Forward hook that applies the cross-attention residual to a layer output.
 
-    Jamba is used *unwrapped* (not replaced by a module) because JambaModel
-    selects the per-layer attention mask with `isinstance(layer,
-    JambaMambaDecoderLayer)`; wrapping a mamba layer would route the wrong mask
-    to it. A forward hook leaves the layer's class intact. Jamba decoder layers
-    return a bare hidden-state tensor; older/other layers may return a tuple.
+    These decoders are hooked *in place* rather than wrapped in a new module.
+    For Jamba that is mandatory: JambaModel picks the per-layer attention mask
+    with `isinstance(layer, JambaMambaDecoderLayer)`, so wrapping a mamba layer
+    would route the wrong mask to it. A forward hook leaves the layer's class
+    intact. Modern decoder layers return a bare hidden-state tensor; older ones
+    return a tuple.
     """
     def hook(module, inputs, output):
         if isinstance(output, tuple):
@@ -414,6 +430,94 @@ def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     return adapters
 
 
+# ---------------------------------------------------------------------------
+# Mixtral (ProtGPT3) injection — via forward hooks
+# ---------------------------------------------------------------------------
+def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
+                    ) -> List[CrossAttentionAdapter]:
+    """Inject cross-attention adapters (via hooks) + LoRA into a Mixtral model.
+
+    ProtGPT3 is a Mixtral-architecture sparse MoE. Its decoder layers return a
+    bare hidden-state tensor, so the same forward-hook injection as Jamba works;
+    hooks also keep the adapters inside the layer `__call__`, which is what makes
+    them recompute correctly under gradient checkpointing.
+
+    LoRA targets the self-attention projections only. The MoE feed-forward stores
+    its experts as fused Parameter tensors (`experts.gate_up_proj` [E, 2*d_ff, d],
+    `experts.down_proj` [E, d, d_ff]) rather than nn.Linear, so there is nothing
+    for `_replace_linear_with_lora` to wrap; those stay frozen, as do the router
+    weights (perturbing routing on a frozen backbone destabilizes the prior).
+    """
+    base = model.model                                   # MixtralModel
+    dec_hidden = model.config.hidden_size
+    n_heads = model.config.num_attention_heads
+
+    adapters: List[CrossAttentionAdapter] = []
+    for i, layer in enumerate(base.layers):
+        if i % every != 0:
+            continue
+        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0)
+        layer.register_forward_hook(_make_cross_attn_hook(ca))
+        adapters.append(ca)
+    # Register on the model so the optimizer / state_dict / .to(device) / DDP all
+    # see the adapter params. The hooks hold the same module objects, so
+    # set_cross_memory() reaches them.
+    model.cross_attn_adapters = nn.ModuleList(adapters)
+
+    if lora_cfg.target_self_attn:
+        for layer in base.layers:
+            for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                _replace_linear_with_lora(layer.self_attn, attr, lora_cfg.rank,
+                                          lora_cfg.alpha, lora_cfg.dropout)
+
+    return adapters
+
+
+# ProtGPT3 was pretrained with a generation-direction marker as the first token
+# after BOS: "1" = N-to-C (the normal reading direction), "2" = C-to-N. It is an
+# ordinary vocab token, not a special token, so it must be added explicitly to
+# every training target and to the generation prompt — without it the decoder is
+# off-distribution from token 0 — and stripped back off when decoding.
+PROTGPT3_FORWARD_TOKEN = "1"
+PROTGPT3_DIRECTION_TOKENS = ("1", "2")
+
+
+def target_prefix_ids(model: nn.Module, tokenizer) -> List[int]:
+    """Control tokens this decoder expects between BOS and the target body.
+
+    Empty for every decoder except ProtGPT3 (see PROTGPT3_FORWARD_TOKEN).
+    """
+    if _decoder_arch(model) != "mixtral":
+        return []
+    tid = tokenizer.convert_tokens_to_ids(PROTGPT3_FORWARD_TOKEN)
+    # convert_tokens_to_ids falls back to the UNK id for an unknown token, and
+    # this tokenizer's UNK id sits outside the model's embedding table — so bail
+    # out rather than feed the decoder an out-of-range id.
+    vocab_size = _unwrap(model).config.vocab_size
+    if tid is None or not (0 <= tid < vocab_size):
+        raise ValueError(
+            f"Mixtral decoder's tokenizer has no usable {PROTGPT3_FORWARD_TOKEN!r} "
+            f"direction token (got id {tid!r}, vocab_size={vocab_size})")
+    return [tid]
+
+
+def decode_target(model: nn.Module, tokenizer, ids) -> str:
+    """Decode one row of generated ids into a target string.
+
+    ProtGPT3's char-level WordLevel tokenizer decodes to space-separated residues
+    ("M K T"), and its direction marker survives `skip_special_tokens` because it
+    is a normal vocab token. Undo both so the caller gets a bare sequence it can
+    feed straight back into the protein encoder.
+    """
+    text = tokenizer.decode(ids, skip_special_tokens=True)
+    if _decoder_arch(model) != "mixtral":
+        return text.strip()
+    seq = "".join(text.split())
+    while seq[:1] in PROTGPT3_DIRECTION_TOKENS:
+        seq = seq[1:]
+    return seq
+
+
 def load_decoder_with_cross_attn(
     direction: str,
     path: str,
@@ -426,14 +530,24 @@ def load_decoder_with_cross_attn(
 
     Dispatch is by architecture (read from the checkpoint's config) first, then
     by `direction`. This lets a direction be re-pointed at a different model
-    (e.g. text2protein: ProGen2 -> Dayhoff/Jamba) without code changes.
+    (e.g. text2protein: ProGen2 -> Dayhoff/Jamba -> ProtGPT3/Mixtral) without
+    code changes.
     """
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     model_type = getattr(AutoConfig.from_pretrained(path, trust_remote_code=True),
                          "model_type", "")
 
-    if model_type == "jamba":
+    if model_type == "mixtral":
+        # ProtGPT3: native Mixtral sparse MoE, no remote modeling code. Drop
+        # router-logits output — we take CE from the logits and never use the MoE
+        # load-balancing aux loss, and computing it on a frozen router is waste.
+        model = AutoModelForCausalLM.from_pretrained(
+            path, output_router_logits=False, dtype=torch.bfloat16)
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        _freeze(model)
+        adapters = _mixtral_inject(model, cross_attn_every, mem_dim, lora_cfg)
+    elif model_type == "jamba":
         # Dayhoff-3b: native Jamba (hybrid Mamba/attention MoE), no remote
         # modeling code. Force the pure-PyTorch SSM path — the fused
         # mamba-ssm/causal-conv1d CUDA kernels aren't available on Mac/XPU — and

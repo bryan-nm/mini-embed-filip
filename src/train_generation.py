@@ -10,7 +10,7 @@ What's frozen vs trainable:
   trains:   cross-attention adapter layers + LoRA on decoder self-attn / FFN
 
 Directions:
-  text2protein:  text -> BioLinkBERT -> proj -> expand -> Dayhoff-170M -> protein
+  text2protein:  text -> BioLinkBERT -> proj -> expand -> ProtGPT3-112M -> protein
   protein2text:  protein -> AMPLIFY-350M -> proj -> expand -> BioGPT     -> text
 
 Usage:
@@ -55,6 +55,7 @@ from src.decoder_adapters import (
     count_trainable,
     load_decoder_with_cross_attn,
     set_cross_memory,
+    target_prefix_ids,
     unfreeze_top_blocks,
 )
 from src.cvae import build_cvae, beta_at
@@ -135,20 +136,26 @@ class GenerationDataset(Dataset):
         return item
 
 
-def make_collate(target_tokenizer, max_target_tokens: int):
+def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=()):
     # ProGen2's tokenizer ships without a pad token; fall back to EOS.
     if target_tokenizer.pad_token is None:
         target_tokenizer.pad_token = target_tokenizer.eos_token
     pad_id = target_tokenizer.pad_token_id
     bos_id = target_tokenizer.bos_token_id
     eos_id = target_tokenizer.eos_token_id
+    prefix_ids = list(prefix_ids)
 
     # We add BOS/EOS explicitly rather than relying on the tokenizer's
-    # `add_special_tokens`: Dayhoff's char tokenizer never adds them (its
-    # build_inputs_with_special_tokens is a no-op), which would leave the model
-    # with no EOS to learn termination and a BOS-mismatch vs inference (which
-    # seeds generation with BOS). Doing it here is uniform across decoders.
-    body_cap = max_target_tokens - (1 if bos_id is not None else 0) - (1 if eos_id is not None else 0)
+    # `add_special_tokens`: the protein decoders' char tokenizers never add them
+    # (Dayhoff's build_inputs_with_special_tokens is a no-op; ProtGPT3 ships with
+    # add_bos_token=False), which would leave the model with no EOS to learn
+    # termination and a BOS-mismatch vs inference (which seeds generation with
+    # BOS). Doing it here is uniform across decoders. `prefix_ids` carries any
+    # decoder control tokens that sit between BOS and the body — for ProtGPT3,
+    # the "1" (N-to-C) direction marker it was pretrained with.
+    body_cap = (max_target_tokens - len(prefix_ids)
+                - (1 if bos_id is not None else 0)
+                - (1 if eos_id is not None else 0))
 
     def collate(batch):
         B = len(batch)
@@ -161,14 +168,14 @@ def make_collate(target_tokenizer, max_target_tokens: int):
             h_pad[i, :l] = b["h"]
             m_pad[i, :l] = b["m"]
 
-        # Tokenize bodies without specials, then wrap with [BOS] ... [EOS].
+        # Tokenize bodies without specials, then wrap with [BOS] [prefix] ... [EOS].
         seqs = []
         for b in batch:
             body = target_tokenizer(
                 b["target"], add_special_tokens=False, truncation=True,
                 max_length=body_cap,
             )["input_ids"]
-            ids = ([bos_id] if bos_id is not None else []) + body + \
+            ids = ([bos_id] if bos_id is not None else []) + prefix_ids + body + \
                   ([eos_id] if eos_id is not None else [])
             seqs.append(ids)
 
@@ -458,7 +465,14 @@ def main() -> None:
                                cfg.model.protein_hidden, cfg.model.text_hidden,
                                need_target=False)
 
-    collate = make_collate(target_tok, cfg.generation.max_target_tokens)
+    # Decoder control tokens between BOS and the target body (ProtGPT3's "1"
+    # direction marker; empty for the other decoders). Resolved from the raw
+    # decoder, before the DDP wrap below.
+    prefix_ids = target_prefix_ids(decoder, target_tok)
+    if env.is_main and prefix_ids:
+        print(f"[gen] decoder target prefix ids: {prefix_ids}")
+
+    collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids)
     if env.distributed:
         train_sampler = DistributedSampler(
             train_ds, num_replicas=env.world_size, rank=env.rank,

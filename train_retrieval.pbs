@@ -4,7 +4,7 @@
 #PBS -l walltime=16:00:00
 #PBS -l select=16
 #PBS -l place=scatter
-#PBS -l filesystems=home_fs:flare_fs
+#PBS -l filesystems=home_fs:flare_fsx
 #PBS -q capacity
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
