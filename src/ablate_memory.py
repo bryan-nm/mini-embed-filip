@@ -102,13 +102,17 @@ def _lora_disabled(model, enabled: bool):
 
 
 def _run_val(decoder, adapters, val_loader, device, *, memory_mode,
-             src_proj, src_expand, cvae, n_latent):
+             src_proj, src_expand, aligned_mem, cvae, n_latent):
     """One full pass over val_loader. Returns (tw_ppl, mm_ppl, tw_ce, mm_ce).
 
     memory_mode:
       "conditioned" — set the row's own source memory on the adapters.
       "shuffled"    — set another row's memory (batch roll): present but wrong.
       "off"         — never set memory; adapters pass through.
+
+    aligned_mem: when True the memory is project(h) (64-d shared space); when False
+    it is expand(project(h)) (encoder-hidden space). Must match how the checkpoint
+    was trained (read from its `memory_space`).
 
     token-weighted (tw) is the correct estimate; mean-of-means (mm) mirrors the
     training-time [val] print so the conditioned number is directly comparable to
@@ -137,7 +141,7 @@ def _run_val(decoder, adapters, val_loader, device, *, memory_mode,
                     h = torch.roll(h, shifts=1, dims=0)
                     mask = torch.roll(mask, shifts=1, dims=0)
                 z = src_proj(h)
-                mem = src_expand(z)
+                mem = z if aligned_mem else src_expand(z)
                 if cvae is not None:
                     # Inference-time conditioning = prior mean (no target available),
                     # exactly as the training val loop does it.
@@ -196,17 +200,22 @@ def main() -> None:
     if args.direction == "text2protein":
         src_proj, src_expand = retrieval.text_proj, retrieval.text_expand
         decoder_path = cfg.generation.decoder_path
-        mem_dim = cfg.model.text_hidden
+        hidden_mem_dim = cfg.model.text_hidden
     else:
         src_proj, src_expand = retrieval.protein_proj, retrieval.protein_expand
         decoder_path = TEXT_DECODER_PATH
-        mem_dim = cfg.model.protein_hidden
+        hidden_mem_dim = cfg.model.protein_hidden
 
     # 2) Decoder + adapters, restored from the generation checkpoint. cross_attn_every
-    # must match what the checkpoint was trained with (stored in it) so adapter
-    # counts line up; adapter_state loads strict=False against the frozen backbone.
+    # AND memory_space must match what the checkpoint was trained with (both stored
+    # in it) so the adapter counts and k/v input dims line up; adapter_state loads
+    # strict=False against the frozen backbone. memory_space defaults to "expanded"
+    # for checkpoints trained before the flag existed.
     ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
     cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
+    memory_space = ckpt.get("memory_space", "expanded")
+    aligned_mem = memory_space == "aligned"
+    mem_dim = cfg.model.embed_dim if aligned_mem else hidden_mem_dim
     lora_cfg = LoRACfg(
         rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
         dropout=cfg.generation.lora_dropout,
@@ -218,7 +227,8 @@ def main() -> None:
         raise RuntimeError(f"unexpected keys in adapter_state: {unexpected}")
     decoder.eval()
     print(f"[ablate] loaded decoder ckpt {args.decoder_ckpt} "
-          f"(cross_attn_every={cae}, {len(adapters)} adapters)")
+          f"(cross_attn_every={cae}, memory_space={memory_space}, mem_dim={mem_dim}, "
+          f"{len(adapters)} adapters)")
 
     # CVAE heads (frozen) if the checkpoint carries them, mirroring generation.
     cvae = load_cvae(ckpt, cfg.model.embed_dim, device)
@@ -259,7 +269,8 @@ def main() -> None:
         with _lora_disabled(decoder, lora_on):
             tw, mm, tw_ce, _ = _run_val(
                 decoder, adapters, val_loader, device, memory_mode=memory_mode,
-                src_proj=src_proj, src_expand=src_expand, cvae=cvae, n_latent=n_latent)
+                src_proj=src_proj, src_expand=src_expand, aligned_mem=aligned_mem,
+                cvae=cvae, n_latent=n_latent)
         print(f"  {label:<24} ce={tw_ce:.4f}  ppl={tw:.3f}", flush=True)
         return mm, tw_ce
 

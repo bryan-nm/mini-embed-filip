@@ -112,7 +112,7 @@ def main() -> None:
         src_max = cfg.data.max_text_tokens
         def enc_src(strs):
             return encode_text_batch(src_model, src_tok, strs, device, src_max)
-        decoder_path, mem_dim = cfg.generation.decoder_path, cfg.model.text_hidden
+        decoder_path, hidden_mem_dim = cfg.generation.decoder_path, cfg.model.text_hidden
         tgt_proj = retrieval.protein_proj
         tgt_max = cfg.data.max_protein_tokens
     else:
@@ -121,15 +121,15 @@ def main() -> None:
         src_max = cfg.data.max_protein_tokens
         def enc_src(strs):
             return encode_protein_batch(src_model, src_tok, strs, device, src_max)
-        decoder_path, mem_dim = TEXT_DECODER_PATH, cfg.model.protein_hidden
+        decoder_path, hidden_mem_dim = TEXT_DECODER_PATH, cfg.model.protein_hidden
         tgt_proj = retrieval.text_proj
         tgt_max = cfg.data.max_text_tokens
 
-    # Source -> 32-d (retrieval candidate) + per-token expansion memory.
+    # Source -> 32-d retrieval candidate. The cross-attn memory itself is built
+    # below, once the ckpt's memory_space is known.
     h_src, m_src = enc_src([args.input])
     with torch.no_grad():
         z_src = src_proj(h_src.float())                 # [1, L, 32]
-        mem = src_expand(z_src)                         # [1, L, mem_dim]
 
     # Decoder + adapters + (optional) CVAE.
     lora_cfg = LoRACfg(
@@ -138,6 +138,12 @@ def main() -> None:
     )
     ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
     cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
+    # "aligned" conditions on the 64-d projection z directly; "expanded" lifts it
+    # back to encoder-hidden space. Must match how the ckpt was trained.
+    aligned_mem = ckpt.get("memory_space", "expanded") == "aligned"
+    mem_dim = cfg.model.embed_dim if aligned_mem else hidden_mem_dim
+    with torch.no_grad():
+        mem = z_src if aligned_mem else src_expand(z_src)   # [1, L, mem_dim]
     decoder, target_tok, adapters = load_decoder_with_cross_attn(
         args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
     )

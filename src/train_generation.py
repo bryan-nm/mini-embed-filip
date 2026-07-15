@@ -289,6 +289,12 @@ def main() -> None:
     ap.add_argument("--max-target-tokens", type=int, default=cfg.generation.max_target_tokens,
                     help="cap on the generated/teacher-forced target length; lower it to "
                          "cut decoder activation memory (truncates long targets)")
+    ap.add_argument("--memory-space", choices=["expanded", "aligned"],
+                    default=cfg.generation.memory_space,
+                    help="conditioning memory: 'expanded' cross-attends over "
+                         "expand(project(h)) in encoder-hidden space (768/960-d, original); "
+                         "'aligned' cross-attends over project(h) directly (64-d shared "
+                         "retrieval space, no expansion head)")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -308,6 +314,7 @@ def main() -> None:
     cfg.generation.cvae_n_latent_tokens = args.cvae_n_latent_tokens
     cfg.generation.cvae_beta_max = args.cvae_beta_max
     cfg.generation.max_target_tokens = args.max_target_tokens
+    cfg.generation.memory_space = args.memory_space
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -326,9 +333,17 @@ def main() -> None:
         if args.direction == "text2protein"
         else TEXT_DECODER_PATH
     )
-    # Memory dim = encoder hidden dim of the INPUT modality (what the expansion
-    # head outputs). For text2protein, input is text -> text_expand -> 768-d.
-    mem_dim = cfg.model.text_hidden if args.direction == "text2protein" else cfg.model.protein_hidden
+    # Memory dim depends on the conditioning space. "expanded": the encoder hidden
+    # dim of the INPUT modality (what the expansion head outputs) — text2protein is
+    # text -> text_expand -> 768-d. "aligned": the 64-d shared projection space
+    # (project(h)), so the adapter k/v are 64->512 and no expansion head is used.
+    aligned_mem = args.memory_space == "aligned"
+    if aligned_mem:
+        mem_dim = cfg.model.embed_dim
+    else:
+        mem_dim = cfg.model.text_hidden if args.direction == "text2protein" else cfg.model.protein_hidden
+    if env.is_main:
+        print(f"[gen] memory_space={args.memory_space} mem_dim={mem_dim}")
 
     # Gradient checkpointing recomputes the forward during backward, but dropout
     # RNG is not reliably preserved across recomputation on XPU. A non-zero LoRA
@@ -535,12 +550,16 @@ def main() -> None:
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume, ckpt_dir)
         ckpt = torch.load(resume_path, map_location=device)
+        # memory_space defaults to "expanded" for pre-flag checkpoints.
         if ckpt.get("cross_attn_every") != args.cross_attn_every or \
-           ckpt.get("unfreeze_top") != args.unfreeze_top:
+           ckpt.get("unfreeze_top") != args.unfreeze_top or \
+           ckpt.get("memory_space", "expanded") != args.memory_space:
             raise RuntimeError(
                 f"--resume checkpoint architecture mismatch: "
                 f"cross_attn_every={ckpt.get('cross_attn_every')} unfreeze_top={ckpt.get('unfreeze_top')} "
-                f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top}")
+                f"memory_space={ckpt.get('memory_space', 'expanded')} "
+                f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top} "
+                f"memory_space={args.memory_space}")
         # `missing` keys are expected (the frozen backbone isn't in adapter_state);
         # only unexpected keys signal a real mismatch.
         _, unexpected = core.load_state_dict(ckpt["adapter_state"], strict=False)
@@ -586,10 +605,12 @@ def main() -> None:
             attn_mask = batch["attn_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Encoder front-end (frozen): project then expand the source side.
+            # Encoder front-end (frozen): project the source side, then (for the
+            # "expanded" space only) lift back to encoder-hidden dim. "aligned"
+            # cross-attends over the 64-d projection z directly.
             with torch.no_grad():
                 z = src_proj(h)
-                mem = src_expand(z)
+                mem = z if aligned_mem else src_expand(z)
 
             kl = torch.zeros((), device=device)
             if cvae is not None:
@@ -667,7 +688,7 @@ def main() -> None:
                     attn_mask = batch["attn_mask"].to(device)
                     labels = batch["labels"].to(device)
                     z = src_proj(h)
-                    mem = src_expand(z)
+                    mem = z if aligned_mem else src_expand(z)
                     # Inference-time conditioning: prior mean (no target available).
                     if cvae is not None:
                         pmu, _ = cvae.prior_params(masked_mean(z, mask))
@@ -701,7 +722,8 @@ def main() -> None:
                        "optimizer_state": optim.state_dict(),
                        "train_log": log,
                        "cross_attn_every": args.cross_attn_every,
-                       "unfreeze_top": args.unfreeze_top}
+                       "unfreeze_top": args.unfreeze_top,
+                       "memory_space": args.memory_space}
             # CVAE heads (Feature 1); absent => downstream loads run without a latent.
             if cvae is not None:
                 payload["cvae_state"] = cvae.state_dict()

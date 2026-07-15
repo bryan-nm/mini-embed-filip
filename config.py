@@ -32,7 +32,7 @@ DATA_CSV = os.environ.get(
 
 TEXT_ENCODER_PATH = os.environ.get("FILIP_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
 PROTEIN_ENCODER_PATH = os.environ.get("FILIP_PROTEIN_ENCODER", f"{MODELS_DIR}/AMPLIFY_350M")
-PROTEIN_DECODER_PATH = os.environ.get("FILIP_PROTEIN_DECODER", f"{MODELS_DIR}/Dayhoff-170m-UR90")  # Jamba
+PROTEIN_DECODER_PATH = os.environ.get("FILIP_PROTEIN_DECODER", f"{MODELS_DIR}/ProtGPT3-112M-dpo")  # Mixtral MoE
 TEXT_DECODER_PATH = os.environ.get("FILIP_TEXT_DECODER", f"{MODELS_DIR}/biogpt")
 
 
@@ -145,6 +145,17 @@ class GenerationCfg:
     retrieval_ckpt: str = ""                  # path to a trained retrieval checkpoint
 
     device: str = "auto"
+
+    # Conditioning memory space (what the decoder cross-attends over).
+    #   "expanded": expand(project(h)) in the encoder-hidden space (768 text /
+    #               960 protein). The original design.
+    #   "aligned":  project(h) directly — the 64-d shared retrieval space, no
+    #               expansion head. Keeps generation in the same space as
+    #               retrieval; the expansion cannot add information beyond the
+    #               64-d projection, so this drops a provably-redundant lift (and
+    #               12x the cross-attn KV width). Requires retraining the adapters
+    #               (k/v projections change from 768->512 to 64->512).
+    memory_space: str = "expanded"            # or "aligned"
 
     # Cross-attention adapter insertion
     cross_attn_every: int = 2                 # insert at every other decoder block

@@ -113,11 +113,13 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
               f"direction={args.direction}", flush=True)
     print(f"[rt][rank {env.rank}] generating {len(my)} outputs on {device}", flush=True)
 
-    # Decoder identity depends on direction (no models needed yet).
+    # Decoder identity depends on direction (no models needed yet). hidden_mem_dim
+    # is the "expanded" memory width; the actual mem_dim also depends on the ckpt's
+    # memory_space and is resolved once the ckpt is loaded below.
     if _target_is_protein(args.direction):
-        decoder_path, mem_dim = cfg.generation.decoder_path, cfg.model.text_hidden
+        decoder_path, hidden_mem_dim = cfg.generation.decoder_path, cfg.model.text_hidden
     else:
-        decoder_path, mem_dim = TEXT_DECODER_PATH, cfg.model.protein_hidden
+        decoder_path, hidden_mem_dim = TEXT_DECODER_PATH, cfg.model.protein_hidden
 
     # Rank-0-first model load (trust_remote_code module-cache race for ProGen2).
     def _load_models():
@@ -128,10 +130,13 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
             rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
             dropout=cfg.generation.lora_dropout,
         )
-        # Build the decoder with the SAME cross_attn_every the ckpt was trained
-        # with (stored in the ckpt), so adapter counts line up.
+        # Build the decoder with the SAME cross_attn_every AND memory_space the ckpt
+        # was trained with (both stored in it), so adapter counts and k/v input dims
+        # line up. memory_space defaults to "expanded" for pre-flag checkpoints.
         ck = torch.load(args.decoder_ckpt, map_location="cpu")
         cae = ck.get("cross_attn_every", args.cross_attn_every)
+        aligned = ck.get("memory_space", "expanded") == "aligned"
+        mem_dim = cfg.model.embed_dim if aligned else hidden_mem_dim
         dec, dtok, adapters = load_decoder_with_cross_attn(
             args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
         )
@@ -141,14 +146,15 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         if dtok.pad_token is None:
             dtok.pad_token = dtok.eos_token
         dtok.padding_side = "left"   # correct for batched decoder generation
-        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, cvae
+        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, cvae, aligned
 
     if env.is_main:
         models = _load_models()
     barrier()
     if not env.is_main:
         models = _load_models()
-    retrieval, text_model, text_tok, prot_model, prot_tok, decoder, dtok, adapters, cvae = models
+    (retrieval, text_model, text_tok, prot_model, prot_tok, decoder, dtok,
+     adapters, cvae, aligned_mem) = models
     if env.is_main and cvae is not None:
         print(f"[rt] CVAE conditioning enabled (latent_tokens={cvae.cfg.n_latent_tokens})",
               flush=True)
@@ -203,10 +209,12 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         uids = [pairs[i].uid for i in chunk]
         B = len(chunk)
 
-        # Source -> 32-d (retrieval candidate) + expanded cross-attn memory.
+        # Source -> 32-d (retrieval candidate) + cross-attn memory. "aligned"
+        # conditions on the 64-d projection directly; "expanded" lifts it back to
+        # encoder-hidden space via the expansion head.
         h_src, mask_src = enc_src(srcs)
         z_src = src_proj(h_src.float())
-        mem = src_expand(z_src)
+        mem = z_src if aligned_mem else src_expand(z_src)
 
         # N candidates per source: replicate the memory, add N latent samples
         # (CVAE) for structured diversity; temperature supplies the rest.
