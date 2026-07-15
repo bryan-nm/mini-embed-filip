@@ -32,6 +32,14 @@ export MASTER_PORT=2950$([ "$DIRECTION" = protein2text ] && echo 3 || echo 2)
 export OMP_NUM_THREADS=8
 export CCL_PROCESS_LAUNCHER=pmix
 export CCL_ATL_TRANSPORT=mpi
+# Do the rank/KVS exchange over MPI (PMIx), NOT oneCCL's internal TCP KVS. The
+# internal KVS is a single rendezvous server on rank 0; at O(1000s) of ranks the
+# simultaneous connect storm overruns it ("Connection reset by peer" -> "pmi init
+# failed" -> SIGSEGV during the first collective). Fine at a few nodes, fatal at
+# scale. CCL_KVS_MODE=mpi routes the exchange through MPI instead; the timeout is
+# headroom for the bring-up on a busy fabric.
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=600
 export FI_PROVIDER=cxi
 export CCL_ZE_IPC_EXCHANGE=pidfd
 
@@ -50,7 +58,10 @@ else
     BS=8;  CAE=2
 fi
 
-mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
+# --pmi=pmix is REQUIRED to match CCL_PROCESS_LAUNCHER=pmix: it tells PALS to
+# expose a PMIx server for CCL to bootstrap against. Without it, pmix is requested
+# but unavailable and CCL falls back to the internal KVS (see CCL_KVS_MODE above).
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_generation --direction "${DIRECTION}" \
     --retrieval-ckpt "${RCKPT}" --device xpu \
     --batch-size "${BS}" --epochs 20 --lr 5e-5 --max-target-tokens 512 \
