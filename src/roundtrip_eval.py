@@ -208,7 +208,8 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
             h_pn, m_pn = enc_src([get_src(pairs[i]) for i in panel_indices])
             z_pn = src_proj(h_pn.float())
             z_panel, panel_mask = pad_stack(
-                [z_pn[i][m_pn[i]].cpu() for i in range(len(panel_indices))], 32, device)
+                [z_pn[i][m_pn[i]].cpu() for i in range(len(panel_indices))],
+                cfg.model.embed_dim, device)
         if env.is_main:
             print(f"[rt] best-of-{N} selection={args.selection} "
                   f"panel={len(panel_indices)}", flush=True)
@@ -224,8 +225,8 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         uids = [pairs[i].uid for i in chunk]
         B = len(chunk)
 
-        # Source -> 32-d (retrieval candidate) + cross-attn memory. "aligned"
-        # conditions on the 64-d projection directly (optionally through the frozen
+        # Source -> embed_dim retrieval candidate + cross-attn memory. "aligned"
+        # conditions on the projection directly (optionally through the frozen
         # memory map); "expanded" lifts it back to encoder-hidden space.
         h_src, mask_src = enc_src(srcs)
         z_src = src_proj(h_src.float())
@@ -258,7 +259,7 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         clear_cross_memory(adapters)
         cand_tgts = [decode_target(decoder, dtok, row) for row in gen]
 
-        # Re-encode all B*N candidates -> 32-d. Guard empty generations.
+        # Re-encode all B*N candidates -> embed_dim. Guard empty generations.
         enc_in = [t if t.strip() else empty_tgt for t in cand_tgts]
         h_gen, mask_gen = enc_tgt(enc_in)
         z_gen = tgt_proj(h_gen.float())
@@ -270,8 +271,9 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
             js = list(range(b * N, b * N + N))
             cand_z = [z_gen[j][mask_gen[j]].float().cpu() for j in js]
             if N > 1:
-                zc, mc = pad_stack(cand_z, 32, device)
-                zs, ms = pad_stack([z_src[b][mask_src[b]].float().cpu()], 32, device)
+                zc, mc = pad_stack(cand_z, cfg.model.embed_dim, device)
+                zs, ms = pad_stack([z_src[b][mask_src[b]].float().cpu()],
+                                   cfg.model.embed_dim, device)
                 best_j, _ = select_best_of_n(
                     zc, mc, zs, ms, z_panel, panel_mask, mode=args.selection)
             else:
@@ -299,7 +301,7 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
 # ---------------------------------------------------------------------------
 # Scoring phase (one rank): merge shards -> FILIP retrieval -> outputs
 # ---------------------------------------------------------------------------
-def _pad_stack(seqs, dim=32):
+def _pad_stack(seqs, dim):
     """List of [l, dim] -> ([N, Lmax, dim], bool mask [N, Lmax])."""
     n = len(seqs)
     lmax = max(max((t.size(0) for t in seqs), default=1), 1)
@@ -337,6 +339,7 @@ def _recall(S: torch.Tensor, groups: torch.Tensor, ks):
 
 
 def score_and_write(args, device) -> None:
+    embed_dim = default_cfg().model.embed_dim
     shards = sorted(glob.glob(str(Path(args.shards_dir) / "shard.*.pt")))
     if not shards:
         raise RuntimeError(f"No shards in {args.shards_dir}; run generation first.")
@@ -346,8 +349,8 @@ def score_and_write(args, device) -> None:
     n = len(recs)
     print(f"[rt][score] merged {n} records from {len(shards)} shards", flush=True)
 
-    Z_gen, mask_gen = _pad_stack([r["z_gen"] for r in recs])
-    Z_src, mask_src = _pad_stack([r["z_src"] for r in recs])
+    Z_gen, mask_gen = _pad_stack([r["z_gen"] for r in recs], embed_dim)
+    Z_src, mask_src = _pad_stack([r["z_src"] for r in recs], embed_dim)
     Z_gen, mask_gen = Z_gen.to(device), mask_gen.to(device)
     Z_src, mask_src = Z_src.to(device), mask_src.to(device)
 
@@ -366,7 +369,7 @@ def score_and_write(args, device) -> None:
     src2gen, _ = _recall(S.t().contiguous(), groups, ks)   # source -> its generated target
 
     # Ceiling: true targets -> sources, same scorer/candidate set.
-    Z_true, mask_true = _pad_stack([r["z_true"] for r in recs])
+    Z_true, mask_true = _pad_stack([r["z_true"] for r in recs], embed_dim)
     S_true = filip_score_matrix_chunked(Z_true.to(device), Z_src, mask_true.to(device),
                                         mask_src, chunk_rows=args.filip_chunk_rows)
     ceiling, _ = _recall(S_true, groups, ks)
