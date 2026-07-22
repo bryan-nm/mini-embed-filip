@@ -78,7 +78,7 @@ def _target_is_protein(direction: str) -> bool:
     return direction == "text2protein"
 
 
-def load_retrieval(ckpt_path: str, device) -> MiniEmbedFilip:
+def load_retrieval(ckpt_path: str, device, with_maps: bool = False) -> MiniEmbedFilip:
     cfg = default_cfg()
     m = MiniEmbedFilip(
         text_hidden=cfg.model.text_hidden, protein_hidden=cfg.model.protein_hidden,
@@ -88,9 +88,18 @@ def load_retrieval(ckpt_path: str, device) -> MiniEmbedFilip:
         expand_dropout=cfg.model.expand_dropout,
         init_temperature=cfg.retrieval.init_temperature,
         max_temperature=cfg.retrieval.max_temperature,
+        with_maps=with_maps, map_hidden=cfg.model.map_hidden,
     )
     state = torch.load(ckpt_path, map_location="cpu")
-    m.load_state_dict(state["model_state"])
+    missing, unexpected = m.load_state_dict(state["model_state"], strict=False)
+    is_map = lambda k: k.startswith("text_map.") or k.startswith("protein_map.")
+    bad = [k for k in missing if not is_map(k)] + [k for k in unexpected if not is_map(k)]
+    if bad:
+        raise RuntimeError(f"retrieval load mismatch (non-map keys): {bad}")
+    if with_maps and any(is_map(k) for k in missing):
+        raise RuntimeError(
+            f"--memory-map decoder ckpt but retrieval ckpt {ckpt_path} has no trained "
+            f"memory map (run train_memory_map)")
     m.eval().to(device)
     for p in m.parameters():
         p.requires_grad_(False)
@@ -123,7 +132,16 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
 
     # Rank-0-first model load (trust_remote_code module-cache race for ProGen2).
     def _load_models():
-        retr = load_retrieval(args.retrieval_ckpt, device)
+        # Build the decoder with the SAME cross_attn_every, memory_space, memory_map
+        # AND cross_attn_mode the ckpt was trained with (all stored in it), so adapter
+        # counts, k/v dims, retrieval maps, and scoring space line up. All default to
+        # the pre-flag values for older checkpoints.
+        ck = torch.load(args.decoder_ckpt, map_location="cpu")
+        cae = ck.get("cross_attn_every", args.cross_attn_every)
+        aligned = ck.get("memory_space", "expanded") == "aligned"
+        memory_map = ck.get("memory_map", False)
+        cross_attn_mode = ck.get("cross_attn_mode", "head")
+        retr = load_retrieval(args.retrieval_ckpt, device, with_maps=memory_map)
         tmodel, ttok = load_text_encoder(
             cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         pmodel, ptok = load_protein_encoder(cfg.model.protein_encoder_path, device)
@@ -131,15 +149,10 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
             rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
             dropout=cfg.generation.lora_dropout,
         )
-        # Build the decoder with the SAME cross_attn_every AND memory_space the ckpt
-        # was trained with (both stored in it), so adapter counts and k/v input dims
-        # line up. memory_space defaults to "expanded" for pre-flag checkpoints.
-        ck = torch.load(args.decoder_ckpt, map_location="cpu")
-        cae = ck.get("cross_attn_every", args.cross_attn_every)
-        aligned = ck.get("memory_space", "expanded") == "aligned"
         mem_dim = cfg.model.embed_dim if aligned else hidden_mem_dim
         dec, dtok, adapters = load_decoder_with_cross_attn(
             args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
+            cross_attn_mode=cross_attn_mode,
         )
         dec.load_state_dict(ck["adapter_state"], strict=False)
         dec.eval()
@@ -147,7 +160,7 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         if dtok.pad_token is None:
             dtok.pad_token = dtok.eos_token
         dtok.padding_side = "left"   # correct for batched decoder generation
-        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, cvae, aligned
+        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, cvae, aligned, memory_map
 
     if env.is_main:
         models = _load_models()
@@ -155,7 +168,7 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
     if not env.is_main:
         models = _load_models()
     (retrieval, text_model, text_tok, prot_model, prot_tok, decoder, dtok,
-     adapters, cvae, aligned_mem) = models
+     adapters, cvae, aligned_mem, memory_map) = models
     if env.is_main and cvae is not None:
         print(f"[rt] CVAE conditioning enabled (latent_tokens={cvae.cfg.n_latent_tokens})",
               flush=True)
@@ -212,11 +225,16 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         B = len(chunk)
 
         # Source -> 32-d (retrieval candidate) + cross-attn memory. "aligned"
-        # conditions on the 64-d projection directly; "expanded" lifts it back to
-        # encoder-hidden space via the expansion head.
+        # conditions on the 64-d projection directly (optionally through the frozen
+        # memory map); "expanded" lifts it back to encoder-hidden space.
         h_src, mask_src = enc_src(srcs)
         z_src = src_proj(h_src.float())
-        mem = z_src if aligned_mem else src_expand(z_src)
+        if not aligned_mem:
+            mem = src_expand(z_src)
+        elif memory_map:
+            mem = retrieval.map_source(z_src, args.direction)
+        else:
+            mem = z_src
 
         # N candidates per source: replicate the memory, add N latent samples
         # (CVAE) for structured diversity; temperature supplies the rest.

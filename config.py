@@ -31,7 +31,7 @@ DATA_CSV = os.environ.get(
 )
 
 TEXT_ENCODER_PATH = os.environ.get("FILIP_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
-PROTEIN_ENCODER_PATH = os.environ.get("FILIP_PROTEIN_ENCODER", f"{MODELS_DIR}/AMPLIFY_350M")
+PROTEIN_ENCODER_PATH = os.environ.get("FILIP_PROTEIN_ENCODER", f"{MODELS_DIR}/SaAMPLIFY_350M")
 PROTEIN_DECODER_PATH = os.environ.get("FILIP_PROTEIN_DECODER", f"{MODELS_DIR}/ProtGPT3-112M-dpo")  # Mixtral MoE
 TEXT_DECODER_PATH = os.environ.get("FILIP_TEXT_DECODER", f"{MODELS_DIR}/biogpt")
 
@@ -51,13 +51,24 @@ class DataCfg:
     max_text_tokens: int = 512
     max_protein_tokens: int = 1024            # bumped from 512 — covers long-tail proteins
 
+    # Caption-schema field labels: the UPPERCASE "LABEL:" prefixes the SwissProt-
+    # full captions are templated with (all 10 that occur across the corpus). The
+    # text tokenizer registers each as a single special token (see
+    # encoders.load_text_encoder); cross-modal comparison masks them out. This list
+    # is the schema seam — swap it if the caption format changes; a new text
+    # embedder just gets these labels registered against its own tokenizer.
+    caption_field_labels: tuple = (
+        "PROTEIN NAME:", "LINEAGE:", "GENE ONTOLOGY:", "SIMILARITY:", "FUNCTION:",
+        "ENZYME CLASS:", "CATALYTIC ACTIVITY:", "PATHWAY:", "DOMAIN:", "PTM:",
+    )
+
 
 @dataclass
 class ModelCfg:
     text_encoder_path: str = TEXT_ENCODER_PATH
     protein_encoder_path: str = PROTEIN_ENCODER_PATH
     text_hidden: int = 768                    # BioLinkBERT-base
-    protein_hidden: int = 960                 # AMPLIFY-350M
+    protein_hidden: int = 960                 # SaAMPLIFY-350M (same 960-d as AMPLIFY-350M)
 
     proj_d_hidden: int = 512
     proj_d_mid: int = 256
@@ -67,6 +78,13 @@ class ModelCfg:
     expand_d_mid: int = 256
     expand_d_hidden: int = 512
     expand_dropout: float = 0.1
+
+    # Cross-modal memory map g: embed_dim -> embed_dim (Medium). A residual MLP,
+    # trained in the frozen map phase (train_memory_map), that nudges a source
+    # token's aligned projection toward the *target* modality's region of the
+    # shared space (text->protein for text2protein). Off unless a decoder run sets
+    # --memory-map; this is just the hidden width when it is built.
+    map_hidden: int = 128
 
 
 @dataclass
@@ -99,6 +117,14 @@ class RetrievalCfg:
     # alignment weight otherwise).
     mask_text_special_tokens: bool = True
     mask_protein_special_tokens: bool = True
+
+    # Field-label special tokens (caption prefixes like "FUNCTION:", see
+    # DataCfg.caption_field_labels) are emitted as single tokens by the text
+    # tokenizer regardless; this flag only controls whether they're masked out of
+    # FILIP comparisons + uniformity. They are template artifacts with no content,
+    # so mask them for cross-modal comparison — an embedding/export run may keep
+    # them (set False). Independent of mask_text_special_tokens (CLS/SEP/PAD).
+    mask_text_field_labels: bool = True
 
     lr: float = 3e-4
     weight_decay: float = 0.01
@@ -136,6 +162,30 @@ class ReconCfg:
 
 
 @dataclass
+class MapCfg:
+    """Cross-modal memory-map phase (Medium).
+
+    Takes a trained retrieval checkpoint, freezes the projection + expansion heads
+    and the temperature, and trains ONLY the two memory maps (text_map,
+    protein_map) with a FILIP-contrastive aux computed on *detached* projections:
+    map(z_src) must retrieve the true target's aligned tokens. Because the inputs
+    are detached, the retrieval geometry (and R@K) is mathematically untouched — a
+    map-augmented checkpoint that generation can load and optionally apply. Writes
+    the same {"epoch", "model_state"} format as train_retrieval.
+    """
+    cache_dir: str = str(REPO_ROOT / "cache")
+    ckpt_dir: str = str(REPO_ROOT / "checkpoints" / "memory_map")
+    device: str = "auto"
+    batch_size: int = 128
+    epochs: int = 5
+    lr: float = 1e-3                          # a small head; tolerates a high LR
+    weight_decay: float = 0.0
+    warmup_frac: float = 0.05
+    grad_clip: float = 1.0
+    log_every: int = 50
+
+
+@dataclass
 class GenerationCfg:
     """One block per generation direction."""
     direction: str = "text2protein"           # or "protein2text"
@@ -156,6 +206,21 @@ class GenerationCfg:
     #               12x the cross-attn KV width). Requires retraining the adapters
     #               (k/v projections change from 768->512 to 64->512).
     memory_space: str = "expanded"            # or "aligned"
+
+    # Apply the retrieval memory map to the source projection before it becomes
+    # cross-attn memory (Medium). Requires memory_space="aligned" and a
+    # map-augmented retrieval checkpoint (train_memory_map). Off => the raw aligned
+    # z is used (the bypass arm of the A/B).
+    memory_map: bool = False
+
+    # Cross-attention scoring space (Strong).
+    #   "head":    learned multi-head attention (q_proj/k_proj into the decoder head
+    #              space). The original adapter.
+    #   "aligned": single-head cosine max-sim in the shared 64-d space — queries are
+    #              projected to embed_dim and scored directly against the aligned
+    #              memory (no k_proj), so the attention weights ARE the FILIP
+    #              [residue x source-token] array. Requires memory_space="aligned".
+    cross_attn_mode: str = "head"             # or "aligned"
 
     # Cross-attention adapter insertion
     cross_attn_every: int = 2                 # insert at every other decoder block
@@ -199,6 +264,7 @@ class Cfg:
     model: ModelCfg = field(default_factory=ModelCfg)
     retrieval: RetrievalCfg = field(default_factory=RetrievalCfg)
     recon: ReconCfg = field(default_factory=ReconCfg)
+    memory_map: MapCfg = field(default_factory=MapCfg)
     generation: GenerationCfg = field(default_factory=GenerationCfg)
 
 

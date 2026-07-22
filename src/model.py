@@ -104,8 +104,45 @@ class ExpansionHead(nn.Module):
         return x
 
 
+class MemoryMap(nn.Module):
+    """Cross-modal residual map g: embed_dim -> embed_dim in the shared space.
+
+    Nudges a source token's aligned projection toward the *target* modality's
+    region of the shared space (text->protein for text2protein), so the decoder
+    conditions on a protein-ward object instead of a text-ward one. Applied
+    per-token; the L_t token structure (and thus the interpretable FILIP array) is
+    preserved.
+
+    The final layer is zero-initialized and the input is unit-norm, so at init
+    g(z) = normalize(z) = z — an exact identity. Training (the frozen map phase)
+    moves it off identity. Output is re-normalized so it stays a citizen of the
+    unit-sphere aligned space (matching ProjectionHead's normalized output), which
+    both the FILIP-contrastive aux and the aligned-mode cross-attention rely on.
+    """
+
+    def __init__(self, dim: int, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden)
+        self.norm = nn.LayerNorm(hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(dropout)
+        self.act = nn.GELU()
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        d = self.fc2(self.drop(self.norm(self.act(self.fc1(z)))))
+        return F.normalize(z + d, p=2, dim=-1)
+
+
 class MiniEmbedFilip(nn.Module):
-    """Full trainable retrieval model: projection + expansion heads + temperature."""
+    """Full trainable retrieval model: projection + expansion heads + temperature.
+
+    When `with_maps` is set it also holds the two cross-modal memory maps
+    (text_map, protein_map). They are absent by default so retrieval /
+    reconstruction checkpoints are byte-identical to before; the map phase and the
+    generation paths that use --memory-map opt in.
+    """
 
     def __init__(
         self,
@@ -120,6 +157,8 @@ class MiniEmbedFilip(nn.Module):
         expand_dropout: float,
         init_temperature: float,
         max_temperature: float,
+        with_maps: bool = False,
+        map_hidden: int = 128,
     ):
         super().__init__()
         self.text_proj = ProjectionHead(
@@ -135,9 +174,28 @@ class MiniEmbedFilip(nn.Module):
             embed_dim, expand_d_mid, expand_d_hidden, protein_hidden, expand_dropout
         )
 
+        self.with_maps = with_maps
+        if with_maps:
+            self.text_map = MemoryMap(embed_dim, map_hidden, proj_dropout)
+            self.protein_map = MemoryMap(embed_dim, map_hidden, proj_dropout)
+
         init_logit_scale = math.log(1.0 / init_temperature)
         self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale, dtype=torch.float32))
         self.max_logit_scale = math.log(max_temperature)
+
+    def map_source(self, z: torch.Tensor, direction: str) -> torch.Tensor:
+        """Apply the cross-modal map for a generation direction's SOURCE side.
+
+        text2protein conditions on text -> text_map (text->protein-ward);
+        protein2text conditions on protein -> protein_map. Raises if the maps were
+        not built (with_maps=False), so a --memory-map run fails loudly against a
+        map-less checkpoint rather than silently conditioning on the raw z.
+        """
+        if not self.with_maps:
+            raise RuntimeError(
+                "map_source called but this model was built with_maps=False "
+                "(no trained memory map in the checkpoint; run train_memory_map)")
+        return self.text_map(z) if direction == "text2protein" else self.protein_map(z)
 
     @torch.no_grad()
     def set_feature_means(self, mean_p: torch.Tensor | None = None,

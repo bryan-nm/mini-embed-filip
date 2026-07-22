@@ -66,21 +66,37 @@ class CrossAttentionAdapter(nn.Module):
     """
 
     def __init__(self, dec_hidden: int, mem_dim: int, n_heads: int,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, score_space: str = "head"):
         super().__init__()
         assert dec_hidden % n_heads == 0
+        assert score_space in ("head", "aligned")
         self.dec_hidden = dec_hidden
         self.mem_dim = mem_dim
         self.n_heads = n_heads
         self.head_dim = dec_hidden // n_heads
         self.scale = self.head_dim ** -0.5
+        self.score_space = score_space
 
         self.ln_q = nn.LayerNorm(dec_hidden)
-        self.q_proj = nn.Linear(dec_hidden, dec_hidden, bias=False)
-        self.k_proj = nn.Linear(mem_dim, dec_hidden, bias=False)
         self.v_proj = nn.Linear(mem_dim, dec_hidden, bias=False)
         self.o_proj = nn.Linear(dec_hidden, dec_hidden, bias=False)
         self.drop = nn.Dropout(dropout)
+
+        if score_space == "head":
+            # Learned multi-head attention in the decoder head space (original).
+            self.q_proj = nn.Linear(dec_hidden, dec_hidden, bias=False)
+            self.k_proj = nn.Linear(mem_dim, dec_hidden, bias=False)
+        else:
+            # "aligned" (Strong): single-head cosine max-sim in the shared mem_dim
+            # (embed_dim) space. Queries are projected to mem_dim and scored
+            # directly against the aligned memory — no k_proj, the keys ARE the
+            # retrieval vectors — with a learned FILIP-style temperature. The
+            # attention weights are then the interpretable [T, L_mem] alignment
+            # array. Values stay learned (v_proj), so the decoder still pulls a
+            # usable 512-d signal while the *weights* remain the alignment.
+            self.q_align = nn.Linear(dec_hidden, mem_dim, bias=False)
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
+            self.max_logit_scale = math.log(100.0)
 
         # Initialize output projection to zero so the adapter starts as a no-op
         # — important for not destabilizing the frozen decoder at step 0.
@@ -89,10 +105,14 @@ class CrossAttentionAdapter(nn.Module):
         # Set externally before each forward; cleared after.
         self.memory: Optional[torch.Tensor] = None      # [B, L_mem, mem_dim]
         self.memory_mask: Optional[torch.Tensor] = None  # [B, L_mem] bool
+        # Last attention weights (aligned mode) for interpretability / --dump-attn.
+        self.last_attn: Optional[torch.Tensor] = None    # [B, T, L_mem]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.memory is None:
             return hidden_states  # pass-through if no memory is set
+        if self.score_space == "aligned":
+            return self._forward_aligned(hidden_states)
 
         # Run the adapter in its own parameter dtype (fp32) and cast the residual
         # back to the decoder's dtype. This keeps a bf16-loaded frozen decoder and
@@ -118,6 +138,32 @@ class CrossAttentionAdapter(nn.Module):
         attn_weights = self.drop(attn_weights)
         attn_out = attn_weights @ v                                    # [B, n_heads, T, head_dim]
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
+        return hidden_states + self.o_proj(attn_out).to(in_dtype)
+
+    def _forward_aligned(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Single-head cosine max-sim cross-attention in the shared aligned space.
+
+        scores[t, m] = temp * <norm(q_align(h_t)), norm(mem_m)>. The attention
+        weights [B, T, L_mem] are the FILIP alignment between decoder positions and
+        source tokens; stored on self.last_attn for inspection.
+        """
+        in_dtype = hidden_states.dtype
+        w_dtype = self.q_align.weight.dtype
+        h = self.ln_q(hidden_states.to(w_dtype))
+        memory = self.memory.to(w_dtype)                              # [B, L, mem_dim]
+
+        q = F.normalize(self.q_align(h), p=2, dim=-1)                 # [B, T, mem_dim]
+        k = F.normalize(memory, p=2, dim=-1)                          # [B, L, mem_dim]
+        scale = self.logit_scale.clamp(max=self.max_logit_scale).exp()
+        scores = (q @ k.transpose(-1, -2)) * scale                    # [B, T, L]
+        if self.memory_mask is not None:
+            scores = scores.masked_fill(~self.memory_mask[:, None, :], float("-inf"))
+
+        attn = F.softmax(scores, dim=-1)                              # [B, T, L]
+        self.last_attn = attn.detach()
+        attn = self.drop(attn)
+        v = self.v_proj(memory)                                       # [B, L, D]
+        attn_out = attn @ v                                           # [B, T, D]
         return hidden_states + self.o_proj(attn_out).to(in_dtype)
 
 
@@ -272,8 +318,8 @@ def unfreeze_top_blocks(model: nn.Module, direction: str, n: int) -> int:
     return count
 
 
-def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
-                   ) -> List[CrossAttentionAdapter]:
+def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+                   cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
     """Inject cross-attention adapters + LoRA into a ProGen2 model in-place."""
     base = model.transformer                              # ProGenModel
     cfg = base.h[0].attn  # type: ignore[attr-defined]
@@ -284,7 +330,8 @@ def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     for i, block in enumerate(base.h):
         if i % every != 0:
             continue
-        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0)
+        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
+                                   score_space=cross_attn_mode)
         wrapped = _ProGenBlockWithCrossAttn(block, ca)
         base.h[i] = wrapped
         adapters.append(ca)
@@ -306,8 +353,8 @@ def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     return adapters
 
 
-def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
-                   ) -> List[CrossAttentionAdapter]:
+def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+                   cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
     """Inject cross-attention adapters + LoRA into a BioGPT model in-place."""
     base = model.biogpt                                   # BioGptModel
     dec_hidden = model.config.hidden_size
@@ -317,7 +364,8 @@ def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     for i, block in enumerate(base.layers):
         if i % every != 0:
             continue
-        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0)
+        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
+                                   score_space=cross_attn_mode)
         wrapped = _BioGptBlockWithCrossAttn(block, ca)
         base.layers[i] = wrapped
         adapters.append(ca)
@@ -384,8 +432,8 @@ def _load_protein_tokenizer(path: str):
         return mod.ProteinTokenizer()
 
 
-def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
-                  ) -> List[CrossAttentionAdapter]:
+def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+                  cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
     """Inject cross-attention adapters (via hooks) + LoRA into a Jamba model.
 
     Cross-attention is added after every Nth decoder layer (mamba or attention
@@ -402,7 +450,8 @@ def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     for i, layer in enumerate(base.layers):
         if i % every != 0:
             continue
-        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0)
+        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
+                                   score_space=cross_attn_mode)
         layer.register_forward_hook(_make_cross_attn_hook(ca))
         adapters.append(ca)
     # Register the adapters on the model so their params are tracked by the
@@ -433,8 +482,8 @@ def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
 # ---------------------------------------------------------------------------
 # Mixtral (ProtGPT3) injection — via forward hooks
 # ---------------------------------------------------------------------------
-def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
-                    ) -> List[CrossAttentionAdapter]:
+def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+                    cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
     """Inject cross-attention adapters (via hooks) + LoRA into a Mixtral model.
 
     ProtGPT3 is a Mixtral-architecture sparse MoE. Its decoder layers return a
@@ -456,7 +505,8 @@ def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg
     for i, layer in enumerate(base.layers):
         if i % every != 0:
             continue
-        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0)
+        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
+                                   score_space=cross_attn_mode)
         layer.register_forward_hook(_make_cross_attn_hook(ca))
         adapters.append(ca)
     # Register on the model so the optimizer / state_dict / .to(device) / DDP all
@@ -525,13 +575,15 @@ def load_decoder_with_cross_attn(
     mem_dim: int,
     lora_cfg: LoRACfg,
     device: torch.device,
+    cross_attn_mode: str = "head",
 ) -> Tuple[nn.Module, object, List[CrossAttentionAdapter]]:
     """Load the appropriate decoder, freeze it, inject adapters + LoRA.
 
     Dispatch is by architecture (read from the checkpoint's config) first, then
     by `direction`. This lets a direction be re-pointed at a different model
     (e.g. text2protein: ProGen2 -> Dayhoff/Jamba -> ProtGPT3/Mixtral) without
-    code changes.
+    code changes. `cross_attn_mode` ("head" | "aligned") selects the adapter
+    scoring space (see CrossAttentionAdapter); "aligned" requires aligned memory.
     """
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -546,7 +598,8 @@ def load_decoder_with_cross_attn(
             path, output_router_logits=False, dtype=torch.bfloat16)
         tokenizer = AutoTokenizer.from_pretrained(path)
         _freeze(model)
-        adapters = _mixtral_inject(model, cross_attn_every, mem_dim, lora_cfg)
+        adapters = _mixtral_inject(model, cross_attn_every, mem_dim, lora_cfg,
+                                   cross_attn_mode)
     elif model_type == "jamba":
         # Dayhoff-3b: native Jamba (hybrid Mamba/attention MoE), no remote
         # modeling code. Force the pure-PyTorch SSM path — the fused
@@ -558,7 +611,8 @@ def load_decoder_with_cross_attn(
             dtype=torch.bfloat16)
         tokenizer = _load_protein_tokenizer(path)
         _freeze(model)
-        adapters = _jamba_inject(model, cross_attn_every, mem_dim, lora_cfg)
+        adapters = _jamba_inject(model, cross_attn_every, mem_dim, lora_cfg,
+                                 cross_attn_mode)
     elif direction == "text2protein":
         # ProGen2 — custom code via auto_map
         model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)
@@ -586,12 +640,14 @@ def load_decoder_with_cross_attn(
                 torch.tensor(head_dim, dtype=torch.float32)
             ).to(torch.get_default_dtype())
         _freeze(model)
-        adapters = _progen_inject(model, cross_attn_every, mem_dim, lora_cfg)
+        adapters = _progen_inject(model, cross_attn_every, mem_dim, lora_cfg,
+                                  cross_attn_mode)
     elif direction == "protein2text":
         model = AutoModelForCausalLM.from_pretrained(path)
         tokenizer = AutoTokenizer.from_pretrained(path)
         _freeze(model)
-        adapters = _biogpt_inject(model, cross_attn_every, mem_dim, lora_cfg)
+        adapters = _biogpt_inject(model, cross_attn_every, mem_dim, lora_cfg,
+                                  cross_attn_mode)
     else:
         raise ValueError(f"Unknown direction: {direction}")
 

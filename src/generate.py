@@ -57,7 +57,8 @@ def pick_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def load_retrieval(ckpt_path: str, device: torch.device) -> MiniEmbedFilip:
+def load_retrieval(ckpt_path: str, device: torch.device,
+                   with_maps: bool = False) -> MiniEmbedFilip:
     cfg = default_cfg()
     m = MiniEmbedFilip(
         text_hidden=cfg.model.text_hidden,
@@ -71,9 +72,19 @@ def load_retrieval(ckpt_path: str, device: torch.device) -> MiniEmbedFilip:
         expand_dropout=cfg.model.expand_dropout,
         init_temperature=cfg.retrieval.init_temperature,
         max_temperature=cfg.retrieval.max_temperature,
+        with_maps=with_maps,
+        map_hidden=cfg.model.map_hidden,
     )
     state = torch.load(ckpt_path, map_location="cpu")
-    m.load_state_dict(state["model_state"])
+    missing, unexpected = m.load_state_dict(state["model_state"], strict=False)
+    is_map = lambda k: k.startswith("text_map.") or k.startswith("protein_map.")
+    bad = [k for k in missing if not is_map(k)] + [k for k in unexpected if not is_map(k)]
+    if bad:
+        raise RuntimeError(f"retrieval load mismatch (non-map keys): {bad}")
+    if with_maps and any(is_map(k) for k in missing):
+        raise RuntimeError(
+            f"--memory-map decoder ckpt but retrieval ckpt {ckpt_path} has no trained "
+            f"memory map (run train_memory_map)")
     m.eval().to(device)
     for p in m.parameters():
         p.requires_grad_(False)
@@ -101,7 +112,14 @@ def main() -> None:
     args = ap.parse_args()
 
     device = pick_device(args.device)
-    retrieval = load_retrieval(args.retrieval_ckpt, device)
+    # Read the decoder ckpt's architecture flags up front — they decide whether the
+    # retrieval model is built with maps. Defaults cover pre-flag checkpoints.
+    ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
+    cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
+    aligned_mem = ckpt.get("memory_space", "expanded") == "aligned"
+    memory_map = ckpt.get("memory_map", False)
+    cross_attn_mode = ckpt.get("cross_attn_mode", "head")
+    retrieval = load_retrieval(args.retrieval_ckpt, device, with_maps=memory_map)
     N = max(args.num_candidates, 1)
 
     # Direction-specific handles: source side (input) + target side (re-encode
@@ -131,21 +149,24 @@ def main() -> None:
     with torch.no_grad():
         z_src = src_proj(h_src.float())                 # [1, L, 32]
 
-    # Decoder + adapters + (optional) CVAE.
+    # Decoder + adapters + (optional) CVAE. Build the cross-attn memory to match
+    # how the ckpt was trained: "expanded" lifts z back to encoder-hidden space;
+    # "aligned" uses z directly, optionally through the frozen memory map.
     lora_cfg = LoRACfg(
         rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
         dropout=cfg.generation.lora_dropout,
     )
-    ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
-    cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
-    # "aligned" conditions on the 64-d projection z directly; "expanded" lifts it
-    # back to encoder-hidden space. Must match how the ckpt was trained.
-    aligned_mem = ckpt.get("memory_space", "expanded") == "aligned"
     mem_dim = cfg.model.embed_dim if aligned_mem else hidden_mem_dim
     with torch.no_grad():
-        mem = z_src if aligned_mem else src_expand(z_src)   # [1, L, mem_dim]
+        if not aligned_mem:
+            mem = src_expand(z_src)                         # [1, L, mem_dim]
+        elif memory_map:
+            mem = retrieval.map_source(z_src, args.direction)
+        else:
+            mem = z_src
     decoder, target_tok, adapters = load_decoder_with_cross_attn(
         args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
+        cross_attn_mode=cross_attn_mode,
     )
     decoder.load_state_dict(ckpt["adapter_state"], strict=False)
     decoder.eval()

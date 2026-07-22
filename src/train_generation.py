@@ -217,7 +217,16 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=()):
 
 
 # ---------------------------------------------------------------------------
-def load_retrieval_model(ckpt_path: str, device: torch.device) -> MiniEmbedFilip:
+def load_retrieval_model(ckpt_path: str, device: torch.device,
+                         with_maps: bool = False) -> MiniEmbedFilip:
+    """Load a frozen retrieval model. With `with_maps`, also build the memory maps
+    and require the checkpoint to carry trained map weights (from train_memory_map).
+
+    The load is strict=False so a map-augmented checkpoint can be read by a
+    map-less run (extra map keys ignored) and vice versa; only NON-map missing /
+    unexpected keys are a real mismatch. When `with_maps` is set, all-map-keys-
+    missing means the checkpoint predates the map phase — fail loudly.
+    """
     cfg = default_cfg()
     m = MiniEmbedFilip(
         text_hidden=cfg.model.text_hidden,
@@ -231,9 +240,19 @@ def load_retrieval_model(ckpt_path: str, device: torch.device) -> MiniEmbedFilip
         expand_dropout=cfg.model.expand_dropout,
         init_temperature=cfg.retrieval.init_temperature,
         max_temperature=cfg.retrieval.max_temperature,
+        with_maps=with_maps,
+        map_hidden=cfg.model.map_hidden,
     )
     state = torch.load(ckpt_path, map_location="cpu")
-    m.load_state_dict(state["model_state"])
+    missing, unexpected = m.load_state_dict(state["model_state"], strict=False)
+    is_map = lambda k: k.startswith("text_map.") or k.startswith("protein_map.")
+    bad = [k for k in missing if not is_map(k)] + [k for k in unexpected if not is_map(k)]
+    if bad:
+        raise RuntimeError(f"retrieval load mismatch (non-map keys): {bad}")
+    if with_maps and any(is_map(k) for k in missing):
+        raise RuntimeError(
+            f"--memory-map set but retrieval checkpoint {ckpt_path} has no trained "
+            f"memory map (run train_memory_map first)")
     m.eval().to(device)
     for p in m.parameters():
         p.requires_grad_(False)
@@ -297,6 +316,15 @@ def main() -> None:
                          "expand(project(h)) in encoder-hidden space (768/960-d, original); "
                          "'aligned' cross-attends over project(h) directly (64-d shared "
                          "retrieval space, no expansion head)")
+    ap.add_argument("--memory-map", action="store_true", default=cfg.generation.memory_map,
+                    help="apply the retrieval memory map g to the aligned source projection "
+                         "before it becomes cross-attn memory (Medium). Requires "
+                         "--memory-space aligned and a map-augmented retrieval ckpt")
+    ap.add_argument("--cross-attn-mode", choices=["head", "aligned"],
+                    default=cfg.generation.cross_attn_mode,
+                    help="cross-attn scoring space (Strong): 'head' learned multi-head "
+                         "(original); 'aligned' single-head cosine max-sim in the 64-d shared "
+                         "space (attention weights = FILIP array). Requires --memory-space aligned")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -317,6 +345,15 @@ def main() -> None:
     cfg.generation.cvae_beta_max = args.cvae_beta_max
     cfg.generation.max_target_tokens = args.max_target_tokens
     cfg.generation.memory_space = args.memory_space
+    cfg.generation.memory_map = args.memory_map
+    cfg.generation.cross_attn_mode = args.cross_attn_mode
+
+    # "aligned" cross-attn and the memory map both live in the 64-d shared space,
+    # so they require aligned memory (the map is a 64->64 residual; aligned scoring
+    # keys ARE the aligned vectors). Fail loudly rather than silently mis-condition.
+    if args.memory_space != "aligned" and (args.memory_map or args.cross_attn_mode == "aligned"):
+        raise SystemExit(
+            "--memory-map / --cross-attn-mode aligned require --memory-space aligned")
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -324,10 +361,11 @@ def main() -> None:
     if env.is_main:
         print(f"[gen] direction={args.direction} world_size={env.world_size} device={device}")
 
-    # 1) Retrieval model (frozen) — provides projection + expansion
-    retrieval = load_retrieval_model(args.retrieval_ckpt, device)
+    # 1) Retrieval model (frozen) — provides projection + expansion (+ maps).
+    retrieval = load_retrieval_model(args.retrieval_ckpt, device, with_maps=args.memory_map)
     if env.is_main:
-        print(f"[gen] loaded retrieval model from {args.retrieval_ckpt}")
+        print(f"[gen] loaded retrieval model from {args.retrieval_ckpt} "
+              f"(memory_map={args.memory_map}, cross_attn_mode={args.cross_attn_mode})")
 
     # 2) Decoder + adapters
     decoder_path = (
@@ -374,6 +412,7 @@ def main() -> None:
     def _load_decoder():
         return load_decoder_with_cross_attn(
             args.direction, decoder_path, args.cross_attn_every, mem_dim, lora_cfg, device,
+            cross_attn_mode=args.cross_attn_mode,
         )
 
     decoder = target_tok = adapters = None
@@ -428,6 +467,14 @@ def main() -> None:
     else:
         src_proj, src_expand, tgt_proj = (
             retrieval.protein_proj, retrieval.protein_expand, retrieval.text_proj)
+
+    def build_memory(z):
+        """Aligned projection -> cross-attn memory. "expanded" lifts z back to
+        encoder-hidden space; "aligned" uses z directly, optionally passed through
+        the frozen cross-modal map (--memory-map). All frozen; call under no_grad."""
+        if not aligned_mem:
+            return src_expand(z)
+        return retrieval.map_source(z, args.direction) if args.memory_map else z
 
     # 2b) Generation-side CVAE heads (Feature 1). Trained alongside the adapters;
     # injected as extra cross-attention memory tokens.
@@ -556,16 +603,22 @@ def main() -> None:
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume, ckpt_dir)
         ckpt = torch.load(resume_path, map_location=device)
-        # memory_space defaults to "expanded" for pre-flag checkpoints.
+        # memory_space/memory_map/cross_attn_mode default to the pre-flag values
+        # ("expanded"/False/"head") for older checkpoints.
         if ckpt.get("cross_attn_every") != args.cross_attn_every or \
            ckpt.get("unfreeze_top") != args.unfreeze_top or \
-           ckpt.get("memory_space", "expanded") != args.memory_space:
+           ckpt.get("memory_space", "expanded") != args.memory_space or \
+           ckpt.get("memory_map", False) != args.memory_map or \
+           ckpt.get("cross_attn_mode", "head") != args.cross_attn_mode:
             raise RuntimeError(
                 f"--resume checkpoint architecture mismatch: "
                 f"cross_attn_every={ckpt.get('cross_attn_every')} unfreeze_top={ckpt.get('unfreeze_top')} "
                 f"memory_space={ckpt.get('memory_space', 'expanded')} "
+                f"memory_map={ckpt.get('memory_map', False)} "
+                f"cross_attn_mode={ckpt.get('cross_attn_mode', 'head')} "
                 f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top} "
-                f"memory_space={args.memory_space}")
+                f"memory_space={args.memory_space} memory_map={args.memory_map} "
+                f"cross_attn_mode={args.cross_attn_mode}")
         # `missing` keys are expected (the frozen backbone isn't in adapter_state);
         # only unexpected keys signal a real mismatch.
         _, unexpected = core.load_state_dict(ckpt["adapter_state"], strict=False)
@@ -611,12 +664,11 @@ def main() -> None:
             attn_mask = batch["attn_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Encoder front-end (frozen): project the source side, then (for the
-            # "expanded" space only) lift back to encoder-hidden dim. "aligned"
-            # cross-attends over the 64-d projection z directly.
+            # Encoder front-end (frozen): project the source side, then build the
+            # conditioning memory (expand / aligned z / aligned+map — see build_memory).
             with torch.no_grad():
                 z = src_proj(h)
-                mem = z if aligned_mem else src_expand(z)
+                mem = build_memory(z)
 
             kl = torch.zeros((), device=device)
             if cvae is not None:
@@ -694,7 +746,7 @@ def main() -> None:
                     attn_mask = batch["attn_mask"].to(device)
                     labels = batch["labels"].to(device)
                     z = src_proj(h)
-                    mem = z if aligned_mem else src_expand(z)
+                    mem = build_memory(z)
                     # Inference-time conditioning: prior mean (no target available).
                     if cvae is not None:
                         pmu, _ = cvae.prior_params(masked_mean(z, mask))
@@ -729,7 +781,9 @@ def main() -> None:
                        "train_log": log,
                        "cross_attn_every": args.cross_attn_every,
                        "unfreeze_top": args.unfreeze_top,
-                       "memory_space": args.memory_space}
+                       "memory_space": args.memory_space,
+                       "memory_map": args.memory_map,
+                       "cross_attn_mode": args.cross_attn_mode}
             # CVAE heads (Feature 1); absent => downstream loads run without a latent.
             if cvae is not None:
                 payload["cvae_state"] = cvae.state_dict()
