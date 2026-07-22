@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -32,6 +33,8 @@ from src.data import (
     RawPairsDataset,
     build_or_load_splits,
     group_ids_from_accessions,
+    group_ids_from_texts,
+    merged_split_group_ids,
     load_pairs,
     load_splits,
     packed_collate,
@@ -104,6 +107,7 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
             cfg.model.text_encoder_path, cfg.model.protein_encoder_path,
             cfg.data.max_text_tokens, cfg.data.max_protein_tokens,
             cfg.retrieval.mask_text_special_tokens, cfg.retrieval.mask_protein_special_tokens,
+            cfg.data.caption_field_labels, cfg.retrieval.mask_text_field_labels,
         )
         saved = read_cache_fingerprint(cfg.retrieval.cache_dir)
         if not fingerprint_matches(saved, expected):
@@ -125,19 +129,55 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
         if env.is_main:
             print(f"[train] live mode; n={n}")
 
-    # Group-aware (by-accession) split: every caption of a protein stays on one
-    # side of the train/val/test boundary. row_group_ids (per global row) is also
-    # used by the R2 loss (false-negative masking) and the val recall, so it is
-    # built on every rank. Only rank 0 creates/repairs the split file; everyone
-    # reads it after a barrier (avoids a write race across ranks).
+    # Per-row caption-identity ids: byte-identical captions share an id. Used for
+    # same-caption false-negative masking AND folded into the split grouping.
+    # Cache path reads the ids precompute wrote (CSV-row order == pair_ids order);
+    # an older cache without the file falls back to hashing the CSV once.
+    if cfg.retrieval.use_cache:
+        tgi_path = Path(cfg.retrieval.cache_dir) / "text_group_ids.json"
+        if tgi_path.exists():
+            with open(tgi_path) as f:
+                row_text_np = np.asarray(json.load(f), dtype=np.int64)
+        else:
+            if env.is_main:
+                print(f"[train] {tgi_path.name} missing; deriving caption ids from "
+                      f"{cfg.data.csv_path} (rebuild the cache to skip this).")
+            fb_pairs = load_pairs(
+                cfg.data.csv_path, id_col=cfg.data.csv_id_col,
+                protein_col=cfg.data.csv_protein_col, text_col=cfg.data.csv_text_col,
+                pfam_col=cfg.data.csv_pfam_col, subset_size=cfg.data.subset_size)
+            if len(fb_pairs) != n or [p.uid for p in fb_pairs] != list(accessions):
+                raise RuntimeError(
+                    "CSV rows do not match the cache's pair_ids; cannot derive "
+                    "caption ids. Rebuild the cache with `python -m src.precompute`.")
+            row_text_np = group_ids_from_texts([p.text for p in fb_pairs])
+        if len(row_text_np) != n:
+            raise RuntimeError(
+                f"text_group_ids length ({len(row_text_np)}) != n ({n}); "
+                f"rebuild the cache with `python -m src.precompute`.")
+    else:
+        row_text_np = group_ids_from_texts([p.text for p in pairs])
+
+    # Group-aware split over the connected components of (same protein) ∪ (same
+    # caption): every caption of a protein AND every identical caption stays on
+    # one side of the train/val/test boundary — splitting by accession alone would
+    # still leak a caption shared across two proteins. row_group_ids (accession)
+    # and row_text_ids (caption) are built on every rank; they feed the R2 loss
+    # false-negative masking (accession also feeds val recall). Only rank 0
+    # creates/repairs the split file; everyone reads it after a barrier.
     row_group_np = group_ids_from_accessions(accessions)
+    split_group_np = merged_split_group_ids(row_group_np, row_text_np)
     if env.is_main:
         splits = build_or_load_splits(
-            str(splits_path), n, cfg.data.splits, cfg.data.seed, group_ids=row_group_np)
-        print(f"[train] splits: {n} rows over {splits['n_groups']} proteins")
+            str(splits_path), n, cfg.data.splits, cfg.data.seed, group_ids=split_group_np)
+        n_prot = int(row_group_np.max()) + 1 if n else 0
+        n_caps = int(row_text_np.max()) + 1 if n else 0
+        print(f"[train] splits: {n} rows over {splits['n_groups']} groups "
+              f"({n_prot} proteins, {n_caps} unique captions)")
     barrier()
     splits = load_splits(str(splits_path))
     row_group_ids = torch.as_tensor(row_group_np, dtype=torch.long)
+    row_text_ids = torch.as_tensor(row_text_np, dtype=torch.long)
 
     # Subsample validation: `val` is already a random permutation slice, so the
     # first N is a deterministic random sample. Keeps the per-epoch rank-0 eval
@@ -198,7 +238,7 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
         )
     if env.is_main:
         print(f"[train] batches/epoch/rank: train={len(train_loader)} val={len(val_loader)} bs={bs}")
-    return train_loader, val_loader, train_sampler, row_group_ids
+    return train_loader, val_loader, train_sampler, row_group_ids, row_text_ids
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +256,7 @@ def fetch_batch(batch, device, encoders, cfg: Cfg):
         h_t, mask_t = encode_text_batch(
             text_model, text_tok, batch["text"], device,
             cfg.data.max_text_tokens, cfg.retrieval.mask_text_special_tokens,
+            cfg.retrieval.mask_text_field_labels,
         )
         h_p, mask_p = encode_protein_batch(
             prot_model, prot_tok, batch["protein"], device,
@@ -305,11 +346,12 @@ def main() -> None:
             subset_size=cfg.data.subset_size,
         )
         from src.encoders import load_protein_encoder, load_text_encoder
-        text_model, text_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+        text_model, text_tok = load_text_encoder(
+            cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
         encoders = (text_model, text_tok, prot_model, prot_tok)
 
-    train_loader, val_loader, train_sampler, row_group_ids = build_loaders(
+    train_loader, val_loader, train_sampler, row_group_ids, row_text_ids = build_loaders(
         cfg, splits_path, env, pairs=pairs, val_subset=args.val_subset)
 
     model = MiniEmbedFilip(
@@ -431,10 +473,13 @@ def main() -> None:
                     mp_all = grouped_all_gather(mask_p.to(out["z_p"].dtype), env) > 0.5
                     mt_all = grouped_all_gather(mask_t.to(out["z_t"].dtype), env) > 0.5
                     local_offset = env.group_rank * out["z_p"].size(0)
-                    # Accession ids for false-negative masking: this rank's
-                    # anchors + the gathered subgroup columns (same order as z_*_all).
+                    # Accession + caption ids for false-negative masking: this
+                    # rank's anchors + the gathered subgroup columns (same order as
+                    # z_*_all). Same protein OR same caption == a false negative.
                     groups_local = row_group_ids[batch["idx"]].to(device)
                     groups_all = grouped_all_gather_ids(groups_local, env)
+                    text_local = row_text_ids[batch["idx"]].to(device)
+                    text_all = grouped_all_gather_ids(text_local, env)
                     losses = phase_r2_loss_grouped(
                         out, h_p_c, h_t_c, mask_p, mask_t, core.logit_scale,
                         z_p_all=z_p_all, z_t_all=z_t_all,
@@ -446,6 +491,7 @@ def main() -> None:
                         uniformity_t=cfg.retrieval.uniformity_t,
                         chunk_rows=args.filip_chunk_rows,
                         groups=groups_local, groups_all=groups_all,
+                        text_groups=text_local, text_groups_all=text_all,
                     )
 
             losses["loss"].backward()
@@ -481,11 +527,11 @@ def main() -> None:
                 metrics = evaluate_split(
                     core, val_loader, device, encoders,
                     cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
-                    row_group_ids=row_group_ids,
+                    row_group_ids=row_group_ids, row_text_ids=row_text_ids,
                 )
                 eval_dt = time.time() - t_eval
                 short = {k: round(v, 4) for k, v in metrics.items()
-                         if k in ("R@1", "R@5", "R@10", "gap_l2",
+                         if k in ("R@1", "R@5", "R@10", "mAP", "gap_l2",
                                   "mean_cross_token_cos", "mean_pos_token_cos",
                                   "uniformity_p_tokens")}
                 print(f"[val] epoch={epoch}  {short}  eval_time={eval_dt:.1f}s")

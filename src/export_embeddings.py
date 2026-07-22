@@ -354,7 +354,8 @@ def run_live(args, cfg) -> None:
 
     # Rank-0-first load (AMPLIFY's trust_remote_code module cache is written once).
     def _load():
-        tm, tt = load_text_encoder(cfg.model.text_encoder_path, device)
+        tm, tt = load_text_encoder(
+            cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         pm, pt = load_protein_encoder(cfg.model.protein_encoder_path, device)
         rm = load_retrieval(args.ckpt, device)
         return tm, tt, pm, pt, rm
@@ -368,7 +369,8 @@ def run_live(args, cfg) -> None:
     def enc_text(strs):
         return encode_text_batch(text_model, text_tok, strs, device,
                                  cfg.data.max_text_tokens,
-                                 cfg.retrieval.mask_text_special_tokens)
+                                 cfg.retrieval.mask_text_special_tokens,
+                                 cfg.retrieval.mask_text_field_labels)
 
     def enc_prot(strs):
         return encode_protein_batch(prot_model, prot_tok, strs, device,

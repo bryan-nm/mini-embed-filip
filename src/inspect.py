@@ -95,7 +95,8 @@ def load_inspect_encoders(device: torch.device):
     """Load the two frozen encoders once, to reuse across many live pairs."""
     cfg = default_cfg()
     from src.encoders import load_protein_encoder, load_text_encoder
-    text_model, text_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+    text_model, text_tok = load_text_encoder(
+        cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
     prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
     return text_model, text_tok, prot_model, prot_tok
 
@@ -110,6 +111,7 @@ def compute_similarity_matrix_live(
     uid: Optional[str] = None,
     mask_text_specials: bool = True,
     mask_protein_specials: bool = True,
+    mask_text_field_labels: bool = True,
     max_protein_tokens: int = 1024,
     max_text_tokens: int = 1024,
 ) -> dict:
@@ -124,7 +126,8 @@ def compute_similarity_matrix_live(
     text_model, text_tok, prot_model, prot_tok = encoders
 
     h_t, m_t = encode_text_batch(text_model, text_tok, [text], device,
-                                 max_text_tokens, mask_text_specials)
+                                 max_text_tokens, mask_text_specials,
+                                 mask_text_field_labels)
     h_p, m_p = encode_protein_batch(prot_model, prot_tok, [protein_seq], device,
                                     max_protein_tokens, mask_protein_specials)
     with torch.no_grad():
@@ -364,6 +367,7 @@ def main() -> None:
             model, protein, text, device, encoders=encoders, uid=uid,
             mask_text_specials=cfg.retrieval.mask_text_special_tokens,
             mask_protein_specials=cfg.retrieval.mask_protein_special_tokens,
+            mask_text_field_labels=cfg.retrieval.mask_text_field_labels,
             max_protein_tokens=cfg.data.max_protein_tokens,
             max_text_tokens=cfg.data.max_text_tokens,
         )

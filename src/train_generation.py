@@ -42,6 +42,8 @@ from src.data import (
     Pair,
     build_or_load_splits,
     group_ids_from_accessions,
+    group_ids_from_texts,
+    merged_split_group_ids,
     load_pairs,
     load_row_protein_idx,
     load_splits,
@@ -452,14 +454,18 @@ def main() -> None:
         subset_size=args.subset_size,
     )
     splits_path = Path(args.cache_dir) / "splits.json"
-    # Group-aware (by-accession) split, matching retrieval. Rank 0 owns creation;
-    # everyone reads after a barrier (no write race). Reuses the retrieval split
-    # when the cache's splits.json is already present and valid.
+    # Group-aware split over (same protein) ∪ (same caption), matching retrieval —
+    # MUST use the identical grouping or build_or_load_splits would treat the
+    # retrieval split file as stale (n_groups mismatch) and rebuild it differently.
+    # Rank 0 owns creation; everyone reads after a barrier (no write race).
     if env.is_main:
-        group_ids = group_ids_from_accessions([p.uid for p in pairs])
+        group_ids = merged_split_group_ids(
+            group_ids_from_accessions([p.uid for p in pairs]),
+            group_ids_from_texts([p.text for p in pairs]))
         splits = build_or_load_splits(
             str(splits_path), len(pairs), cfg.data.splits, args.seed, group_ids=group_ids)
-        print(f"[gen] splits: {len(pairs)} rows over {splits['n_groups']} proteins")
+        print(f"[gen] splits: {len(pairs)} rows over {splits['n_groups']} groups "
+              f"(protein ∪ caption)")
     barrier()
     splits = load_splits(str(splits_path))
 

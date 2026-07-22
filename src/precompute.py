@@ -55,6 +55,7 @@ from config import default_cfg
 from src.data import (
     cache_fingerprint,
     dedup_proteins,
+    group_ids_from_texts,
     load_pairs,
     write_cache_fingerprint,
 )
@@ -146,6 +147,7 @@ def encode_shard(args, cfg, env) -> None:
 
     mask_text_specials = not args.no_mask_text_specials
     mask_protein_specials = not args.no_mask_protein_specials
+    mask_text_field_labels = not args.no_mask_text_field_labels
 
     pairs = load_pairs(
         cfg.data.csv_path,
@@ -168,7 +170,8 @@ def encode_shard(args, cfg, env) -> None:
     # Stagger encoder load to avoid thousands of ranks hammering the files at once.
     if args.load_stagger > 0 and env.world_size > 1:
         time.sleep((env.local_rank % 12) * args.load_stagger)
-    text_model, text_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+    text_model, text_tok = load_text_encoder(
+        cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
     prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
     barrier()  # everyone past model load before timing the encode
 
@@ -197,7 +200,8 @@ def encode_shard(args, cfg, env) -> None:
         [p.uid for p in pairs[t_start:t_end]], t_start, t_end, "text",
         lambda batch: encode_text_batch(
             text_model, text_tok, batch, device, args.max_text_tokens,
-            mask_specials=mask_text_specials),
+            mask_specials=mask_text_specials,
+            mask_field_labels=mask_text_field_labels),
         shards_dir, tag, env, bs,
     )
 
@@ -309,10 +313,21 @@ def merge_shards(args, cfg) -> None:
         json.dump(protein_ids, f)
     with open(cache_dir / "pair_ids.json", "w") as f:
         json.dump(pair_ids, f)
+    # Per-row caption-identity ids (dense, first-appearance): consumed by the
+    # trainer for same-caption false-negative masking and folded into the split
+    # grouping so identical captions never straddle train/val/test. Written here
+    # (in CSV-row order, matching pair_ids) so the cached path needs no CSV.
+    text_group_ids = group_ids_from_texts([p.text for p in pairs])
+    n_unique_caps = int(text_group_ids.max()) + 1 if n_rows else 0
+    with open(cache_dir / "text_group_ids.json", "w") as f:
+        json.dump(text_group_ids.tolist(), f)
+    print(f"[merge] captions: {n_rows} rows -> {n_unique_caps} unique "
+          f"({n_rows - n_unique_caps} duplicate caption rows)", flush=True)
     fp = cache_fingerprint(
         cfg.model.text_encoder_path, cfg.model.protein_encoder_path,
         args.max_text_tokens, args.max_protein_tokens,
         not args.no_mask_text_specials, not args.no_mask_protein_specials,
+        cfg.data.caption_field_labels, not args.no_mask_text_field_labels,
     )
     write_cache_fingerprint(str(cache_dir), fp)
     bytes_p = (cache_dir / "protein_h.bin").stat().st_size
@@ -333,6 +348,8 @@ def main() -> None:
     ap.add_argument("--max-protein-tokens", type=int, default=cfg.data.max_protein_tokens)
     ap.add_argument("--no-mask-text-specials", action="store_true")
     ap.add_argument("--no-mask-protein-specials", action="store_true")
+    ap.add_argument("--no-mask-text-field-labels", action="store_true",
+                    help="keep caption field-label special tokens in the text mask")
     ap.add_argument("--encode-only", action="store_true", help="write shards, skip merge")
     ap.add_argument("--merge-only", action="store_true",
                     help="single-process merge of existing shards, skip encode")

@@ -14,24 +14,71 @@ import torch
 from src.losses import filip_score_matrix_chunked, token_uniformity_loss
 
 
+def _average_precision(scores: torch.Tensor, relevant: torch.Tensor) -> torch.Tensor:
+    """Per-query Average Precision, matching ProTrek's definition.
+
+    scores   [Q, C] similarity of each query row to every candidate column.
+    relevant [Q, C] bool; True where a candidate is a correct (multi-positive) hit.
+
+    Ranks candidates by descending score, then for the k-th relevant hit (found at
+    1-based rank r) takes precision k/r and averages over all relevant hits — i.e.
+    ProTrek's `np.mean([(i+1)/rank for i, rank in enumerate(ranks)])` (see
+    protrek_trimodal_model.py `_protein2text`/`_text2protein`), computed here over
+    the whole candidate pool exactly as ProTrek searches the full index. Returns
+    [Q]; the mean over queries is mAP. Every query has >=1 relevant (its own
+    positive), so the normalizer is never zero.
+    """
+    C = scores.size(1)
+    # stable sort -> deterministic tie handling run-to-run (FILIP scores rarely
+    # tie exactly except among identical captions, which are all mutually relevant).
+    order = scores.argsort(dim=1, descending=True, stable=True)  # [Q, C] cand idx, best first
+    rel_sorted = torch.gather(relevant, 1, order).to(scores.dtype)   # [Q, C] in rank order
+    ranks = torch.arange(1, C + 1, device=scores.device, dtype=scores.dtype)
+    cum_rel = rel_sorted.cumsum(dim=1)                          # relevant-so-far at each rank
+    precision_at_hit = cum_rel / ranks[None, :]                 # k / r at every position
+    num_rel = rel_sorted.sum(dim=1).clamp_min(1.0)              # R (>=1 via self-positive)
+    return (precision_at_hit * rel_sorted).sum(dim=1) / num_rel
+
+
 @torch.no_grad()
 def retrieval_recall(
     z_p: torch.Tensor, z_t: torch.Tensor,
     mask_p: torch.Tensor, mask_t: torch.Tensor,
     ks=(1, 5, 10), chunk_rows: int = 16,
     groups: torch.Tensor = None,
+    text_groups: torch.Tensor = None,
 ) -> Dict[str, float]:
-    """Symmetric retrieval R@K over the FILIP score matrix.
+    """Symmetric retrieval R@K + mAP over the FILIP score matrix.
 
-    `groups` (per-row accession id) makes every same-protein candidate a
-    positive, so the augmented corpus's sibling captions in a val batch don't
-    count as distractors. The reported rank is that of the best-scoring
-    positive. Without `groups` this is the diagonal-positive recall.
+    A candidate is a positive (not a distractor) when it shares the query's
+    protein (`groups`, accession id) OR its caption (`text_groups`, caption id).
+    Both relations are checked *directly*, mirroring the training-side
+    `mask_false_negatives`. This matters because the corpus has byte-identical
+    captions across different proteins: without caption grouping, an identical
+    caption ties with the positive in p2t and the identical *query* has
+    contradictory targets in t2p, both of which deflate R@K (and cap it below 1
+    for a caption shared by m proteins). The reported rank is that of the
+    best-scoring positive. With neither group supplied this is diagonal recall.
+
+    mAP uses ProTrek's Average-Precision definition (see `_average_precision`)
+    with the same multi-positive relevance set, so `mAP_p2t` / `mAP_t2p` are
+    directly comparable to ProTrek's `protein2text` / `text2protein` `..._map`
+    (our p2t = query protein → texts = ProTrek protein2text). The absolute value
+    still depends on the candidate-pool composition, so a strict head-to-head
+    needs both models scored over the same evaluation set.
     """
     sim = filip_score_matrix_chunked(z_p, z_t, mask_p, mask_t, chunk_rows)
     n = sim.size(0)
     target = torch.arange(n, device=sim.device)
-    same = None if groups is None else (groups[:, None] == groups[None, :])
+    same = None
+    if groups is not None:
+        same = groups[:, None] == groups[None, :]
+    if text_groups is not None:
+        same_text = text_groups[:, None] == text_groups[None, :]
+        same = same_text if same is None else (same | same_text)
+    # Relevance set for AP: the multi-positive group, or the query's own positive
+    # (diagonal) when no groups are supplied — then AP reduces to reciprocal rank.
+    relevant = same if same is not None else torch.eye(n, dtype=torch.bool, device=sim.device)
 
     out: Dict[str, float] = {}
     for direction, mat in (("p2t", sim), ("t2p", sim.t())):
@@ -43,8 +90,10 @@ def retrieval_recall(
             ranks = ((mat > best_pos[:, None]) & ~same).sum(dim=1) + 1
         for k in ks:
             out[f"R@{k}_{direction}"] = (ranks <= k).float().mean().item()
+        out[f"mAP_{direction}"] = _average_precision(mat, relevant).mean().item()
     for k in ks:
         out[f"R@{k}"] = 0.5 * (out[f"R@{k}_p2t"] + out[f"R@{k}_t2p"])
+    out["mAP"] = 0.5 * (out["mAP_p2t"] + out["mAP_t2p"])
     return out
 
 
@@ -115,12 +164,14 @@ def modality_gap_metrics(
 def evaluate_split(model, loader, device: torch.device, encoders=None,
                    max_protein_tokens: int = 1024, max_text_tokens: int = 1024,
                    filip_chunk_rows: int = 8,
-                   row_group_ids: torch.Tensor = None) -> Dict[str, float]:
+                   row_group_ids: torch.Tensor = None,
+                   row_text_ids: torch.Tensor = None) -> Dict[str, float]:
     """Run a full eval pass. Works for both cached and live modes.
 
-    `row_group_ids` (global row -> accession id) enables accession-grouped
-    recall, so multiple captions of one protein in the val set are scored as
-    positives rather than distractors.
+    `row_group_ids` (global row -> accession id) and `row_text_ids` (global row
+    -> caption id) enable grouped recall: candidates sharing the query's protein
+    or its caption are scored as positives rather than distractors, so sibling
+    captions and byte-identical captions in the val set don't deflate R@K.
 
     Scoring stays on `device`: the projected embeddings are tiny (val_subset x
     L x 32), so the FILIP recall + gap metrics run on the GPU instead of being
@@ -175,13 +226,17 @@ def evaluate_split(model, loader, device: torch.device, encoders=None,
     z_p, mask_p = _pad_cat(z_ps, mps)
     z_t, mask_t = _pad_cat(z_ts, mts)
 
-    groups = None
-    if row_group_ids is not None and idxs:
+    groups = text_groups = None
+    if idxs and (row_group_ids is not None or row_text_ids is not None):
         sel = torch.cat(idxs)                       # global row indices, eval order
-        groups = row_group_ids[sel].to(z_p.device)  # aligned with z_p / z_t rows
+        if row_group_ids is not None:
+            groups = row_group_ids[sel].to(z_p.device)      # aligned with z_p/z_t rows
+        if row_text_ids is not None:
+            text_groups = row_text_ids[sel].to(z_p.device)  # aligned with z_p/z_t rows
 
     metrics: Dict[str, float] = {}
     metrics.update(retrieval_recall(z_p, z_t, mask_p, mask_t,
-                                    chunk_rows=filip_chunk_rows, groups=groups))
+                                    chunk_rows=filip_chunk_rows,
+                                    groups=groups, text_groups=text_groups))
     metrics.update(modality_gap_metrics(z_p, z_t, mask_p, mask_t))
     return metrics

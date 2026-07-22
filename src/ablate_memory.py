@@ -61,6 +61,8 @@ from src.cvae import load_cvae
 from src.data import (
     build_or_load_splits,
     group_ids_from_accessions,
+    group_ids_from_texts,
+    merged_split_group_ids,
     load_pairs,
     load_splits,
 )
@@ -245,7 +247,10 @@ def main() -> None:
     if splits_path.exists():
         splits = load_splits(str(splits_path))
     else:
-        group_ids = group_ids_from_accessions([p.uid for p in pairs])
+        # Same (protein ∪ caption) grouping as retrieval/generation.
+        group_ids = merged_split_group_ids(
+            group_ids_from_accessions([p.uid for p in pairs]),
+            group_ids_from_texts([p.text for p in pairs]))
         splits = build_or_load_splits(
             str(splits_path), len(pairs), cfg.data.splits, args.seed, group_ids=group_ids)
 

@@ -84,6 +84,19 @@ def load_pairs(
 # ---------------------------------------------------------------------------
 # Splits (fingerprinted)
 # ---------------------------------------------------------------------------
+def dense_group_ids(keys: Sequence) -> np.ndarray:
+    """Hashable per-row keys -> dense int ids in first-appearance order."""
+    mapping: dict = {}
+    out = np.empty(len(keys), dtype=np.int64)
+    for i, k in enumerate(keys):
+        gid = mapping.get(k)
+        if gid is None:
+            gid = len(mapping)
+            mapping[k] = gid
+        out[i] = gid
+    return out
+
+
 def group_ids_from_accessions(accessions: Sequence[str]) -> np.ndarray:
     """Per-row accession strings -> dense int group ids in first-appearance order.
 
@@ -92,14 +105,74 @@ def group_ids_from_accessions(accessions: Sequence[str]) -> np.ndarray:
     train/val/test boundary. The augmented SwissProt corpus has ~8.87 captions
     per protein; a row-level split would leak proteins across splits.
     """
-    mapping: dict = {}
-    out = np.empty(len(accessions), dtype=np.int64)
-    for i, a in enumerate(accessions):
-        gid = mapping.get(a)
-        if gid is None:
-            gid = len(mapping)
-            mapping[a] = gid
-        out[i] = gid
+    return dense_group_ids(accessions)
+
+
+def group_ids_from_texts(texts: Sequence[str]) -> np.ndarray:
+    """Per-row caption strings -> dense int group ids in first-appearance order.
+
+    Rows sharing an *identical* caption get the same id. With the augmented
+    corpus some proteins carry byte-identical captions (generic descriptions,
+    duplicated entries); this id is used two ways: to mask same-caption columns
+    out of the contrastive denominator (false negatives), and — folded into the
+    split grouping — to keep identical captions on one side of the split.
+    """
+    return dense_group_ids(texts)
+
+
+def merged_split_group_ids(*id_arrays: Sequence[int]) -> np.ndarray:
+    """Connected-component ids over rows linked by ANY shared key.
+
+    Each argument is a per-row id array (e.g. accession ids AND caption ids). Two
+    rows are unioned when they share a value in the same array; the returned
+    per-row component id therefore keeps every protein *and* every identical
+    caption wholly on one side of a group-aware split. Both constraints hold at
+    once only under this transitive closure — splitting by accession alone would
+    still leak an identical caption shared across two proteins.
+
+    Note this closure is intentionally NOT the relation used for contrastive
+    false-negative masking: there, only a *direct* shared protein or shared
+    caption makes a column a false negative (see `mask_false_negatives`), not a
+    transitive chain through some third row.
+    """
+    arrays = [np.asarray(a) for a in id_arrays]
+    n = int(arrays[0].shape[0])
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]        # path halving
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Within each key array, chain every row to the key's first occurrence — that
+    # stars all rows sharing a key into one component.
+    for arr in arrays:
+        assert arr.shape[0] == n, "all id arrays must have one entry per row"
+        first: dict = {}
+        for i in range(n):
+            k = int(arr[i])
+            j = first.get(k)
+            if j is None:
+                first[k] = i
+            else:
+                union(j, i)
+
+    # Dense relabel by first-appearance of each component root.
+    out = np.empty(n, dtype=np.int64)
+    relabel: dict = {}
+    for i in range(n):
+        r = find(i)
+        c = relabel.get(r)
+        if c is None:
+            c = len(relabel)
+            relabel[r] = c
+        out[i] = c
     return out
 
 
@@ -400,6 +473,7 @@ def cache_fingerprint(
     text_encoder_path: str, protein_encoder_path: str,
     max_text_tokens: int, max_protein_tokens: int,
     mask_text_specials: bool, mask_protein_specials: bool,
+    text_field_labels: tuple = (), mask_text_field_labels: bool = True,
 ) -> dict:
     return {
         # Bumped when the on-disk layout changes; v2 stores protein rows
@@ -412,6 +486,11 @@ def cache_fingerprint(
         "max_protein_tokens": int(max_protein_tokens),
         "mask_text_specials": bool(mask_text_specials),
         "mask_protein_specials": bool(mask_protein_specials),
+        # Registering field labels changes the *tokenization* itself, so any cache
+        # built without them is stale regardless of the mask flag — both keys are
+        # fingerprinted so a label-set change (or mask toggle) forces a rebuild.
+        "text_field_labels": sorted(str(l) for l in text_field_labels),
+        "mask_text_field_labels": bool(mask_text_field_labels),
     }
 
 

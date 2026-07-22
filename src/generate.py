@@ -107,7 +107,7 @@ def main() -> None:
     # Direction-specific handles: source side (input) + target side (re-encode
     # candidates). The panel is the SAME modality as the source.
     if args.direction == "text2protein":
-        src_model, src_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+        src_model, src_tok = load_text_encoder(cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         src_proj, src_expand = retrieval.text_proj, retrieval.text_expand
         src_max = cfg.data.max_text_tokens
         def enc_src(strs):
@@ -217,12 +217,12 @@ def _select(args, cfg, device, retrieval, cands, z_src, m_src, tgt_proj):
         enc_tgt = lambda strs: encode_protein_batch(
             tgt_model, tgt_tok, strs, device, cfg.data.max_protein_tokens)
         panel_proj = retrieval.text_proj
-        panel_model, panel_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+        panel_model, panel_tok = load_text_encoder(cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         enc_panel = lambda strs: encode_text_batch(
             panel_model, panel_tok, strs, device, cfg.data.max_text_tokens)
         empty = "M"
     else:
-        tgt_model, tgt_tok = load_text_encoder(cfg.model.text_encoder_path, device)
+        tgt_model, tgt_tok = load_text_encoder(cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         enc_tgt = lambda strs: encode_text_batch(
             tgt_model, tgt_tok, strs, device, cfg.data.max_text_tokens)
         panel_proj = retrieval.protein_proj

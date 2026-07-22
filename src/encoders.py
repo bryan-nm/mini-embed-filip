@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sys
 import types
-from typing import List
+from typing import List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -63,32 +63,116 @@ def install_xformers_stub_if_missing() -> bool:
 # ---------------------------------------------------------------------------
 # Text encoder: BioLinkBERT-base
 # ---------------------------------------------------------------------------
-def load_text_encoder(path: str, device: torch.device):
+def _register_caption_field_labels(model, tokenizer,
+                                   field_labels: Sequence[str]) -> List[str]:
+    """Register caption field labels (e.g. "FUNCTION:") as single special tokens.
+
+    The SwissProt-full captions are templated with UPPERCASE "LABEL:" prefixes that
+    carry no biological/textual content. Making each one a single `additional_special
+    _token` (a) lets the tokenizer emit it as one id instead of 2-3 word-pieces, and
+    (b) lets cross-modal masking drop the whole label by id (see `_text_valid_mask`).
+
+    Portable across text encoders: any HF tokenizer/model exposes
+    `add_special_tokens` + `resize_token_embeddings`, so a new embedder only needs
+    its own `field_labels` passed in. The exact registered ids are stashed on the
+    tokenizer (`_caption_field_label_ids`) so masking never has to re-derive them.
+
+    The encoder is frozen, so the new embedding rows would never train; we mean-init
+    each from the sub-word embeddings the label used to tokenize into, keeping
+    neighbor contextualization (and any unmasked, embedding-mode pooling) sensible
+    rather than random. Idempotent: labels already mapping to a single id are skipped.
+    Returns the list of newly added labels.
+    """
+    if not field_labels:
+        tokenizer._caption_field_label_ids = []
+        return []
+
+    unk = tokenizer.unk_token_id
+    fresh: List[str] = []
+    pieces: dict = {}
+    for lab in field_labels:
+        cur = tokenizer.convert_tokens_to_ids(lab)
+        if cur is not None and cur != unk:
+            continue                                   # already a single token
+        sub = tokenizer(lab, add_special_tokens=False)["input_ids"]
+        if not sub:
+            continue                                   # nothing to represent
+        fresh.append(lab)
+        pieces[lab] = sub                              # captured BEFORE we add it
+
+    if fresh:
+        tokenizer.add_special_tokens({"additional_special_tokens": fresh})
+        model.resize_token_embeddings(len(tokenizer))
+        emb = model.get_input_embeddings().weight.data
+        for lab in fresh:
+            new_id = tokenizer.convert_tokens_to_ids(lab)
+            emb[new_id] = emb[pieces[lab]].mean(dim=0)
+
+    # Full label -> id map (fresh + any that were already single tokens), so
+    # `_field_label_ids` can mask them without re-tokenizing.
+    tokenizer._caption_field_label_ids = [
+        int(tokenizer.convert_tokens_to_ids(lab)) for lab in field_labels
+    ]
+    return fresh
+
+
+def load_text_encoder(path: str, device: torch.device,
+                      field_labels: Optional[Sequence[str]] = None):
+    """Load the frozen text encoder + tokenizer.
+
+    `field_labels` (caption-schema "LABEL:" prefixes) are registered as single
+    special tokens if given; see `_register_caption_field_labels`. Registration is
+    a tokenizer property and happens regardless of masking — masking is controlled
+    separately at encode time (`encode_text_batch(mask_field_labels=...)`).
+    """
     from transformers import AutoModel, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(path)
     model = AutoModel.from_pretrained(path).eval().to(device)
+    _register_caption_field_labels(model, tok, field_labels or [])
     for p in model.parameters():
         p.requires_grad_(False)
     return model, tok
 
 
+def _field_label_ids(tokenizer) -> set:
+    """IDs of the registered caption field-label special tokens (portable)."""
+    ids = getattr(tokenizer, "_caption_field_label_ids", None)
+    if ids:
+        return {int(i) for i in ids if i is not None and int(i) >= 0}
+    # Fallback for a tokenizer registered outside `_register_caption_field_labels`:
+    # treat any additional special tokens as field labels.
+    try:
+        extra = tokenizer.additional_special_tokens_ids
+    except Exception:
+        extra = None
+    return {int(i) for i in extra if i is not None and int(i) >= 0} if extra else set()
+
+
 def _text_valid_mask(input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                     tokenizer, mask_specials: bool) -> torch.Tensor:
-    """Bool mask: True at positions we want to keep for FILIP / uniformity."""
+                     tokenizer, mask_specials: bool,
+                     mask_field_labels: bool) -> torch.Tensor:
+    """Bool mask: True at positions we want to keep for FILIP / uniformity.
+
+    `mask_specials` drops the structural specials ([CLS]/[SEP]/[PAD]/<bos>/<eos>);
+    `mask_field_labels` independently drops the caption field-label special tokens.
+    The two are separate so an embedding run can, say, keep field labels while still
+    dropping padding.
+    """
     valid = attention_mask.bool()
-    if not mask_specials:
-        return valid
-    special_ids = set()
-    for tok_id in (tokenizer.cls_token_id, tokenizer.sep_token_id,
-                   tokenizer.pad_token_id, tokenizer.bos_token_id,
-                   tokenizer.eos_token_id):
-        if tok_id is not None:
-            special_ids.add(int(tok_id))
-    if not special_ids:
+    drop_ids = set()
+    if mask_specials:
+        for tok_id in (tokenizer.cls_token_id, tokenizer.sep_token_id,
+                       tokenizer.pad_token_id, tokenizer.bos_token_id,
+                       tokenizer.eos_token_id):
+            if tok_id is not None:
+                drop_ids.add(int(tok_id))
+    if mask_field_labels:
+        drop_ids.update(_field_label_ids(tokenizer))
+    if not drop_ids:
         return valid
     spec = torch.zeros_like(input_ids, dtype=torch.bool)
-    for sid in special_ids:
+    for sid in drop_ids:
         spec = spec | (input_ids == sid)
     return valid & ~spec
 
@@ -106,13 +190,17 @@ def text_encoder_max_len(model) -> int:
 @torch.no_grad()
 def encode_text_batch(
     model, tokenizer, texts: List[str], device: torch.device,
-    max_len: int, mask_specials: bool = True,
+    max_len: int, mask_specials: bool = True, mask_field_labels: bool = True,
 ):
     """Returns (h_t, valid_mask) where h_t is [B, L, 768] and mask is [B, L].
 
     `max_len` is silently capped at the model's max_position_embeddings —
     BioLinkBERT-base cannot index past 512 tokens regardless of what the
     config requests. Swap to a long-context text encoder if you need more.
+
+    `mask_field_labels` drops caption field-label special tokens (see
+    `load_text_encoder`) from the returned mask — keep it on for cross-modal
+    comparison; turn it off if you want those positions in an embedding pool.
     """
     effective_max = min(max_len, text_encoder_max_len(model))
     enc = tokenizer(
@@ -122,7 +210,7 @@ def encode_text_batch(
     out = model(**enc)
     h = out.last_hidden_state                            # [B, L, 768]
     valid = _text_valid_mask(enc["input_ids"], enc["attention_mask"],
-                             tokenizer, mask_specials)
+                             tokenizer, mask_specials, mask_field_labels)
     return h, valid
 
 

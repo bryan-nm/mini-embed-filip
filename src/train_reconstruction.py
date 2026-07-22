@@ -97,7 +97,7 @@ def main() -> None:
     barrier()
     splits_path = Path(args.cache_dir) / "splits.json"
 
-    train_loader, val_loader, train_sampler, row_group_ids = build_loaders(
+    train_loader, val_loader, train_sampler, row_group_ids, row_text_ids = build_loaders(
         cfg, splits_path, env, pairs=None, val_subset=args.val_subset)
 
     model = load_retrieval_model(args.ckpt, cfg, device)
@@ -190,9 +190,9 @@ def main() -> None:
             metrics = evaluate_split(
                 model, val_loader, device, None,
                 cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
-                row_group_ids=row_group_ids,
+                row_group_ids=row_group_ids, row_text_ids=row_text_ids,
             )
-            rk = {k: round(metrics[k], 4) for k in ("R@1", "R@5", "R@10") if k in metrics}
+            rk = {k: round(metrics[k], 4) for k in ("R@1", "R@5", "R@10", "mAP") if k in metrics}
             print(f"[val] epoch={epoch} recon_p={val_p:.4f} recon_t={val_t:.4f} "
                   f"R@K(unchanged)={rk}")
             log.append({"epoch": epoch, "val_recon_p": val_p, "val_recon_t": val_t,

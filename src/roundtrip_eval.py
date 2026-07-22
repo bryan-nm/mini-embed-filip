@@ -124,7 +124,8 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
     # Rank-0-first model load (trust_remote_code module-cache race for ProGen2).
     def _load_models():
         retr = load_retrieval(args.retrieval_ckpt, device)
-        tmodel, ttok = load_text_encoder(cfg.model.text_encoder_path, device)
+        tmodel, ttok = load_text_encoder(
+            cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         pmodel, ptok = load_protein_encoder(cfg.model.protein_encoder_path, device)
         lora_cfg = LoRACfg(
             rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
@@ -163,7 +164,8 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
     # target = generated modality).
     def enc_text(strs):
         return encode_text_batch(text_model, text_tok, strs, device,
-                                 cfg.data.max_text_tokens, mask_specials=True)
+                                 cfg.data.max_text_tokens, mask_specials=True,
+                                 mask_field_labels=True)
 
     def enc_prot(strs):
         return encode_protein_batch(prot_model, prot_tok, strs, device,

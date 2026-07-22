@@ -100,19 +100,31 @@ def mask_false_negatives(
     target: torch.Tensor,           # [R] index of each row's positive column
     groups_row: Optional[torch.Tensor] = None,   # [R] accession id per row
     groups_col: Optional[torch.Tensor] = None,   # [C] accession id per column
+    text_row: Optional[torch.Tensor] = None,     # [R] caption id per row
+    text_col: Optional[torch.Tensor] = None,     # [C] caption id per column
 ) -> torch.Tensor:
-    """Mask same-protein non-target columns out of the InfoNCE denominator.
+    """Mask same-protein or same-caption non-target columns out of the denominator.
 
     The augmented corpus has ~8.87 captions per protein, so a contrastive batch
-    can contain several captions of the same protein. Without masking, those
-    siblings act as false negatives — the loss would push a protein away from a
-    valid caption. We set every column sharing a row's accession (except that
-    row's designated positive) to a large negative, removing it from softmax.
-    No-op when group ids are not supplied.
+    can contain several captions of the same protein; the corpus also repeats
+    byte-identical captions across different proteins. Both make a column a false
+    negative — an equally valid positive the loss must not push away. We mask
+    every column that shares a row's accession OR its caption (except that row's
+    designated positive) by setting it to a large negative, removing it from
+    softmax. Each relation is independently optional; a column matching either is
+    masked. No-op when neither pair of group ids is supplied.
+
+    The two relations are checked *directly* (not transitively): a column is a
+    false negative only if it literally shares this row's protein or caption.
     """
-    if groups_row is None or groups_col is None:
+    same = None
+    if groups_row is not None and groups_col is not None:
+        same = groups_row[:, None] == groups_col[None, :]      # [R, C]
+    if text_row is not None and text_col is not None:
+        same_text = text_row[:, None] == text_col[None, :]     # [R, C]
+        same = same_text if same is None else (same | same_text)
+    if same is None:
         return logits
-    same = groups_row[:, None] == groups_col[None, :]           # [R, C]
     is_target = torch.zeros_like(same)
     is_target[torch.arange(logits.size(0), device=logits.device), target] = True
     return logits.masked_fill(same & ~is_target, _NEG_LOGIT)
@@ -246,6 +258,8 @@ def phase_r2_loss_grouped(
     chunk_rows: int = 0,
     groups: Optional[torch.Tensor] = None,       # [B] accession id per local anchor
     groups_all: Optional[torch.Tensor] = None,   # [G] accession id per gathered column
+    text_groups: Optional[torch.Tensor] = None,      # [B] caption id per local anchor
+    text_groups_all: Optional[torch.Tensor] = None,  # [G] caption id per gathered column
 ) -> dict:
     """Distributed Phase-R2 InfoNCE over a bounded subgroup of negatives.
 
@@ -255,9 +269,11 @@ def phase_r2_loss_grouped(
     local slice of `z_*_all` carries gradient (see `dist.grouped_all_gather`),
     so this is the standard gather-with-grad contrastive loss — no double count.
 
-    When `groups`/`groups_all` are supplied, columns sharing an anchor's protein
-    (other than its own positive) are masked out of the denominator, so the
-    corpus's multiple captions per protein don't act as false negatives.
+    When `groups`/`groups_all` (accession) and/or `text_groups`/`text_groups_all`
+    (caption identity) are supplied, columns sharing an anchor's protein or its
+    caption (other than its own positive) are masked out of the denominator, so
+    neither the corpus's multiple captions per protein nor its repeated identical
+    captions act as false negatives.
     """
     z_p, z_t = out["z_p"], out["z_t"]
     h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]
@@ -272,9 +288,11 @@ def phase_r2_loss_grouped(
     mat_t2p = builder(z_p_all, z_t, mask_p_all, mask_t).t()        # [B, G]
 
     target = torch.arange(B, device=z_p.device) + local_offset
-    # Both directions share the same row/column accession layout.
-    logits_pt = mask_false_negatives(scale * mat_p2t, target, groups, groups_all)
-    logits_tp = mask_false_negatives(scale * mat_t2p, target, groups, groups_all)
+    # Both directions share the same row/column accession + caption layout.
+    logits_pt = mask_false_negatives(scale * mat_p2t, target, groups, groups_all,
+                                     text_groups, text_groups_all)
+    logits_tp = mask_false_negatives(scale * mat_t2p, target, groups, groups_all,
+                                     text_groups, text_groups_all)
     loss_pt = F.cross_entropy(logits_pt, target)
     loss_tp = F.cross_entropy(logits_tp, target)
     l_nce = 0.5 * (loss_pt + loss_tp)
@@ -334,12 +352,14 @@ def phase_r2_loss(
     uniformity_t: float = 2.0,
     chunk_rows: int = 0,
     groups: Optional[torch.Tensor] = None,       # [B] accession id per pair
+    text_groups: Optional[torch.Tensor] = None,  # [B] caption id per pair
 ) -> dict:
     """Phase R2: FILIP-based symmetric InfoNCE + small align aux + recon
     (+ optional token-uniformity regularizer).
 
-    `groups` (per-pair accession ids) masks same-protein off-diagonal entries as
-    false negatives; no-op when omitted.
+    `groups` (per-pair accession ids) masks same-protein off-diagonal entries and
+    `text_groups` (per-pair caption ids) masks same-caption entries as false
+    negatives; each is a no-op when omitted.
     """
     z_p, z_t = out["z_p"], out["z_t"]
     h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]
@@ -351,8 +371,10 @@ def phase_r2_loss(
 
     scale = logit_scale.exp()
     target = torch.arange(filip_mat.size(0), device=filip_mat.device)
-    logits_pt = mask_false_negatives(scale * filip_mat, target, groups, groups)
-    logits_tp = mask_false_negatives((scale * filip_mat).t(), target, groups, groups)
+    logits_pt = mask_false_negatives(scale * filip_mat, target, groups, groups,
+                                     text_groups, text_groups)
+    logits_tp = mask_false_negatives((scale * filip_mat).t(), target, groups, groups,
+                                     text_groups, text_groups)
     loss_pt = F.cross_entropy(logits_pt, target)
     loss_tp = F.cross_entropy(logits_tp, target)
     l_nce = 0.5 * (loss_pt + loss_tp)
