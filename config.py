@@ -59,7 +59,8 @@ class DataCfg:
     # embedder just gets these labels registered against its own tokenizer.
     caption_field_labels: tuple = (
         "PROTEIN NAME:", "LINEAGE:", "GENE ONTOLOGY:", "SIMILARITY:", "FUNCTION:",
-        "ENZYME CLASS:", "CATALYTIC ACTIVITY:", "PATHWAY:", "DOMAIN:", "PTM:",
+        "ENZYME CLASS:", "CATALYTIC ACTIVITY:", "PATHWAY:", "DOMAIN:", "PTM:", 
+        "SUBCELLULAR LOCATION:",
     )
 
 
