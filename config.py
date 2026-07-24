@@ -23,11 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parent
 #   export FILIP_DATA_CSV=/flare/.../SwissProt_full/fully_annotated_...csv
 # FILIP_MODELS_DIR swaps the base dir for all four models at once (subdir names
 # are assumed identical); the per-model vars override an individual path.
-MODELS_DIR = os.environ.get("FILIP_MODELS_DIR", "/Users/bryan/Documents/models")
+MODELS_DIR = os.environ.get("FILIP_MODELS_DIR", "/flare/NLDesignProtein/bryan/FILIP-dev-space/models")
 
 DATA_CSV = os.environ.get(
     "FILIP_DATA_CSV",
-    "/Users/bryan/Documents/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv",
+    "/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv",
 )
 
 TEXT_ENCODER_PATH = os.environ.get("FILIP_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
