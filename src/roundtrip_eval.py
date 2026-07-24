@@ -145,9 +145,12 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         tmodel, ttok = load_text_encoder(
             cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         pmodel, ptok = load_protein_encoder(cfg.model.protein_encoder_path, device)
+        # LoRA targeting must match training (--no-lora ckpts have no LoRA modules).
         lora_cfg = LoRACfg(
             rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
             dropout=cfg.generation.lora_dropout,
+            target_self_attn=ck.get("lora_targets_self_attn", True),
+            target_ffn=ck.get("lora_targets_ffn", True),
         )
         mem_dim = cfg.model.embed_dim if aligned else hidden_mem_dim
         dec, dtok, adapters = load_decoder_with_cross_attn(

@@ -88,13 +88,33 @@ class CrossAttentionAdapter(nn.Module):
             self.k_proj = nn.Linear(mem_dim, dec_hidden, bias=False)
         else:
             # "aligned" (Strong): single-head cosine max-sim in the shared mem_dim
-            # (embed_dim) space. Queries are projected to mem_dim and scored
-            # directly against the aligned memory — no k_proj, the keys ARE the
-            # retrieval vectors — with a learned FILIP-style temperature. The
-            # attention weights are then the interpretable [T, L_mem] alignment
-            # array. Values stay learned (v_proj), so the decoder still pulls a
-            # usable 512-d signal while the *weights* remain the alignment.
-            self.q_align = nn.Linear(dec_hidden, mem_dim, bias=False)
+            # (embed_dim) space. The decoder hidden state is projected into the
+            # shared space and scored directly against the aligned memory — no
+            # k_proj, the keys ARE the retrieval vectors — with a learned FILIP
+            # temperature. The attention weights are then the interpretable
+            # [T, L_mem] alignment array. Values stay learned (v_proj), so the
+            # decoder still pulls a usable dec_hidden-d signal while the *weights*
+            # remain the alignment.
+            #
+            # q_align is a small MLP with the same body as the retrieval
+            # ProjectionHead (dec_hidden -> dec_hidden -> dec_hidden//2 -> mem_dim,
+            # Linear/GELU/LayerNorm, dropout after the first block), so both sides
+            # of the max-sim reach the shared space through the same *kind* of
+            # nonlinear map. The final L2-normalize lives in the forward. ln_q
+            # (above) is the decoder-side input norm, analogous to the projection
+            # head's mean-centering. The array's interpretability depends only on
+            # cosine-scoring against the real keys, not on this map's form.
+            mid = dec_hidden // 2
+            self.q_align = nn.Sequential(
+                nn.Linear(dec_hidden, dec_hidden),
+                nn.GELU(),
+                nn.LayerNorm(dec_hidden),
+                nn.Dropout(dropout),
+                nn.Linear(dec_hidden, mid),
+                nn.GELU(),
+                nn.LayerNorm(mid),
+                nn.Linear(mid, mem_dim),
+            )
             self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
             self.max_logit_scale = math.log(100.0)
 
@@ -143,12 +163,13 @@ class CrossAttentionAdapter(nn.Module):
     def _forward_aligned(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Single-head cosine max-sim cross-attention in the shared aligned space.
 
-        scores[t, m] = temp * <norm(q_align(h_t)), norm(mem_m)>. The attention
-        weights [B, T, L_mem] are the FILIP alignment between decoder positions and
-        source tokens; stored on self.last_attn for inspection.
+        scores[t, m] = temp * <norm(q_align(h_t)), norm(mem_m)>, where q_align is
+        the ProjectionHead-style MLP. The attention weights [B, T, L_mem] are the
+        FILIP alignment between decoder positions and source tokens; stored on
+        self.last_attn for inspection.
         """
         in_dtype = hidden_states.dtype
-        w_dtype = self.q_align.weight.dtype
+        w_dtype = self.q_align[0].weight.dtype        # first Linear of the MLP
         h = self.ln_q(hidden_states.to(w_dtype))
         memory = self.memory.to(w_dtype)                              # [B, L, mem_dim]
 

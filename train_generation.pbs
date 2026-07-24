@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_generation
-#PBS -l walltime=12:00:00
+#PBS -l walltime=16:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -25,7 +25,7 @@ export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
 # text2protein decoder: ProtGPT3-112M-dpo (Mixtral MoE). Stated explicitly rather
 # than left to the config default so the job fails loudly if it isn't staged.
 export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
-export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_annotated/swissprot_augmented.csv
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
 export MASTER_PORT=2950$([ "$DIRECTION" = protein2text ] && echo 3 || echo 2)
@@ -64,8 +64,9 @@ fi
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_generation --direction "${DIRECTION}" \
     --retrieval-ckpt "${RCKPT}" --device xpu \
-    --batch-size "${BS}" --epochs 20 --lr 5e-5 --max-target-tokens 512 \
-    --cross-attn-every "${CAE}" --unfreeze-top 0 --use-cvae --val-subset 100
+    --memory-space aligned --cross-attn-mode aligned \
+    --batch-size "${BS}" --epochs 20 --lr 1.5e-4 --max-target-tokens 512 \
+    --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100
 
 # push stop notifications to slack
 rc=$?

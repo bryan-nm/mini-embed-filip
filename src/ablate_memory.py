@@ -228,9 +228,13 @@ def main() -> None:
     # (all stored in it) so adapter counts, k/v input dims, and scoring space line
     # up; adapter_state loads strict=False against the frozen backbone.
     mem_dim = cfg.model.embed_dim if aligned_mem else hidden_mem_dim
+    # LoRA targeting must match training (--no-lora ckpts have no LoRA modules), so
+    # the rebuilt decoder has the same structure the adapter_state was saved from.
     lora_cfg = LoRACfg(
         rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
         dropout=cfg.generation.lora_dropout,
+        target_self_attn=ckpt.get("lora_targets_self_attn", True),
+        target_ffn=ckpt.get("lora_targets_ffn", True),
     )
     decoder, target_tok, adapters = load_decoder_with_cross_attn(
         args.direction, decoder_path, cae, mem_dim, lora_cfg, device,

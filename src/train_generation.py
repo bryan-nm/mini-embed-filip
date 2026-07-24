@@ -347,6 +347,11 @@ def main() -> None:
                          "('2', residues reversed) per example (ProtGPT3 only). Free augmentation "
                          "+ regularizes conditioning toward direction-invariant signal. Val stays "
                          "forward-only")
+    ap.add_argument("--no-lora", action="store_true",
+                    help="disable LoRA on the frozen decoder self-attn/FFN — train ONLY the "
+                         "cross-attention adapters. LoRA is caption-blind (unconditional domain "
+                         "adaptation); dropping it removes that shortcut so gains must come from "
+                         "conditioning. Use to A/B whether LoRA helps or suppresses conditioning")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -370,6 +375,11 @@ def main() -> None:
     cfg.generation.memory_map = args.memory_map
     cfg.generation.cross_attn_mode = args.cross_attn_mode
     cfg.generation.direction_augment = args.direction_augment
+    # --no-lora zeroes both LoRA targets; the LoRACfg below reads these, so the
+    # injectors then skip LoRA entirely (adapters-only training).
+    if args.no_lora:
+        cfg.generation.lora_targets_self_attn = False
+        cfg.generation.lora_targets_ffn = False
 
     # "aligned" cross-attn and the memory map both live in the 64-d shared space,
     # so they require aligned memory (the map is a 64->64 residual; aligned scoring
@@ -454,7 +464,9 @@ def main() -> None:
               f"({n_unfrozen:,} params now trainable)")
     if env.is_main:
         n_train = count_trainable(decoder)
-        print(f"[gen] decoder trainable params (cross-attn + LoRA): {n_train:,}")
+        lora_on = cfg.generation.lora_targets_self_attn or cfg.generation.lora_targets_ffn
+        print(f"[gen] decoder trainable params (cross-attn"
+              f"{' + LoRA' if lora_on else ', LoRA OFF'}): {n_train:,}")
         print(f"[gen] num cross-attention adapters: {len(adapters)}")
 
     # Gradient checkpointing: recompute layer activations in backward instead of
@@ -634,22 +646,28 @@ def main() -> None:
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume, ckpt_dir)
         ckpt = torch.load(resume_path, map_location=device)
-        # memory_space/memory_map/cross_attn_mode default to the pre-flag values
-        # ("expanded"/False/"head") for older checkpoints.
+        # memory_space/memory_map/cross_attn_mode/lora_targets_* default to the
+        # pre-flag values ("expanded"/False/"head"/True) for older checkpoints.
         if ckpt.get("cross_attn_every") != args.cross_attn_every or \
            ckpt.get("unfreeze_top") != args.unfreeze_top or \
            ckpt.get("memory_space", "expanded") != args.memory_space or \
            ckpt.get("memory_map", False) != args.memory_map or \
-           ckpt.get("cross_attn_mode", "head") != args.cross_attn_mode:
+           ckpt.get("cross_attn_mode", "head") != args.cross_attn_mode or \
+           ckpt.get("lora_targets_self_attn", True) != cfg.generation.lora_targets_self_attn or \
+           ckpt.get("lora_targets_ffn", True) != cfg.generation.lora_targets_ffn:
             raise RuntimeError(
                 f"--resume checkpoint architecture mismatch: "
                 f"cross_attn_every={ckpt.get('cross_attn_every')} unfreeze_top={ckpt.get('unfreeze_top')} "
                 f"memory_space={ckpt.get('memory_space', 'expanded')} "
                 f"memory_map={ckpt.get('memory_map', False)} "
                 f"cross_attn_mode={ckpt.get('cross_attn_mode', 'head')} "
+                f"lora_self_attn={ckpt.get('lora_targets_self_attn', True)} "
+                f"lora_ffn={ckpt.get('lora_targets_ffn', True)} "
                 f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top} "
                 f"memory_space={args.memory_space} memory_map={args.memory_map} "
-                f"cross_attn_mode={args.cross_attn_mode}")
+                f"cross_attn_mode={args.cross_attn_mode} "
+                f"lora_self_attn={cfg.generation.lora_targets_self_attn} "
+                f"lora_ffn={cfg.generation.lora_targets_ffn}")
         # `missing` keys are expected (the frozen backbone isn't in adapter_state);
         # only unexpected keys signal a real mismatch.
         _, unexpected = core.load_state_dict(ckpt["adapter_state"], strict=False)
@@ -815,7 +833,9 @@ def main() -> None:
                        "memory_space": args.memory_space,
                        "memory_map": args.memory_map,
                        "cross_attn_mode": args.cross_attn_mode,
-                       "direction_augment": args.direction_augment}
+                       "direction_augment": args.direction_augment,
+                       "lora_targets_self_attn": cfg.generation.lora_targets_self_attn,
+                       "lora_targets_ffn": cfg.generation.lora_targets_ffn}
             # CVAE heads (Feature 1); absent => downstream loads run without a latent.
             if cvae is not None:
                 payload["cvae_state"] = cvae.state_dict()

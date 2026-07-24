@@ -151,10 +151,13 @@ def main() -> None:
 
     # Decoder + adapters + (optional) CVAE. Build the cross-attn memory to match
     # how the ckpt was trained: "expanded" lifts z back to encoder-hidden space;
-    # "aligned" uses z directly, optionally through the frozen memory map.
+    # "aligned" uses z directly, optionally through the frozen memory map. LoRA
+    # targeting must also match training (--no-lora ckpts have no LoRA modules).
     lora_cfg = LoRACfg(
         rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
         dropout=cfg.generation.lora_dropout,
+        target_self_attn=ckpt.get("lora_targets_self_attn", True),
+        target_ffn=ckpt.get("lora_targets_ffn", True),
     )
     mem_dim = cfg.model.embed_dim if aligned_mem else hidden_mem_dim
     with torch.no_grad():

@@ -223,6 +223,16 @@ class GenerationCfg:
     #              [residue x source-token] array. Requires memory_space="aligned".
     cross_attn_mode: str = "head"             # or "aligned"
 
+    # Stochastic N-to-C / C-to-N direction augmentation (ProtGPT3 only). Each
+    # training target is randomly factorized forward ("1", N-to-C) or reverse
+    # ("2", C-to-N, residues reversed). Same protein + same conditioning memory,
+    # opposite autoregressive order — an ~free augmentation that also regularizes
+    # the conditioning toward direction-invariant (semantic) signal, since local
+    # positional shortcuts don't transfer across order. Validation + inference stay
+    # forward-only for comparability. Distinct from `direction` (text2protein vs
+    # protein2text); this is the within-text2protein sequence order.
+    direction_augment: bool = False
+
     # Cross-attention adapter insertion
     cross_attn_every: int = 2                 # insert at every other decoder block
 
