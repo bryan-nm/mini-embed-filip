@@ -524,48 +524,71 @@ def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
 
 
 # ProtGPT3 was pretrained with a generation-direction marker as the first token
-# after BOS: "1" = N-to-C (the normal reading direction), "2" = C-to-N. It is an
-# ordinary vocab token, not a special token, so it must be added explicitly to
-# every training target and to the generation prompt — without it the decoder is
-# off-distribution from token 0 — and stripped back off when decoding.
-PROTGPT3_FORWARD_TOKEN = "1"
-PROTGPT3_DIRECTION_TOKENS = ("1", "2")
+# after BOS: "1" = N-to-C (the normal reading direction), "2" = C-to-N (residues
+# emitted in reverse order). It is an ordinary vocab token, not a special token,
+# so it must be added explicitly to every training target and to the generation
+# prompt — without it the decoder is off-distribution from token 0 — and stripped
+# back off when decoding (with the residues re-reversed for a "2" sequence).
+PROTGPT3_FORWARD_TOKEN = "1"        # N-to-C
+PROTGPT3_REVERSE_TOKEN = "2"        # C-to-N
+PROTGPT3_DIRECTION_TOKENS = (PROTGPT3_FORWARD_TOKEN, PROTGPT3_REVERSE_TOKEN)
 
 
-def target_prefix_ids(model: nn.Module, tokenizer) -> List[int]:
-    """Control tokens this decoder expects between BOS and the target body.
-
-    Empty for every decoder except ProtGPT3 (see PROTGPT3_FORWARD_TOKEN).
-    """
-    if _decoder_arch(model) != "mixtral":
-        return []
-    tid = tokenizer.convert_tokens_to_ids(PROTGPT3_FORWARD_TOKEN)
+def _protgpt3_marker_id(model: nn.Module, tokenizer, token: str) -> int:
+    tid = tokenizer.convert_tokens_to_ids(token)
     # convert_tokens_to_ids falls back to the UNK id for an unknown token, and
     # this tokenizer's UNK id sits outside the model's embedding table — so bail
     # out rather than feed the decoder an out-of-range id.
     vocab_size = _unwrap(model).config.vocab_size
     if tid is None or not (0 <= tid < vocab_size):
         raise ValueError(
-            f"Mixtral decoder's tokenizer has no usable {PROTGPT3_FORWARD_TOKEN!r} "
-            f"direction token (got id {tid!r}, vocab_size={vocab_size})")
-    return [tid]
+            f"Mixtral decoder's tokenizer has no usable {token!r} direction token "
+            f"(got id {tid!r}, vocab_size={vocab_size})")
+    return tid
+
+
+def target_prefix_ids(model: nn.Module, tokenizer) -> List[int]:
+    """Forward (N-to-C) control tokens between BOS and the target body.
+
+    Empty for every decoder except ProtGPT3 (see PROTGPT3_FORWARD_TOKEN).
+    """
+    if _decoder_arch(model) != "mixtral":
+        return []
+    return [_protgpt3_marker_id(model, tokenizer, PROTGPT3_FORWARD_TOKEN)]
+
+
+def reverse_prefix_ids(model: nn.Module, tokenizer) -> List[int]:
+    """Reverse (C-to-N) control tokens, for direction augmentation.
+
+    ProtGPT3 only — raises for a decoder without a reverse marker, so a
+    --direction-augment run fails loudly rather than teaching a directionless
+    decoder to model reversed sequences as if forward.
+    """
+    if _decoder_arch(model) != "mixtral":
+        raise ValueError(
+            "direction augmentation requires a decoder with a C-to-N reverse marker "
+            "(ProtGPT3/Mixtral); this decoder has none")
+    return [_protgpt3_marker_id(model, tokenizer, PROTGPT3_REVERSE_TOKEN)]
 
 
 def decode_target(model: nn.Module, tokenizer, ids) -> str:
-    """Decode one row of generated ids into a target string.
+    """Decode one row of generated ids into an N-to-C target string.
 
     ProtGPT3's char-level WordLevel tokenizer decodes to space-separated residues
     ("M K T"), and its direction marker survives `skip_special_tokens` because it
-    is a normal vocab token. Undo both so the caller gets a bare sequence it can
-    feed straight back into the protein encoder.
+    is a normal vocab token. Undo both. Critically, if the sequence was generated
+    C-to-N (leading "2"), the emitted residues are in reverse order, so re-reverse
+    them — otherwise a downstream re-encode (roundtrip / best-of-N) sees a
+    backwards protein. The caller always gets a bare N-to-C sequence.
     """
     text = tokenizer.decode(ids, skip_special_tokens=True)
     if _decoder_arch(model) != "mixtral":
         return text.strip()
     seq = "".join(text.split())
+    reverse = seq[:1] == PROTGPT3_REVERSE_TOKEN
     while seq[:1] in PROTGPT3_DIRECTION_TOKENS:
         seq = seq[1:]
-    return seq
+    return seq[::-1] if reverse else seq
 
 
 def load_decoder_with_cross_attn(

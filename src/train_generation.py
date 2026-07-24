@@ -56,6 +56,7 @@ from src.decoder_adapters import (
     clear_cross_memory,
     count_trainable,
     load_decoder_with_cross_attn,
+    reverse_prefix_ids,
     set_cross_memory,
     target_prefix_ids,
     unfreeze_top_blocks,
@@ -138,7 +139,8 @@ class GenerationDataset(Dataset):
         return item
 
 
-def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=()):
+def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
+                 rev_prefix_ids=None, direction_augment: bool = False):
     # ProGen2's tokenizer ships without a pad token; fall back to EOS.
     if target_tokenizer.pad_token is None:
         target_tokenizer.pad_token = target_tokenizer.eos_token
@@ -146,6 +148,8 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=()):
     bos_id = target_tokenizer.bos_token_id
     eos_id = target_tokenizer.eos_token_id
     prefix_ids = list(prefix_ids)
+    rev_prefix_ids = list(rev_prefix_ids) if rev_prefix_ids is not None else []
+    augment = direction_augment and len(rev_prefix_ids) > 0
 
     # We add BOS/EOS explicitly rather than relying on the tokenizer's
     # `add_special_tokens`: the protein decoders' char tokenizers never add them
@@ -155,7 +159,13 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=()):
     # BOS). Doing it here is uniform across decoders. `prefix_ids` carries any
     # decoder control tokens that sit between BOS and the body — for ProtGPT3,
     # the "1" (N-to-C) direction marker it was pretrained with.
-    body_cap = (max_target_tokens - len(prefix_ids)
+    #
+    # Direction augmentation (ProtGPT3): when `augment`, each target is factorized
+    # forward ("1" + residues) or reverse ("2" + reversed residues) with equal
+    # probability. Same protein, same conditioning memory, opposite decode order;
+    # decode_target re-reverses a "2" sequence back to N-to-C at inference.
+    max_prefix = max(len(prefix_ids), len(rev_prefix_ids))
+    body_cap = (max_target_tokens - max_prefix
                 - (1 if bos_id is not None else 0)
                 - (1 if eos_id is not None else 0))
 
@@ -173,11 +183,17 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=()):
         # Tokenize bodies without specials, then wrap with [BOS] [prefix] ... [EOS].
         seqs = []
         for b in batch:
+            target, pfx = b["target"], prefix_ids
+            # Coin-flip C-to-N: reverse the residue string (char == token for the
+            # char-level vocab) and use the reverse marker. CPU RNG, seeded, and
+            # separate from the device dropout RNG.
+            if augment and bool(torch.rand(()) < 0.5):
+                target, pfx = target[::-1], rev_prefix_ids
             body = target_tokenizer(
-                b["target"], add_special_tokens=False, truncation=True,
+                target, add_special_tokens=False, truncation=True,
                 max_length=body_cap,
             )["input_ids"]
-            ids = ([bos_id] if bos_id is not None else []) + prefix_ids + body + \
+            ids = ([bos_id] if bos_id is not None else []) + pfx + body + \
                   ([eos_id] if eos_id is not None else [])
             seqs.append(ids)
 
@@ -325,6 +341,12 @@ def main() -> None:
                     help="cross-attn scoring space (Strong): 'head' learned multi-head "
                          "(original); 'aligned' single-head cosine max-sim in the 64-d shared "
                          "space (attention weights = FILIP array). Requires --memory-space aligned")
+    ap.add_argument("--direction-augment", action="store_true",
+                    default=cfg.generation.direction_augment,
+                    help="stochastically factorize each protein target N-to-C ('1') or C-to-N "
+                         "('2', residues reversed) per example (ProtGPT3 only). Free augmentation "
+                         "+ regularizes conditioning toward direction-invariant signal. Val stays "
+                         "forward-only")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -347,6 +369,7 @@ def main() -> None:
     cfg.generation.memory_space = args.memory_space
     cfg.generation.memory_map = args.memory_map
     cfg.generation.cross_attn_mode = args.cross_attn_mode
+    cfg.generation.direction_augment = args.direction_augment
 
     # "aligned" cross-attn and the memory map both live in the 64-d shared space,
     # so they require aligned memory (the map is a 64->64 residual; aligned scoring
@@ -535,27 +558,35 @@ def main() -> None:
 
     # Decoder control tokens between BOS and the target body (ProtGPT3's "1"
     # direction marker; empty for the other decoders). Resolved from the raw
-    # decoder, before the DDP wrap below.
+    # decoder, before the DDP wrap below. --direction-augment additionally samples
+    # the "2" (C-to-N) marker per training example; reverse_prefix_ids raises for a
+    # decoder without a reverse marker, so a bad --direction-augment fails loudly.
     prefix_ids = target_prefix_ids(decoder, target_tok)
+    rev_prefix_ids = reverse_prefix_ids(decoder, target_tok) if args.direction_augment else None
     if env.is_main and prefix_ids:
-        print(f"[gen] decoder target prefix ids: {prefix_ids}")
+        print(f"[gen] decoder target prefix ids: {prefix_ids}"
+              + (f" | direction-augment reverse ids: {rev_prefix_ids}" if rev_prefix_ids else ""))
 
-    collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids)
+    # Train collate augments direction (if enabled); val stays forward-only so its
+    # CE is comparable across runs and reflects the deployment (N-to-C) path.
+    train_collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids,
+                                 rev_prefix_ids, direction_augment=args.direction_augment)
+    val_collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids)
     if env.distributed:
         train_sampler = DistributedSampler(
             train_ds, num_replicas=env.world_size, rank=env.rank,
             shuffle=True, seed=args.seed, drop_last=True,
         )
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  sampler=train_sampler, collate_fn=collate,
+                                  sampler=train_sampler, collate_fn=train_collate,
                                   drop_last=True, num_workers=cfg.generation.num_workers)
     else:
         train_sampler = None
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  shuffle=True, collate_fn=collate, drop_last=True,
+                                  shuffle=True, collate_fn=train_collate, drop_last=True,
                                   num_workers=cfg.generation.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size,
-                            shuffle=False, collate_fn=collate,
+                            shuffle=False, collate_fn=val_collate,
                             num_workers=cfg.generation.num_workers)
     if len(train_loader) == 0:
         raise RuntimeError(
@@ -783,7 +814,8 @@ def main() -> None:
                        "unfreeze_top": args.unfreeze_top,
                        "memory_space": args.memory_space,
                        "memory_map": args.memory_map,
-                       "cross_attn_mode": args.cross_attn_mode}
+                       "cross_attn_mode": args.cross_attn_mode,
+                       "direction_augment": args.direction_augment}
             # CVAE heads (Feature 1); absent => downstream loads run without a latent.
             if cvae is not None:
                 payload["cvae_state"] = cvae.state_dict()
