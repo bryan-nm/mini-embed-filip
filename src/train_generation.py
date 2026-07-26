@@ -140,8 +140,46 @@ class GenerationDataset(Dataset):
         return item
 
 
+def _corrupt_body_spans(row_ids: torch.Tensor, start: int, length: int,
+                        p: float, mean_span: int, aa_ids: torch.Tensor) -> None:
+    """In-place: overwrite ~`p` of the `length` body tokens at [start, start+length)
+    of the 1-D `row_ids`, in contiguous spans, with random amino-acid tokens.
+
+    Spans have geometric length (mean `mean_span`, capped at 10 and the body
+    length); each corrupted position gets an independent random residue from
+    `aa_ids`. Operates ONLY on input_ids — never labels — so the decoder is still
+    scored on predicting the true residue it can no longer see, which forces it off
+    the (near-sufficient) autoregressive prefix and onto the cross-attention
+    conditioning. Contiguous spans (vs i.i.d.) defeat local interpolation: a masked
+    block can't be filled from its immediate neighbours, so global/conditioning
+    info has to carry it. No-op when length<=0 or p<=0.
+    """
+    if length <= 0 or p <= 0.0:
+        return
+    n_target = int(round(p * length))
+    if n_target <= 0:
+        return
+    q = 1.0 / max(mean_span, 1)
+    max_span = min(10, length)
+    covered: set = set()
+    guard, guard_cap = 0, 4 * length + 50
+    while len(covered) < n_target and guard < guard_cap:
+        guard += 1
+        u = float(torch.rand(()))
+        span = 1 + int(math.log(1.0 - u + 1e-9) / math.log(1.0 - q + 1e-9))
+        span = max(1, min(span, max_span))
+        s = int(torch.randint(0, length - span + 1, ()).item())
+        for off in range(s, s + span):
+            if off not in covered:
+                covered.add(off)
+                row_ids[start + off] = int(aa_ids[torch.randint(0, aa_ids.numel(), ())])
+                if len(covered) >= n_target:
+                    break
+
+
 def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
-                 rev_prefix_ids=None, direction_augment: bool = False):
+                 rev_prefix_ids=None, direction_augment: bool = False,
+                 target_input_dropout: float = 0.0, dropout_mean_span: int = 5):
     # ProGen2's tokenizer ships without a pad token; fall back to EOS.
     if target_tokenizer.pad_token is None:
         target_tokenizer.pad_token = target_tokenizer.eos_token
@@ -151,6 +189,23 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
     prefix_ids = list(prefix_ids)
     rev_prefix_ids = list(rev_prefix_ids) if rev_prefix_ids is not None else []
     augment = direction_augment and len(rev_prefix_ids) > 0
+
+    # Amino-acid substitution pool for target-input span dropout: the 20 canonical
+    # residues, each a single decoder token (char-level protein vocab). Built once.
+    aa_ids = None
+    if target_input_dropout > 0.0:
+        ids = []
+        for aa in "ACDEFGHIKLMNPQRSTVWY":
+            toks = target_tokenizer(aa, add_special_tokens=False)["input_ids"]
+            if len(toks) == 1:
+                ids.append(toks[0])
+        ids = sorted(set(ids))
+        if not ids:
+            raise ValueError(
+                "--target-input-dropout needs a decoder vocab where amino acids are "
+                "single tokens (a protein decoder); got none. It is a text2protein "
+                "feature — leave it 0 for protein2text.")
+        aa_ids = torch.tensor(ids, dtype=torch.long)
 
     # We add BOS/EOS explicitly rather than relying on the tokenizer's
     # `add_special_tokens`: the protein decoders' char tokenizers never add them
@@ -183,6 +238,7 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
 
         # Tokenize bodies without specials, then wrap with [BOS] [prefix] ... [EOS].
         seqs = []
+        body_spans = []          # (start, length) of the residue body within each row
         for b in batch:
             target, pfx = b["target"], prefix_ids
             # Coin-flip C-to-N: reverse the residue string (char == token for the
@@ -194,9 +250,10 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
                 target, add_special_tokens=False, truncation=True,
                 max_length=body_cap,
             )["input_ids"]
-            ids = ([bos_id] if bos_id is not None else []) + pfx + body + \
-                  ([eos_id] if eos_id is not None else [])
+            head = ([bos_id] if bos_id is not None else []) + pfx
+            ids = head + body + ([eos_id] if eos_id is not None else [])
             seqs.append(ids)
+            body_spans.append((len(head), len(body)))
 
         L = max(len(s) for s in seqs)
         input_ids = torch.full((B, L), pad_id, dtype=torch.long)
@@ -208,6 +265,13 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
         # Labels = input_ids; pad positions become -100 (ignored by CE).
         labels = input_ids.clone()
         labels[attn_mask == 0] = -100
+
+        # Target-input span dropout (train only): corrupt input_ids AFTER cloning
+        # labels, so the model still predicts the true (now unseen) residues.
+        if aa_ids is not None:
+            for i, (start, length) in enumerate(body_spans):
+                _corrupt_body_spans(input_ids[i], start, length,
+                                    target_input_dropout, dropout_mean_span, aa_ids)
 
         out = {
             "h": h_pad, "m": m_pad,
@@ -373,6 +437,15 @@ def main() -> None:
                          "cross-attention adapters. LoRA is caption-blind (unconditional domain "
                          "adaptation); dropping it removes that shortcut so gains must come from "
                          "conditioning. Use to A/B whether LoRA helps or suppresses conditioning")
+    ap.add_argument("--target-input-dropout", type=float, default=0.0,
+                    help="text2protein: corrupt this fraction of the target protein's INPUT "
+                         "residues (the teacher-forcing context) with random amino acids, in "
+                         "contiguous spans, while leaving the labels intact. Handicaps the "
+                         "near-sufficient autoregressive prefix so the decoder must lean on the "
+                         "cross-attn conditioning. 0 = off; try 0.15-0.3. Val is never corrupted")
+    ap.add_argument("--dropout-mean-span", type=int, default=5,
+                    help="mean length (geometric, capped at 10) of each corrupted residue span "
+                         "for --target-input-dropout")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -408,6 +481,12 @@ def main() -> None:
     if args.memory_space != "aligned" and (args.memory_map or args.cross_attn_mode == "aligned"):
         raise SystemExit(
             "--memory-map / --cross-attn-mode aligned require --memory-space aligned")
+    if args.target_input_dropout > 0.0 and args.direction != "text2protein":
+        raise SystemExit(
+            "--target-input-dropout is a text2protein feature (it corrupts protein-residue "
+            "targets with random amino acids); leave it 0 for protein2text")
+    if not (0.0 <= args.target_input_dropout < 1.0):
+        raise SystemExit("--target-input-dropout must be in [0, 1)")
     if args.warm_start_qalign and args.cross_attn_mode != "aligned":
         raise SystemExit(
             "--warm-start-qalign requires --cross-attn-mode aligned (q_align exists only "
@@ -634,7 +713,10 @@ def main() -> None:
     # Train collate augments direction (if enabled); val stays forward-only so its
     # CE is comparable across runs and reflects the deployment (N-to-C) path.
     train_collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids,
-                                 rev_prefix_ids, direction_augment=args.direction_augment)
+                                 rev_prefix_ids, direction_augment=args.direction_augment,
+                                 target_input_dropout=args.target_input_dropout,
+                                 dropout_mean_span=args.dropout_mean_span)
+    # Val is never corrupted, so its CE / the ablation stay comparable across runs.
     val_collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids)
     if env.distributed:
         train_sampler = DistributedSampler(
@@ -923,6 +1005,8 @@ def main() -> None:
                        "cross_attn_every": args.cross_attn_every,
                        "unfreeze_top": args.unfreeze_top,
                        "unfreeze_where": args.unfreeze_where,
+                       "target_input_dropout": args.target_input_dropout,
+                       "dropout_mean_span": args.dropout_mean_span,
                        "unfreeze_lr": args.unfreeze_lr,
                        "warm_start_qalign": args.warm_start_qalign,
                        "memory_space": args.memory_space,
