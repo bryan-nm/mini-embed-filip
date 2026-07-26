@@ -187,6 +187,56 @@ class CrossAttentionAdapter(nn.Module):
         attn_out = attn @ v                                           # [B, T, D]
         return hidden_states + self.o_proj(attn_out).to(in_dtype)
 
+    def warm_start_q_align_from(self, proj_head: nn.Module) -> None:
+        """Warm-start the aligned-mode query MLP from a retrieval ProjectionHead.
+
+        `q_align` maps decoder hidden states into the shared space, to be cosine-
+        scored against the aligned memory. The retrieval projection head of the
+        DECODER's own modality (protein_proj for text2protein) already defines how
+        that modality's tokens carve the shared sphere — and in retrieval it is the
+        matching *protein* token that sits near a given text key. So we transplant
+        that head's body — the layers from d_hidden through the d_out projection
+        (norm1, fc2, norm2, fc3) — and leave only the input layer (`q_align[0]`:
+        dec_hidden -> d_hidden) freshly initialized, since the ProtGPT3 decoder
+        hidden space differs from the encoder hidden space the head was trained on.
+        From step 0 the query then lands in a sensible region of the shared space
+        instead of cold-starting a random map through the frozen decoder.
+
+        `o_proj` stays zero (the adapter is still a no-op at step 0); this only sets
+        where the *alignment* points once o_proj opens under gradient. The head's
+        input mean-centering (`mean_in`) is intentionally dropped — it belongs to
+        the encoder feature space, and the fresh `q_align[0]` learns its own input
+        map.
+
+        Requires the transplant layers to match shape, i.e. dec_hidden ==
+        proj_d_hidden and dec_hidden // 2 == proj_d_mid (holds for ProtGPT3-112M:
+        512/256). Raises a clear error otherwise rather than silently skipping, so
+        a mismatched decoder/head pairing fails loudly.
+        """
+        if self.score_space != "aligned":
+            raise ValueError("warm_start_q_align_from applies only to aligned mode")
+        # q_align layout: [0] fc1, [1] GELU, [2] norm1, [3] Dropout,
+        #                 [4] fc2, [5] GELU, [6] norm2, [7] fc3
+        pairs = [
+            (self.q_align[2], proj_head.norm1),
+            (self.q_align[4], proj_head.fc2),
+            (self.q_align[6], proj_head.norm2),
+            (self.q_align[7], proj_head.fc3),
+        ]
+        for dst, src in pairs:
+            if dst.weight.shape != src.weight.shape:
+                raise ValueError(
+                    "aligned warm-start dim mismatch: q_align body layer "
+                    f"{tuple(dst.weight.shape)} != projection-head layer "
+                    f"{tuple(src.weight.shape)}. Warm-start requires dec_hidden == "
+                    "proj_d_hidden and dec_hidden//2 == proj_d_mid (e.g. ProtGPT3-112M "
+                    "hidden=512 with proj 512/256). Rebuild q_align at the head's dims "
+                    "for other sizes.")
+        with torch.no_grad():
+            for dst, src in pairs:
+                dst.weight.copy_(src.weight.to(dst.weight))
+                dst.bias.copy_(src.bias.to(dst.bias))
+
 
 # ---------------------------------------------------------------------------
 # Minimal LoRA wrapper (avoids hard dep on peft)
@@ -317,22 +367,32 @@ def _decoder_blocks(model: nn.Module):
     return model.model.layers                 # Jamba / Mixtral (ProtGPT3)
 
 
-def unfreeze_top_blocks(model: nn.Module, direction: str, n: int) -> int:
-    """Unfreeze the top `n` decoder blocks in place (full fine-tune of those
-    blocks, on top of the adapters/LoRA). Returns # params unfrozen.
+def unfreeze_decoder_blocks(model: nn.Module, n: int, where: str = "top") -> int:
+    """Unfreeze `n` decoder blocks in place (full fine-tune of those blocks, on
+    top of the adapters/LoRA). Returns # params unfrozen.
 
     Gives the decoder real capacity to incorporate the cross-attention memory
-    when small adapters alone can't overcome the frozen prior. Keep `n` small
-    and the LR low to avoid wrecking the pretrained protein/text prior.
-    `direction` is accepted for backward compatibility; the block list is
-    resolved from the model architecture.
+    when small adapters alone can't overcome the frozen prior. Keep `n` small and
+    the LR low (see the separate optimizer group in train_generation) to avoid
+    wrecking the pretrained protein/text prior.
+
+    `where` selects which end of the stack to unfreeze:
+      "top"    — the last `n` blocks (nearest the output logits): capacity to
+                 turn a conditioned hidden state into the right next-token dist.
+      "bottom" — the first `n` blocks (nearest the embeddings): capacity to make
+                 the early representation receptive to the injected memory so the
+                 conditioning propagates up through the (frozen) rest of the stack.
+    Which wins is empirical; A/B them.
     """
     if n <= 0:
         return 0
+    if where not in ("top", "bottom"):
+        raise ValueError(f"unfreeze `where` must be 'top' or 'bottom', got {where!r}")
     blocks = list(_decoder_blocks(model))
     n = min(n, len(blocks))
+    chosen = blocks[-n:] if where == "top" else blocks[:n]
     count = 0
-    for block in blocks[-n:]:
+    for block in chosen:
         for p in block.parameters():
             p.requires_grad_(True)
             count += p.numel()
@@ -711,6 +771,22 @@ def clear_cross_memory(adapters: List[CrossAttentionAdapter]) -> None:
     for a in adapters:
         a.memory = None
         a.memory_mask = None
+
+
+def warm_start_q_align(adapters: List[CrossAttentionAdapter],
+                       proj_head: nn.Module) -> int:
+    """Warm-start every aligned-mode adapter's query MLP from `proj_head`.
+
+    `proj_head` should be the retrieval projection head of the DECODER's own
+    modality (protein_proj for text2protein, text_proj for protein2text). Returns
+    the number of adapters warm-started. No-op for adapters not in aligned mode.
+    """
+    n = 0
+    for a in adapters:
+        if getattr(a, "score_space", None) == "aligned":
+            a.warm_start_q_align_from(proj_head)
+            n += 1
+    return n
 
 
 def count_trainable(model: nn.Module) -> int:

@@ -59,7 +59,8 @@ from src.decoder_adapters import (
     reverse_prefix_ids,
     set_cross_memory,
     target_prefix_ids,
-    unfreeze_top_blocks,
+    unfreeze_decoder_blocks,
+    warm_start_q_align,
 )
 from src.cvae import build_cvae, beta_at
 from src.losses import masked_mean
@@ -275,11 +276,17 @@ def load_retrieval_model(ckpt_path: str, device: torch.device,
     return m
 
 
-def cosine_warmup_lr(step: int, total: int, warmup: int, base: float) -> float:
+def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
+    """LR multiplier in [0, 1]: linear warmup then cosine decay. Multiply each
+    param group's own base_lr by this so groups can carry different base LRs."""
     if step < warmup:
-        return base * (step + 1) / max(warmup, 1)
+        return (step + 1) / max(warmup, 1)
     progress = (step - warmup) / max(total - warmup, 1)
-    return base * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def cosine_warmup_lr(step: int, total: int, warmup: int, base: float) -> float:
+    return base * cosine_warmup_factor(step, total, warmup)
 
 
 def resolve_resume_path(resume: str, ckpt_dir: Path) -> Path:
@@ -317,7 +324,21 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=cfg.generation.lr)
     ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every)
     ap.add_argument("--unfreeze-top", type=int, default=0,
-                    help="fully fine-tune the top N decoder blocks (0 = adapters/LoRA only)")
+                    help="fully fine-tune N decoder blocks (0 = adapters/LoRA only); "
+                         "which N blocks is set by --unfreeze-where")
+    ap.add_argument("--unfreeze-where", choices=["top", "bottom"], default="top",
+                    help="which end of the decoder stack --unfreeze-top selects: 'top' = the "
+                         "last N blocks (nearest logits, default), 'bottom' = the first N "
+                         "(nearest embeddings, lets conditioning become receptive early)")
+    ap.add_argument("--unfreeze-lr", type=float, default=None,
+                    help="separate (typically lower) LR for the unfrozen decoder blocks; "
+                         "defaults to --lr. The adapters/LoRA/CVAE heads always use --lr. "
+                         "Keep this well below --lr to avoid wrecking the pretrained prior")
+    ap.add_argument("--warm-start-qalign", action="store_true",
+                    help="initialize the aligned-mode cross-attn query MLP (q_align) from the "
+                         "retrieval projection head of the generated modality, so the decoder-"
+                         "side query lands in the shared space from step 0 instead of cold-"
+                         "starting a random map. Requires --cross-attn-mode aligned")
     ap.add_argument("--grad-checkpointing", action="store_true",
                     help="recompute layer activations in backward to fit large decoders "
                          "(e.g. the 3B Dayhoff/Jamba); ~30%% slower, much less memory. "
@@ -387,6 +408,10 @@ def main() -> None:
     if args.memory_space != "aligned" and (args.memory_map or args.cross_attn_mode == "aligned"):
         raise SystemExit(
             "--memory-map / --cross-attn-mode aligned require --memory-space aligned")
+    if args.warm_start_qalign and args.cross_attn_mode != "aligned":
+        raise SystemExit(
+            "--warm-start-qalign requires --cross-attn-mode aligned (q_align exists only "
+            "in aligned mode)")
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -458,9 +483,9 @@ def main() -> None:
 
     # Optional partial unfreeze of the top decoder blocks (all ranks, identically,
     # before DDP captures requires_grad state).
-    n_unfrozen = unfreeze_top_blocks(decoder, args.direction, args.unfreeze_top)
+    n_unfrozen = unfreeze_decoder_blocks(decoder, args.unfreeze_top, where=args.unfreeze_where)
     if env.is_main and args.unfreeze_top > 0:
-        print(f"[gen] unfroze top {args.unfreeze_top} decoder blocks "
+        print(f"[gen] unfroze {args.unfreeze_where} {args.unfreeze_top} decoder blocks "
               f"({n_unfrozen:,} params now trainable)")
     if env.is_main:
         n_train = count_trainable(decoder)
@@ -502,6 +527,18 @@ def main() -> None:
     else:
         src_proj, src_expand, tgt_proj = (
             retrieval.protein_proj, retrieval.protein_expand, retrieval.text_proj)
+
+    # Optional warm-start of the aligned-mode query MLP from the retrieval head of
+    # the GENERATED modality (tgt_proj: protein_proj for text2protein). Done before
+    # the DDP wrap so DDP's init-time broadcast syncs the copied weights across
+    # ranks, and before the optimizer/resume so param shapes are final. The copy is
+    # deterministic from the (identical, frozen) retrieval head on every rank.
+    if args.warm_start_qalign:
+        n_ws = warm_start_q_align(adapters, tgt_proj)
+        if env.is_main:
+            head = "protein_proj" if args.direction == "text2protein" else "text_proj"
+            print(f"[gen] warm-started q_align in {n_ws} aligned adapter(s) from {head} "
+                  f"(fc1 input layer left freshly initialized)")
 
     def build_memory(z):
         """Aligned projection -> cross-attn memory. "expanded" lifts z back to
@@ -618,13 +655,37 @@ def main() -> None:
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=True)
     core = decoder.module if env.distributed else decoder
 
-    # 4) Optim — decoder adapters/LoRA (+ unfrozen blocks) and the CVAE heads.
-    train_params = [p for p in decoder.parameters() if p.requires_grad]
+    # 4) Optim — two LR groups: the adapters/LoRA/CVAE "heads" at --lr, and any
+    # unfrozen decoder blocks at --unfreeze-lr (defaults to --lr). The frozen
+    # backbone contributes no params. Each group carries its own base_lr; the
+    # cosine schedule scales both by the same factor each step (see train loop).
+    # With no unfreeze (or --unfreeze-lr unset) this reduces exactly to one LR.
+    adapter_param_ids = {id(p) for a in adapters for p in a.parameters()}
+    head_params, backbone_params = [], []
+    for name, p in core.named_parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in adapter_param_ids or "lora_" in name or "cross_attn" in name:
+            head_params.append(p)          # cross-attn adapters + LoRA
+        else:
+            backbone_params.append(p)      # fully-unfrozen decoder blocks
     if cvae is not None:
-        train_params += list(cvae.parameters())
+        head_params += list(cvae.parameters())
+
+    backbone_lr = args.unfreeze_lr if args.unfreeze_lr is not None else args.lr
+    param_groups = [{"params": head_params, "base_lr": args.lr, "lr": args.lr}]
+    if backbone_params:
+        param_groups.append(
+            {"params": backbone_params, "base_lr": backbone_lr, "lr": backbone_lr})
     optim = torch.optim.AdamW(
-        train_params, lr=args.lr, weight_decay=cfg.generation.weight_decay,
+        param_groups, lr=args.lr, weight_decay=cfg.generation.weight_decay,
     )
+    train_params = head_params + backbone_params   # for grad clipping below
+    if env.is_main:
+        msg = (f"[gen] optim: heads={sum(p.numel() for p in head_params):,} @ lr={args.lr:.2e}")
+        msg += (f" | backbone={sum(p.numel() for p in backbone_params):,} @ lr={backbone_lr:.2e}"
+                if backbone_params else " | backbone=none")
+        print(msg)
     total_steps = args.epochs * len(train_loader)
     warmup = max(int(cfg.generation.warmup_frac * total_steps), 1)
 
@@ -650,6 +711,8 @@ def main() -> None:
         # pre-flag values ("expanded"/False/"head"/True) for older checkpoints.
         if ckpt.get("cross_attn_every") != args.cross_attn_every or \
            ckpt.get("unfreeze_top") != args.unfreeze_top or \
+           ckpt.get("unfreeze_where", "top") != args.unfreeze_where or \
+           ckpt.get("warm_start_qalign", False) != args.warm_start_qalign or \
            ckpt.get("memory_space", "expanded") != args.memory_space or \
            ckpt.get("memory_map", False) != args.memory_map or \
            ckpt.get("cross_attn_mode", "head") != args.cross_attn_mode or \
@@ -658,12 +721,15 @@ def main() -> None:
             raise RuntimeError(
                 f"--resume checkpoint architecture mismatch: "
                 f"cross_attn_every={ckpt.get('cross_attn_every')} unfreeze_top={ckpt.get('unfreeze_top')} "
+                f"unfreeze_where={ckpt.get('unfreeze_where', 'top')} "
+                f"warm_start_qalign={ckpt.get('warm_start_qalign', False)} "
                 f"memory_space={ckpt.get('memory_space', 'expanded')} "
                 f"memory_map={ckpt.get('memory_map', False)} "
                 f"cross_attn_mode={ckpt.get('cross_attn_mode', 'head')} "
                 f"lora_self_attn={ckpt.get('lora_targets_self_attn', True)} "
                 f"lora_ffn={ckpt.get('lora_targets_ffn', True)} "
                 f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top} "
+                f"unfreeze_where={args.unfreeze_where} warm_start_qalign={args.warm_start_qalign} "
                 f"memory_space={args.memory_space} memory_map={args.memory_map} "
                 f"cross_attn_mode={args.cross_attn_mode} "
                 f"lora_self_attn={cfg.generation.lora_targets_self_attn} "
@@ -702,9 +768,10 @@ def main() -> None:
         decoder.train()
         t0 = time.time()
         for it, batch in enumerate(train_loader):
-            lr = cosine_warmup_lr(global_step, total_steps, warmup, args.lr)
+            frac = cosine_warmup_factor(global_step, total_steps, warmup)
             for g in optim.param_groups:
-                g["lr"] = lr
+                g["lr"] = g["base_lr"] * frac
+            lr = optim.param_groups[0]["lr"]     # head-group LR, for logging
             optim.zero_grad(set_to_none=True)
 
             h = batch["h"].to(device).float()
@@ -830,6 +897,9 @@ def main() -> None:
                        "train_log": log,
                        "cross_attn_every": args.cross_attn_every,
                        "unfreeze_top": args.unfreeze_top,
+                       "unfreeze_where": args.unfreeze_where,
+                       "unfreeze_lr": args.unfreeze_lr,
+                       "warm_start_qalign": args.warm_start_qalign,
                        "memory_space": args.memory_space,
                        "memory_map": args.memory_map,
                        "cross_attn_mode": args.cross_attn_mode,
