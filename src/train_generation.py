@@ -487,6 +487,21 @@ def main() -> None:
     if env.is_main and args.unfreeze_top > 0:
         print(f"[gen] unfroze {args.unfreeze_where} {args.unfreeze_top} decoder blocks "
               f"({n_unfrozen:,} params now trainable)")
+    # The decoder is loaded in bf16 for frozen-backbone inference (fine when only
+    # the fp32 adapters train). Training bf16 *master* weights is broken: an AdamW
+    # update at lr≈2e-5 is far below the bf16 ULP at a typical weight magnitude
+    # (~8e-5 near |w|≈0.02), so it rounds to zero — the "unfrozen" blocks never
+    # actually move (looks implausibly fast, val ppl doesn't budge) — and bf16 Adam
+    # moments underflow into inf/NaN that clip_grad_norm_ then smears across every
+    # parameter (NaN that never recovers). Upcast to fp32 master weights whenever a
+    # backbone block is trained. (Large decoders would instead want autocast(bf16)
+    # over fp32 params to keep the compute cheap; the 112M ProtGPT3 is small enough
+    # that plain fp32 is fine.)
+    if n_unfrozen > 0:
+        decoder.float()
+        if env.is_main:
+            print(f"[gen] upcast decoder to fp32 for stable fine-tuning of the "
+                  f"unfrozen blocks (bf16 master weights don't train)")
     if env.is_main:
         n_train = count_trainable(decoder)
         lora_on = cfg.generation.lora_targets_self_attn or cfg.generation.lora_targets_ffn
@@ -831,8 +846,18 @@ def main() -> None:
             # so average their grads manually (mirrors the retrieval trainer).
             if cvae is not None:
                 average_gradients(cvae)
-            torch.nn.utils.clip_grad_norm_(train_params, cfg.generation.grad_clip)
-            optim.step()
+            total_norm = torch.nn.utils.clip_grad_norm_(train_params, cfg.generation.grad_clip)
+            # Skip the step on a non-finite grad norm instead of letting it poison
+            # every weight: clip_grad_norm_ rescales all grads by clip/total_norm, so
+            # a single inf/NaN grad makes the coefficient NaN and turns EVERY param
+            # NaN on step() — permanently (all later forwards are NaN, train + val).
+            # Grads are DDP-synced, so total_norm is identical on all ranks and they
+            # skip in lockstep. Next iter's zero_grad clears the bad grads.
+            if torch.isfinite(total_norm):
+                optim.step()
+            elif env.is_main:
+                print(f"[warn] non-finite grad norm ({total_norm.item()}) at epoch={epoch} "
+                      f"step={it+1}; skipping optimizer step", flush=True)
             global_step += 1
 
             if env.is_main and ((it + 1) % cfg.generation.log_every == 0 or it == 0):
