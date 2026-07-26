@@ -177,6 +177,21 @@ def _corrupt_body_spans(row_ids: torch.Tensor, start: int, length: int,
                     break
 
 
+def _per_example_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Per-example mean next-token CE over non-ignored positions.
+
+    logits [B, L, V], labels [B, L] -> [B]. Uses the same left-shift as the scalar
+    CE (predict token t+1 from position t); ignored (-100) positions contribute 0
+    and are excluded from the per-example denominator.
+    """
+    sl = logits[:, :-1, :]
+    lb = labels[:, 1:]
+    tok = F.cross_entropy(sl.reshape(-1, sl.size(-1)), lb.reshape(-1),
+                          ignore_index=-100, reduction="none").view(lb.shape)
+    valid = (lb != -100)
+    return tok.sum(1) / valid.sum(1).clamp(min=1)
+
+
 def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
                  rev_prefix_ids=None, direction_augment: bool = False,
                  target_input_dropout: float = 0.0, dropout_mean_span: int = 5):
@@ -446,6 +461,15 @@ def main() -> None:
     ap.add_argument("--dropout-mean-span", type=int, default=5,
                     help="mean length (geometric, capped at 10) of each corrupted residue span "
                          "for --target-input-dropout")
+    ap.add_argument("--contrast-lambda", type=float, default=0.0,
+                    help="weight on the contrastive negative-memory hinge (0 = off). Each step "
+                         "also runs the decoder on a shuffled (wrong) memory and penalizes the "
+                         "correct memory unless it beats the wrong one by --contrast-margin "
+                         "nats/token. Directly optimizes 'content gain'. Doubles the forward "
+                         "batch to 2B — halve --batch-size if it OOMs")
+    ap.add_argument("--contrast-margin", type=float, default=0.5,
+                    help="target nats/token by which the correct memory should beat a wrong one "
+                         "(the hinge margin for --contrast-lambda)")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -902,19 +926,49 @@ def main() -> None:
                 mask = torch.cat([mask, k_mask], dim=1)
                 kl = cvae.kl(qmu, qlv, pmu, plv)
 
-            set_cross_memory(adapters, mem, mask)
-            out = decoder(input_ids=input_ids, attention_mask=attn_mask)
+            contrast_on = args.contrast_lambda > 0.0 and input_ids.size(0) >= 2
+            if contrast_on:
+                # Negative memory: pair each row with another example's memory (a
+                # batch roll is a derangement for B>=2). Concatenate the correct and
+                # shuffled conditioning into ONE forward of size 2B — rows 0:B attend
+                # the correct memory, rows B:2B the wrong one — so there is a single
+                # forward/backward (DDP-clean, unlike two separate decoder calls).
+                B = input_ids.size(0)
+                mem_cat = torch.cat([mem, mem.roll(1, 0)], dim=0)
+                mask_cat = torch.cat([mask, mask.roll(1, 0)], dim=0)
+                set_cross_memory(adapters, mem_cat, mask_cat)
+                out = decoder(input_ids=input_ids.repeat(2, 1),
+                              attention_mask=attn_mask.repeat(2, 1))
+                pos_logits, neg_logits = out.logits[:B], out.logits[B:]
+            else:
+                set_cross_memory(adapters, mem, mask)
+                out = decoder(input_ids=input_ids, attention_mask=attn_mask)
+                pos_logits, neg_logits = out.logits, None
 
-            logits = out.logits                              # [B, L, V]
-            shift_logits = logits[:, :-1, :].contiguous()
+            # Primary CE: token-weighted global over the positive forward — numerically
+            # identical to the non-contrastive loss, so train/val stay comparable.
             shift_labels = labels[:, 1:].contiguous()
-            ce = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            valid = (shift_labels != -100)
+            tok_pos = F.cross_entropy(
+                pos_logits[:, :-1, :].reshape(-1, pos_logits.size(-1)),
+                shift_labels.reshape(-1), ignore_index=-100, reduction="none",
+            ).view(shift_labels.shape)
+            ce = tok_pos.sum() / valid.sum().clamp(min=1)
+
             beta = beta_at(global_step, total_steps, cvae.cfg) if cvae is not None else 0.0
             loss = ce + beta * kl
+
+            gap = None
+            if contrast_on:
+                # Hinge: the correct memory should beat a wrong one by >= margin
+                # nats/token, per example. Pushes ce_neg UP and ce_pos DOWN, so the
+                # memory *content* has to matter — this is exactly the "content gain"
+                # the ablation measures, made an explicit training objective.
+                ce_pos_ex = tok_pos.sum(1) / valid.sum(1).clamp(min=1)      # [B]
+                ce_neg_ex = _per_example_ce(neg_logits, labels)            # [B]
+                gap = (ce_neg_ex - ce_pos_ex).mean()
+                hinge = F.relu(args.contrast_margin - (ce_neg_ex - ce_pos_ex)).mean()
+                loss = loss + args.contrast_lambda * hinge
             loss.backward()
             # Clear AFTER backward, not before: with gradient checkpointing the
             # decoder layers (and their cross-attn adapter hooks) are recomputed
@@ -949,6 +1003,8 @@ def main() -> None:
                        f"lr={lr:.2e} ce={ce.item():.4f} ppl={ppl:.2f}")
                 if cvae is not None:
                     msg += f" kl={kl.item():.4f} beta={beta:.3f}"
+                if gap is not None:
+                    msg += f" gap={gap.item():+.4f}"   # train-time content gain (ce_neg-ce_pos)
                 print(msg, flush=True)
 
         dt = time.time() - t0
@@ -1007,6 +1063,8 @@ def main() -> None:
                        "unfreeze_where": args.unfreeze_where,
                        "target_input_dropout": args.target_input_dropout,
                        "dropout_mean_span": args.dropout_mean_span,
+                       "contrast_lambda": args.contrast_lambda,
+                       "contrast_margin": args.contrast_margin,
                        "unfreeze_lr": args.unfreeze_lr,
                        "warm_start_qalign": args.warm_start_qalign,
                        "memory_space": args.memory_space,
