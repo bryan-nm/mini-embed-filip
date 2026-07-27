@@ -1,0 +1,70 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_p2t_rl
+#PBS -l walltime=12:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m abe
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+# GRPO-style RL fine-tune of protein->text generation. Run FIRST as a de-risking
+# testbed for the RL machinery: protein2text already conditions well (warm start,
+# dense reward), so reward-up -> round-trip-up validates the loop, tunes the
+# hyperparameters, and serves as a control for the harder text2protein direction.
+# Separate track from train_generation.py; writes to
+# checkpoints/generation/protein2text_rl/.
+: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+: "${INIT_CKPT:?set -v INIT_CKPT=path/to/sft/protein2text/epochNN.pt (the working ckpt)}"
+
+NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+# RL rollouts are embarrassingly parallel: effective GRPO batch scales with NRANKS.
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+# protein2text decoder: BioGPT (24-layer dense). Both encoders are also loaded
+# (protein source memory + text reward re-encode), staged under MODELS_DIR.
+export FILIP_TEXT_DECODER=${FILIP_MODELS_DIR}/biogpt
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29505
+export OMP_NUM_THREADS=8
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+# Route the rank/KVS exchange over MPI (PMIx) — see train_generation.pbs.
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+source ~/bin/slack_notify.sh
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+
+# Architecture (cross_attn_every, unfreeze, LoRA targets) is inherited from
+# INIT_CKPT's metadata. Text targets are short, so max-new-tokens 128 keeps
+# rollouts cheap (this direction iterates faster than text2protein). BioGPT's
+# strong fluency prior + the KL reference suppress text reward-hacking
+# (repetition / keyword-stuffing).
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
+    python -m src.train_rl --direction protein2text \
+    --retrieval-ckpt "${RCKPT}" --init-ckpt "${INIT_CKPT}" --device xpu \
+    --steps 2000 --prompts-per-rank 8 --group-size 8 \
+    --max-new-tokens 128 --temperature 1.0 --top-p 0.95 \
+    --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 \
+    --log-every 10 --save-every 200
+
+rc=$?
+if [ $rc -eq 0 ]; then
+    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
+else
+    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
+fi
+exit $rc
