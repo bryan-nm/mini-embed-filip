@@ -82,7 +82,13 @@ def filip_per_pair(z_p: torch.Tensor, z_t: torch.Tensor,
     s_p2t = max_p.sum(1) / mask_p.sum(1).clamp_min(1)
     max_t = sim.max(dim=1).values.masked_fill(~mask_t, 0.0)   # [N, Lt]
     s_t2p = max_t.sum(1) / mask_t.sum(1).clamp_min(1)
-    return 0.5 * (s_p2t + s_t2p)                              # [N]
+    # Clamp to the valid cosine-mean range. Normal scores already sit in [-1, 1];
+    # this only catches the degenerate case where a generation encodes to ZERO
+    # valid tokens (all special / field-label), for which the max over an
+    # all-invalid axis leaks the -1e4 sentinel (~-5000 reward). Flooring it at -1
+    # ("matched nothing") keeps a single junk sample from blowing up the group
+    # std and washing out the real advantages — and makes true collapse legible.
+    return (0.5 * (s_p2t + s_t2p)).clamp(-1.0, 1.0)           # [N]
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +395,7 @@ def main() -> None:
             gen_strs = [decode_target(core, dtok, row) for row in seqs]
             enc_in = [s if s.strip() else empty_tgt for s in gen_strs]
             h_gen, mask_gen = enc_tgt(enc_in)
+            n_empty = int((mask_gen.sum(dim=1) == 0).sum())   # gens with no valid tokens
             z_gen = tgt_proj(h_gen.float())                      # [B*G, Lp, D]
             z_src_g = z_src.repeat_interleave(G, dim=0)
             mask_src_g = mask_src.repeat_interleave(G, dim=0)
@@ -440,7 +447,7 @@ def main() -> None:
             print(f"[rl] step={step}/{args.steps} lr={optim.param_groups[0]['lr']:.2e} "
                   f"reward={reward.mean().item():.4f} (max {reward.max().item():.4f}) "
                   f"adv|={adv.abs().mean().item():.3f} kl={kl_val.item():.4f} "
-                  f"ent={ent_val.item():.3f} genlen={gen_len:.0f} "
+                  f"ent={ent_val.item():.3f} genlen={gen_len:.0f} empty={n_empty}/{B*G} "
                   f"pg={pg_loss.item():.4f} {(time.time()-t0)/(step+1):.1f}s/step", flush=True)
 
         if (step + 1) % args.save_every == 0:
