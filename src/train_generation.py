@@ -159,6 +159,12 @@ def _corrupt_body_spans(row_ids: torch.Tensor, start: int, length: int,
     n_target = int(round(p * length))
     if n_target <= 0:
         return
+    if n_target >= length:
+        # p>=1.0: full no-prefix regime. Corrupt every body position directly —
+        # span placement can't reliably cover 100% (coupon-collector), so bypass it.
+        for off in range(length):
+            row_ids[start + off] = int(aa_ids[torch.randint(0, aa_ids.numel(), ())])
+        return
     q = 1.0 / max(mean_span, 1)
     max_span = min(10, length)
     covered: set = set()
@@ -509,8 +515,8 @@ def main() -> None:
         raise SystemExit(
             "--target-input-dropout is a text2protein feature (it corrupts protein-residue "
             "targets with random amino acids); leave it 0 for protein2text")
-    if not (0.0 <= args.target_input_dropout < 1.0):
-        raise SystemExit("--target-input-dropout must be in [0, 1)")
+    if not (0.0 <= args.target_input_dropout <= 1.0):
+        raise SystemExit("--target-input-dropout must be in [0, 1] (1.0 = full no-prefix)")
     if args.warm_start_qalign and args.cross_attn_mode != "aligned":
         raise SystemExit(
             "--warm-start-qalign requires --cross-attn-mode aligned (q_align exists only "
