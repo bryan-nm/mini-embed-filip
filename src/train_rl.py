@@ -177,8 +177,15 @@ def main() -> None:
     ap.add_argument("--device", default="xpu")
     ap.add_argument("--cache-dir", default=cfg.retrieval.cache_dir)
     ap.add_argument("--ckpt-dir", default=None,
-                    help="output dir (default: <ckpt_dir>/text2protein_rl)")
-    ap.add_argument("--steps", type=int, default=2000, help="number of RL update steps")
+                    help="output dir (default: <ckpt_dir>/<direction>_rl)")
+    ap.add_argument("--resume", default=None,
+                    help="continue a prior RL run: path to a stepNNNNNN.pt, or 'auto' to pick "
+                         "the latest in --ckpt-dir. Restores policy weights, optimizer state, "
+                         "and the step counter; the KL reference stays anchored to --init-ckpt "
+                         "(the original SFT model), NOT the resumed policy")
+    ap.add_argument("--steps", type=int, default=2000,
+                    help="TOTAL RL update-step budget (not per-job). A resumed run continues "
+                         "toward this total, so the LR schedule stays continuous across restarts")
     ap.add_argument("--prompts-per-rank", type=int, default=8,
                     help="B: distinct captions sampled per rank per step")
     ap.add_argument("--group-size", type=int, default=8,
@@ -208,6 +215,17 @@ def main() -> None:
     direction = args.direction
     ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir else \
         Path(cfg.generation.ckpt_dir) / f"{direction}_rl"
+
+    # Resolve --resume: 'auto' picks the latest stepNNNNNN.pt in ckpt_dir (fresh
+    # start if none exist yet, so a re-queued PBS job just continues).
+    resume_path = None
+    if args.resume == "auto":
+        existing = sorted(ckpt_dir.glob("step*.pt"))
+        resume_path = existing[-1] if existing else None
+    elif args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise SystemExit(f"--resume checkpoint not found: {resume_path}")
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -257,6 +275,23 @@ def main() -> None:
         # weights) rather than an artifact of fp32-vs-bf16 precision.
         if n_unfrozen > 0:
             ref_decoder.float()
+
+    # Resume: overlay the prior RL policy weights onto the (init-built) decoder,
+    # AFTER unfreeze + fp32 upcast so shapes/dtypes match, and BEFORE the DDP wrap
+    # so DDP broadcasts the resumed weights. The reference stays anchored to
+    # --init-ckpt (loaded above), NOT this resumed policy. Optimizer state and the
+    # step counter are restored further down.
+    resume_ck = None
+    start_step = 0
+    if resume_path is not None:
+        resume_ck = torch.load(resume_path, map_location=device)
+        _, unexpected = decoder.load_state_dict(resume_ck["adapter_state"], strict=False)
+        if unexpected:
+            raise RuntimeError(f"--resume unexpected keys: {unexpected}")
+        start_step = int(resume_ck.get("step", 0))
+        if env.is_main:
+            print(f"[rl] resumed policy from {resume_path} at step {start_step} "
+                  f"(KL reference stays anchored to {args.init_ckpt})", flush=True)
 
     # Frozen encode+project handles, per direction: the SOURCE builds the cross-attn
     # memory; the TARGET is what we generate and re-encode for the reward. The FILIP
@@ -333,6 +368,11 @@ def main() -> None:
     optim = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=0.0)
     train_params = head_params + backbone_params
     warmup = max(int(args.warmup_frac * args.steps), 1)
+    # Resume the AdamW moments so updates stay well-conditioned across restarts
+    # (the param-group structure is identical, since unfreeze matches). The custom
+    # base_lr keys survive state_dict; the loop overwrites lr each step regardless.
+    if resume_ck is not None and "optimizer_state" in resume_ck:
+        optim.load_state_dict(resume_ck["optimizer_state"])
 
     bos = dtok.bos_token_id if dtok.bos_token_id is not None else dtok.eos_token_id
     pad_id = dtok.pad_token_id if dtok.pad_token_id is not None else dtok.eos_token_id
@@ -350,6 +390,7 @@ def main() -> None:
         trainable = {n for n, p in core.named_parameters() if p.requires_grad}
         adapter_state = {k: v for k, v in core.state_dict().items() if k in trainable}
         payload = {"step": step, "adapter_state": adapter_state,
+                   "optimizer_state": optim.state_dict(),
                    "rl": True, "direction": direction, "init_ckpt": args.init_ckpt,
                    "kl_coef": args.kl_coef, "lr": args.lr, **meta}
         path = ckpt_dir / f"step{step:06d}.pt"
@@ -360,7 +401,7 @@ def main() -> None:
     # RL loop
     # =====================================================================
     t0 = time.time()
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         frac = cosine_warmup_factor(step, args.steps, warmup)
         for grp in optim.param_groups:
             grp["lr"] = grp["base_lr"] * frac
@@ -448,7 +489,7 @@ def main() -> None:
                   f"reward={reward.mean().item():.4f} (max {reward.max().item():.4f}) "
                   f"adv|={adv.abs().mean().item():.3f} kl={kl_val.item():.4f} "
                   f"ent={ent_val.item():.3f} genlen={gen_len:.0f} empty={n_empty}/{B*G} "
-                  f"pg={pg_loss.item():.4f} {(time.time()-t0)/(step+1):.1f}s/step", flush=True)
+                  f"pg={pg_loss.item():.4f} {(time.time()-t0)/(step-start_step+1):.1f}s/step", flush=True)
 
         if (step + 1) % args.save_every == 0:
             save(step + 1)
