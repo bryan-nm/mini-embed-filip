@@ -14,7 +14,7 @@ import torch
 from src.losses import filip_score_matrix_chunked, token_uniformity_loss
 
 
-def _average_precision(scores: torch.Tensor, relevant: torch.Tensor) -> torch.Tensor:
+def average_precision(scores: torch.Tensor, relevant: torch.Tensor) -> torch.Tensor:
     """Per-query Average Precision, matching ProTrek's definition.
 
     scores   [Q, C] similarity of each query row to every candidate column.
@@ -60,7 +60,7 @@ def retrieval_recall(
     for a caption shared by m proteins). The reported rank is that of the
     best-scoring positive. With neither group supplied this is diagonal recall.
 
-    mAP uses ProTrek's Average-Precision definition (see `_average_precision`)
+    mAP uses ProTrek's Average-Precision definition (see `average_precision`)
     with the same multi-positive relevance set, so `mAP_p2t` / `mAP_t2p` are
     directly comparable to ProTrek's `protein2text` / `text2protein` `..._map`
     (our p2t = query protein → texts = ProTrek protein2text). The absolute value
@@ -90,7 +90,7 @@ def retrieval_recall(
             ranks = ((mat > best_pos[:, None]) & ~same).sum(dim=1) + 1
         for k in ks:
             out[f"R@{k}_{direction}"] = (ranks <= k).float().mean().item()
-        out[f"mAP_{direction}"] = _average_precision(mat, relevant).mean().item()
+        out[f"mAP_{direction}"] = average_precision(mat, relevant).mean().item()
     for k in ks:
         out[f"R@{k}"] = 0.5 * (out[f"R@{k}_p2t"] + out[f"R@{k}_t2p"])
     out["mAP"] = 0.5 * (out["mAP_p2t"] + out["mAP_t2p"])

@@ -26,6 +26,15 @@ Algorithm (GRPO-style, no value network):
        KL penalty to the frozen SFT reference (guards reward hacking / collapse)
        and an optional entropy bonus.
 
+Every --eval-every steps (default 200, aligned with --save-every) the loop also runs
+the held-out round-trip eval in-process: generate a FIXED val subset free-running,
+re-encode, and score accession-grouped R@K + mAP over the whole eval pool with the
+same code path as `python -m src.roundtrip_eval`. The training reward only compares a
+generation to its OWN source, which a policy can raise by drifting toward one generic
+high-scoring output; the pooled metric is what catches that. Rows are sharded across
+ranks, so the cost is ~one extra rollout's generation per eval (<1% of wall time at
+the default cadence). Results stream to stdout and to <ckpt_dir>/rl_roundtrip.jsonl.
+
 Init from an SFT checkpoint (the cleanest-LM one — the unfrozen-only run, NOT the
 contrastive one whose no-memory behaviour is damaged). The saved checkpoint mirrors
 train_generation's adapter_state + meta, so roundtrip_eval / ablate_memory load it
@@ -53,7 +62,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
-from src.data import load_pairs, load_splits
+from src.best_of_n import pad_stack
+from src.data import group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
     LoRACfg, clear_cross_memory, count_trainable, decode_target,
     load_decoder_with_cross_attn, set_cross_memory, target_prefix_ids,
@@ -63,7 +73,8 @@ from src.dist import barrier, cleanup, init_distributed
 from src.encoders import (
     encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
 )
-from src.roundtrip_eval import load_retrieval
+from src.losses import filip_score_matrix_chunked
+from src.roundtrip_eval import grouped_recall, load_retrieval
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +174,134 @@ def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# In-loop round-trip eval — the held-out version of the training reward
+# ---------------------------------------------------------------------------
+def _rng_snapshot(device):
+    """Save CPU + accelerator RNG so the eval's sampling doesn't perturb the
+    rollout stream. Without this, turning the eval on (or changing --eval-every)
+    silently shifts every subsequent rollout, making runs non-reproducible."""
+    dev_state = None
+    try:
+        if device.type == "xpu":
+            dev_state = torch.xpu.get_rng_state(device)
+        elif device.type == "cuda":
+            dev_state = torch.cuda.get_rng_state(device)
+    except Exception:
+        dev_state = None
+    return torch.get_rng_state(), dev_state
+
+
+def _rng_restore(device, state) -> None:
+    cpu_state, dev_state = state
+    torch.set_rng_state(cpu_state)
+    if dev_state is None:
+        return
+    try:
+        if device.type == "xpu":
+            torch.xpu.set_rng_state(dev_state, device)
+        elif device.type == "cuda":
+            torch.cuda.set_rng_state(dev_state, device)
+    except Exception:
+        pass
+
+
+@torch.no_grad()
+def roundtrip_eval_inloop(core, dtok, adapters, retrieval, pairs, eval_idx, prompt,
+                          pad_id, enc_src, src_proj, enc_tgt, tgt_proj, get_src,
+                          get_tgt, empty_tgt, direction, memory_map, embed_dim,
+                          args, env, device, need_ceiling: bool):
+    """Free-running round-trip retrieval over a FIXED val subset.
+
+    Identical measurement to `python -m src.roundtrip_eval`: same generation path
+    (cross-attn memory from the source, sampled decode), same FILIP scorer, same
+    `grouped_recall` -> accession-grouped R@K + mAP. Run in-process, so every
+    model is already resident and the only real cost is one extra `generate`.
+
+    This is the honest counterpart to the training reward: the reward scores a
+    generation against ITS OWN source only, which a degenerate policy can raise by
+    drifting toward a generic high-scoring output. R@K/mAP score it against the
+    whole eval pool, so that drift shows up as a flat or falling curve while the
+    reward climbs.
+
+    Rows are sharded round-robin across ranks (`eval_idx` is identical on every
+    rank), so wall time is one SMALL-batch generation rather than one large one;
+    the per-token embeddings are all-gathered (fp16 on the wire) and rank 0 scores
+    the full N x N matrix.
+
+    `need_ceiling` also re-encodes the TRUE targets for the ceiling row. The
+    retrieval model is frozen and the eval set fixed, so that number never moves —
+    pass True on the first call only and reuse the result.
+
+    Returns (metrics, ceiling) on rank 0; (None, None) elsewhere.
+    """
+    my = eval_idx[env.rank::env.world_size]
+    ks = (1, 5, 10)
+    recs = []
+    bs = max(args.eval_batch_size, 1)
+    for s in range(0, len(my), bs):
+        chunk = my[s:s + bs]
+        h_src, mask_src = enc_src([get_src(pairs[i]) for i in chunk])
+        z_src = src_proj(h_src.float())
+        mem = retrieval.map_source(z_src, direction) if memory_map else z_src
+
+        set_cross_memory(adapters, mem, mask_src)
+        input_ids = torch.tensor([prompt] * len(chunk), device=device, dtype=torch.long)
+        gen = core.generate(
+            input_ids, max_new_tokens=args.eval_max_new_tokens,
+            do_sample=args.eval_temperature > 0,
+            temperature=max(args.eval_temperature, 1e-6),
+            top_p=args.eval_top_p, pad_token_id=pad_id, use_cache=True)
+        clear_cross_memory(adapters)
+
+        gen_strs = [decode_target(core, dtok, row) for row in gen]
+        h_gen, mask_gen = enc_tgt([g if g.strip() else empty_tgt for g in gen_strs])
+        z_gen = tgt_proj(h_gen.float())
+        if need_ceiling:
+            h_true, mask_true = enc_tgt([get_tgt(pairs[i]) for i in chunk])
+            z_true = tgt_proj(h_true.float())
+
+        # Keep only the valid tokens, fp16 on CPU: the gather payload is ~200 KB
+        # per row at fp32, and every rank receives the whole eval set.
+        for b, i in enumerate(chunk):
+            rec = {"uid": pairs[i].uid,
+                   "z_gen": z_gen[b][mask_gen[b]].half().cpu(),
+                   "z_src": z_src[b][mask_src[b]].half().cpu()}
+            if need_ceiling:
+                rec["z_true"] = z_true[b][mask_true[b]].half().cpu()
+            recs.append(rec)
+
+    if env.distributed and torch.distributed.is_initialized():
+        buf = [None] * env.world_size
+        torch.distributed.all_gather_object(buf, recs)
+        recs = [r for part in buf for r in part]
+    if not env.is_main:
+        return None, None
+
+    # Accession ids align rows/cols of every matrix below (a protein carries ~8.87
+    # captions, so sibling rows must count as positives, not distractors).
+    groups = torch.as_tensor(
+        group_ids_from_accessions([r["uid"] for r in recs]), device=device)
+    Z_src, m_src = pad_stack([r["z_src"].float() for r in recs], embed_dim, device)
+    Z_gen, m_gen = pad_stack([r["z_gen"].float() for r in recs], embed_dim, device)
+
+    S = filip_score_matrix_chunked(Z_gen, Z_src, m_gen, m_src,
+                                   chunk_rows=args.eval_filip_chunk_rows)
+    gen2src, _ = grouped_recall(S, groups, ks)             # generated target -> its source
+    src2gen, _ = grouped_recall(S.t().contiguous(), groups, ks)
+    del S
+
+    ceiling = None
+    if need_ceiling:
+        Z_true, m_true = pad_stack([r["z_true"].float() for r in recs], embed_dim, device)
+        S_true = filip_score_matrix_chunked(Z_true, Z_src, m_true, m_src,
+                                            chunk_rows=args.eval_filip_chunk_rows)
+        ceiling, _ = grouped_recall(S_true, groups, ks)
+        del S_true
+
+    return {"n": len(recs), "gen2src": gen2src, "src2gen": src2gen}, ceiling
+
+
+# ---------------------------------------------------------------------------
 def main() -> None:
     cfg = default_cfg()
     ap = argparse.ArgumentParser()
@@ -208,9 +347,44 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
+    # ---- held-out round-trip eval (same metric as src.roundtrip_eval) ----
+    ap.add_argument("--eval-every", type=int, default=200,
+                    help="run the held-out round-trip eval every N steps (0 = off). "
+                         "Defaults to --save-every so every checkpoint has a metric")
+    ap.add_argument("--eval-samples", type=int, default=1000,
+                    help="val rows in the eval pool. Fixed across the run (--eval-seed), "
+                         "so the curve is comparable step to step. Also the candidate-pool "
+                         "size, so R@K/mAP are NOT comparable across different values")
+    ap.add_argument("--eval-batch-size", type=int, default=8,
+                    help="per-rank generation batch during eval. The pool is sharded across "
+                         "ranks, so this only bites on small worlds")
+    ap.add_argument("--eval-temperature", type=float, default=None,
+                    help="eval sampling temperature (default: --temperature, i.e. measure the "
+                         "same distribution the policy is being trained on). 0 = greedy")
+    ap.add_argument("--eval-top-p", type=float, default=None,
+                    help="eval nucleus cutoff (default: --top-p)")
+    ap.add_argument("--eval-max-new-tokens", type=int, default=None,
+                    help="default: --max-new-tokens")
+    ap.add_argument("--eval-filip-chunk-rows", type=int, default=4,
+                    help="row chunk for the N x N FILIP scoring on rank 0; bounds the "
+                         "transient (~chunk_rows*N*L_gen*L_src floats) on top of the "
+                         "resident fp32 policy + KL reference")
+    ap.add_argument("--eval-seed", type=int, default=1234,
+                    help="picks the fixed eval subset and seeds eval sampling; the RL rollout "
+                         "RNG stream is saved/restored around each eval")
+    ap.add_argument("--eval-at-start", dest="eval_at_start", action="store_true",
+                    help="also eval before the first step (baseline for the init/resumed policy)")
+    ap.add_argument("--no-eval-at-start", dest="eval_at_start", action="store_false")
+    ap.set_defaults(eval_at_start=True)
     args = ap.parse_args()
     if args.group_size < 2:
         raise SystemExit("--group-size must be >= 2 (group-relative advantage needs a group)")
+    if args.eval_temperature is None:
+        args.eval_temperature = args.temperature
+    if args.eval_top_p is None:
+        args.eval_top_p = args.top_p
+    if args.eval_max_new_tokens is None:
+        args.eval_max_new_tokens = args.max_new_tokens
 
     direction = args.direction
     ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir else \
@@ -308,11 +482,11 @@ def main() -> None:
     if direction == "text2protein":
         enc_src, src_proj = enc_text, retrieval.text_proj
         enc_tgt, tgt_proj = enc_prot, retrieval.protein_proj
-        get_src, empty_tgt = (lambda p: p.text), "M"
+        get_src, get_tgt, empty_tgt = (lambda p: p.text), (lambda p: p.protein), "M"
     else:
         enc_src, src_proj = enc_prot, retrieval.protein_proj
         enc_tgt, tgt_proj = enc_text, retrieval.text_proj
-        get_src, empty_tgt = (lambda p: p.protein), "protein"
+        get_src, get_tgt, empty_tgt = (lambda p: p.protein), (lambda p: p.text), "protein"
 
     # ---- data: sample captions from the train split ----
     pairs = load_pairs(
@@ -326,6 +500,21 @@ def main() -> None:
               f"{count_trainable(decoder):,} | unfrozen={n_unfrozen:,} | "
               f"fp32={n_unfrozen > 0} | KL={'on' if ref_decoder is not None else 'off'}",
               flush=True)
+
+    # Fixed held-out eval pool: same rows every eval (and across restarts), drawn
+    # from val with a dedicated generator so it's independent of --seed and of the
+    # rollout stream. Identical on every rank — the eval shards it by rank.
+    eval_idx: list = []
+    if args.eval_every > 0 and args.eval_samples > 0:
+        val_idx = list(splits["val"])
+        g_ev = torch.Generator().manual_seed(args.eval_seed)
+        perm = torch.randperm(len(val_idx), generator=g_ev).tolist()
+        eval_idx = [val_idx[i] for i in perm[:args.eval_samples]]
+        if env.is_main:
+            print(f"[rl] round-trip eval: {len(eval_idx)} val rows every "
+                  f"{args.eval_every} steps (temp={args.eval_temperature} "
+                  f"top_p={args.eval_top_p} max_new={args.eval_max_new_tokens}); "
+                  f"~{len(eval_idx) / max(env.world_size, 1):.1f} rows/rank", flush=True)
 
     # Per-rank shuffled caption stream (reshuffles when exhausted).
     g = torch.Generator().manual_seed(args.seed + 1234 + env.rank)
@@ -397,10 +586,54 @@ def main() -> None:
         torch.save(payload, path)
         print(f"[rl][ckpt] saved {path}", flush=True)
 
+    # Held-out round-trip eval. The ceiling (true target -> source, same scorer and
+    # candidate pool) depends only on the frozen retrieval model and the fixed eval
+    # set, so it's computed once and reused — the "done" flag is tracked on EVERY
+    # rank, not inferred from rank 0's returned ceiling (only rank 0 scores), or the
+    # non-main ranks would keep encoding true targets forever.
+    eval_state = {"ceiling": None, "done": False, "seconds": 0.0}
+
+    def run_eval(step_id: int) -> None:
+        if not eval_idx:
+            return
+        barrier()
+        t_ev = time.time()
+        rng = _rng_snapshot(device)
+        torch.manual_seed(args.eval_seed + env.rank)
+        try:
+            metrics, ceiling = roundtrip_eval_inloop(
+                core, dtok, adapters, retrieval, pairs, eval_idx, prompt, pad_id,
+                enc_src, src_proj, enc_tgt, tgt_proj, get_src, get_tgt, empty_tgt,
+                direction, meta["memory_map"], cfg.model.embed_dim, args, env, device,
+                need_ceiling=not eval_state["done"])
+        finally:
+            _rng_restore(device, rng)
+        if ceiling is not None:
+            eval_state["ceiling"] = ceiling
+        eval_state["done"] = True
+        dt = time.time() - t_ev
+        eval_state["seconds"] += dt
+        if env.is_main:
+            g2s, s2g = metrics["gen2src"], metrics["src2gen"]
+            ceil = eval_state["ceiling"] or {}
+            print(f"[rl][rt] step={step_id} n={metrics['n']} "
+                  f"gen->src R@1={g2s['R@1']:.4f} R@10={g2s['R@10']:.4f} "
+                  f"mAP={g2s['mAP']:.4f} medrank={g2s['median_rank']:.0f} | "
+                  f"src->gen R@1={s2g['R@1']:.4f} mAP={s2g['mAP']:.4f} | "
+                  f"ceiling R@1={ceil.get('R@1', float('nan')):.4f} "
+                  f"mAP={ceil.get('mAP', float('nan')):.4f} | {dt:.1f}s", flush=True)
+            with open(ckpt_dir / "rl_roundtrip.jsonl", "a") as f:
+                f.write(json.dumps({"step": step_id, "seconds": round(dt, 2),
+                                    "ceiling": eval_state["ceiling"], **metrics}) + "\n")
+        barrier()
+
     # =====================================================================
     # RL loop
     # =====================================================================
+    if args.eval_at_start:
+        run_eval(start_step)
     t0 = time.time()
+    eval_state["seconds"] = 0.0     # s/step below is reported EXCLUDING eval time
     for step in range(start_step, args.steps):
         frac = cosine_warmup_factor(step, args.steps, warmup)
         for grp in optim.param_groups:
@@ -489,11 +722,18 @@ def main() -> None:
                   f"reward={reward.mean().item():.4f} (max {reward.max().item():.4f}) "
                   f"adv|={adv.abs().mean().item():.3f} kl={kl_val.item():.4f} "
                   f"ent={ent_val.item():.3f} genlen={gen_len:.0f} empty={n_empty}/{B*G} "
-                  f"pg={pg_loss.item():.4f} {(time.time()-t0)/(step-start_step+1):.1f}s/step", flush=True)
+                  f"pg={pg_loss.item():.4f} "
+                  f"{(time.time()-t0-eval_state['seconds'])/(step-start_step+1):.1f}s/step",
+                  flush=True)
 
         if (step + 1) % args.save_every == 0:
             save(step + 1)
             barrier()
+
+        # After the save, so each checkpoint on disk has a matching metric line.
+        if args.eval_every > 0 and ((step + 1) % args.eval_every == 0
+                                    or step + 1 == args.steps):
+            run_eval(step + 1)
 
     save(args.steps)
     barrier()

@@ -18,7 +18,7 @@ generates+encodes a contiguous slice and writes a shard; rank 0 merges, scores
 the full NxN FILIP matrix, and writes outputs.
 
 Outputs (under --out-dir, default eval/<direction>/):
-  roundtrip_metrics.json     R@K (both directions) + ceiling + config
+  roundtrip_metrics.json     R@K + mAP (both directions) + ceiling + config
   roundtrip_pairs.tsv        id, rank, score, lengths, true & generated output
   roundtrip_sequences.fasta  protein targets only (text2protein): >{id}|true and
                              >{id}|generated, cleaned to A-Z, ready for a folding
@@ -61,6 +61,7 @@ from src.encoders import (
     encode_protein_batch, encode_text_batch,
     load_protein_encoder, load_text_encoder,
 )
+from src.evaluate import average_precision
 from src.losses import filip_score_matrix_chunked, masked_mean
 from src.model import MiniEmbedFilip
 
@@ -318,8 +319,8 @@ def _pad_stack(seqs, dim):
     return out, mask
 
 
-def _recall(S: torch.Tensor, groups: torch.Tensor, ks):
-    """Accession-grouped retrieval recall.
+def grouped_recall(S: torch.Tensor, groups: torch.Tensor, ks):
+    """Accession-grouped retrieval recall + mAP.
 
     S [Nq, Nc] with query i and candidate i index-aligned. `groups` [N] holds
     each row's accession id; EVERY candidate sharing the query's accession is a
@@ -328,6 +329,11 @@ def _recall(S: torch.Tensor, groups: torch.Tensor, ks):
     protein must count as a hit, not a miss (and duplicate proteins on the
     protein2text source side likewise). Reports the rank of the best-scoring
     positive. When every accession is unique this reduces to diagonal recall.
+
+    mAP reuses `src.evaluate.average_precision` — the same ProTrek AP definition
+    retrieval training reports — over the same multi-positive relevance set used
+    for R@K here, so round-trip mAP is directly comparable to the retrieval
+    model's own mAP (and to the ceiling row below).
     """
     n = S.size(0)
     same = groups[:, None] == groups[None, :]                  # [Nq, Nc] positives
@@ -336,6 +342,7 @@ def _recall(S: torch.Tensor, groups: torch.Tensor, ks):
     # rank = 1 + (# non-positive candidates strictly outscoring the best positive)
     ranks = ((S > best_pos[:, None]) & (~same)).sum(dim=1) + 1
     out = {f"R@{k}": (ranks <= k).float().mean().item() for k in ks if k <= n}
+    out["mAP"] = average_precision(S, same).mean().item()
     out["median_rank"] = float(ranks.median().item())
     out["mean_pos_score"] = float(best_pos.mean().item())
     return out, ranks
@@ -368,14 +375,14 @@ def score_and_write(args, device) -> None:
     S = filip_score_matrix_chunked(Z_gen, Z_src, mask_gen, mask_src,
                                    chunk_rows=args.filip_chunk_rows)
     ks = [1, 5, 10]
-    gen2src, ranks_g = _recall(S, groups, ks)              # generated target -> its source
-    src2gen, _ = _recall(S.t().contiguous(), groups, ks)   # source -> its generated target
+    gen2src, ranks_g = grouped_recall(S, groups, ks)              # generated target -> its source
+    src2gen, _ = grouped_recall(S.t().contiguous(), groups, ks)   # source -> its generated target
 
     # Ceiling: true targets -> sources, same scorer/candidate set.
     Z_true, mask_true = _pad_stack([r["z_true"] for r in recs], embed_dim)
     S_true = filip_score_matrix_chunked(Z_true.to(device), Z_src, mask_true.to(device),
                                         mask_src, chunk_rows=args.filip_chunk_rows)
-    ceiling, _ = _recall(S_true, groups, ks)
+    ceiling, _ = grouped_recall(S_true, groups, ks)
 
     tgt = "protein" if _target_is_protein(args.direction) else "text"
     src = "text" if _target_is_protein(args.direction) else "protein"
