@@ -20,6 +20,28 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 : "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
 : "${INIT_CKPT:?set -v INIT_CKPT=path/to/sft/text2protein/epochNN.pt (cleanest-LM ckpt)}"
 
+# Rollout budget. 256 capped rollouts BELOW the median SwissProt protein (~330
+# residues), which broke the reward: the FILIP score compares a truncated rollout
+# against the WHOLE caption, so caption tokens describing anything past residue
+# 256 could only be satisfied by cramming that content into the visible window.
+# For a two-domain prompt that rewards chimeras over correct domain order. 1024
+# covers essentially the whole corpus, so the reward scores a finished protein.
+#
+# Overridable from qsub (-v PPR=...): at 1024 the policy's forward-with-grad over
+# B*G sequences is 4x the 256 footprint and train_rl has no gradient
+# checkpointing. Sized for ProtGPT3-112M; for the 1.3B decoder (~4x per-token
+# activations) drop PPR first — keep --group-size 8, since group-relative
+# advantage degrades fast with a small group.
+MAXNEW=${MAXNEW:-1024}
+PPR=${PPR:-8}
+# Length band on the reward, OFF by default. The SFT-side fixes (no synthetic EOS
+# on truncated targets, 1024 cap, bidirectional factorization) are expected to fix
+# the length distribution on their own; this is the fallback if they don't. Size
+# it against the rstd printed in the step log — lambda ~ 4.5*rstd makes a 2x
+# length error cost about one group-std. Watch lenratio (median L_gen/L_true; 1.0
+# is on target) before reaching for it.
+LEN_LAMBDA=${LEN_LAMBDA:-0.0}
+
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
 # RL rollouts are embarrassingly parallel: each rank draws its own prompts, so the
@@ -56,13 +78,24 @@ slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 # upcast to fp32 for stable updates). max-new-tokens 256 fits protein targets;
 # B=8 prompts x G=8 group = 64 rollouts/rank (halve --prompts-per-rank if OOM,
 # since the policy is fp32 and a fp32 KL reference is also resident).
+# --resume auto continues from the latest checkpoint in the output dir (fresh
+# start on the first run), so re-queuing this job after a wall-time kill picks up
+# where it left off. --steps is the TOTAL budget; INIT_CKPT stays the fixed KL
+# anchor across restarts.
+# --eval-every 200 runs the held-out round-trip metric (fixed 1000 val rows,
+# sharded across ranks) alongside each checkpoint -> checkpoints/.../rl_roundtrip.jsonl.
+# The reward alone can't distinguish real conditioning from drift toward one
+# generic high-scoring output; the pooled R@K/mAP can. ~1 rollout of extra
+# generation per eval, so <1% of wall time at this cadence.
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${INIT_CKPT}" --device xpu \
-    --steps 2000 --prompts-per-rank 8 --group-size 8 \
-    --max-new-tokens 256 --temperature 1.0 --top-p 0.95 \
+    --resume auto --steps 2000 --prompts-per-rank "${PPR}" --group-size 8 \
+    --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
     --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 \
-    --log-every 10 --save-every 200
+    --length-lambda "${LEN_LAMBDA}" --length-tolerance 0.25 \
+    --log-every 10 --save-every 200 \
+    --eval-every 200 --eval-samples 1000 --eval-max-new-tokens "${MAXNEW}"
 
 rc=$?
 if [ $rc -eq 0 ]; then
