@@ -15,8 +15,8 @@ Trained things:
    A small auxiliary reconstruction term trains them during retrieval; an optional
    **expansion-only reconstruction phase** then sharpens them further at zero
    retrieval cost (see `src/train_reconstruction`).
-3. **Decoder cross-attention adapters** (text→protein direction: Dayhoff-3b-UR90,
-   a Jamba hybrid Mamba/attention MoE; protein→text direction: BioGPT). Trained
+3. **Decoder cross-attention adapters** (text→protein direction: ProtGPT3-112M-dpo,
+   a Mixtral sparse MoE; protein→text direction: BioGPT). Trained
    per direction, independently. Injection is architecture-dispatched, so a
    direction can be re-pointed at a different decoder by changing its path.
 4. **Decoder LoRA on existing self-attn/FFN** (small, also per direction).
@@ -53,7 +53,7 @@ You also need four pretrained models on disk. Default paths in `config.py`:
 |---|---|---|
 | text encoder | BioLinkBERT-base | `/Users/bryan/Documents/models/BioLinkBERT-base` |
 | protein encoder | SaAMPLIFY-120M | `/Users/bryan/Documents/models/SaAMPLIFY_120M` |
-| protein decoder (text→protein) | Dayhoff-3b-UR90 (Jamba) | `/Users/bryan/Documents/models/Dayhoff-3b-UR90` |
+| protein decoder (text→protein) | ProtGPT3-112M-dpo (Mixtral MoE) | `/Users/bryan/Documents/models/ProtGPT3-112M-dpo` |
 | text decoder (protein→text) | BioGPT | `/Users/bryan/Documents/models/biogpt` |
 
 These defaults are the dev-machine layout but are **environment-overridable**, so
@@ -98,7 +98,7 @@ python -m src.train_retrieval --use-cache --device cuda
 python -m src.train_reconstruction \
     --ckpt checkpoints/retrieval/epochNN.pt --device cuda
 
-# 3a) Generation training: text → protein (Dayhoff-3b by default).
+# 3a) Generation training: text → protein (ProtGPT3-112M-dpo by default).
 #     Add --use-cvae to also train the conditional-VAE latent.
 python -m src.train_generation --direction text2protein \
     --retrieval-ckpt checkpoints/reconstruction/epochNN.pt --device cuda
@@ -137,10 +137,9 @@ python -m src.train_retrieval --use-cache --batch-size 32 \
 python -m src.train_reconstruction --ckpt checkpoints/retrieval/epoch02.pt \
     --subset-size 512 --batch-size 32 --epochs 2 --device cpu
 
-# Generation. The default text2protein decoder is Dayhoff-3b (a 3B Jamba MoE,
-# impractical on CPU); point the direction at a small decoder for the smoke test.
+# Generation. The default text2protein decoder (ProtGPT3-112M-dpo) is small
+# enough to smoke-test on CPU; FILIP_PROTEIN_DECODER points it elsewhere.
 # --subset-size must match the cache so the by-accession split lines up.
-FILIP_PROTEIN_DECODER=/path/to/progen2-small \
 python -m src.train_generation --direction text2protein \
     --retrieval-ckpt checkpoints/reconstruction/epoch01.pt \
     --subset-size 512 --batch-size 4 --epochs 1 --device cpu --use-cvae
@@ -456,7 +455,7 @@ Also in the full dict: `mean_intra_p_token_cos`, `mean_intra_t_token_cos`
 | field | meaning |
 |---|---|
 | `ce` | cross-entropy on the target sequence, teacher-forced |
-| `ppl` | `exp(ce)`; perplexity. Random baseline = vocab size (≈32 for ProGen2/Dayhoff char vocab, 42384 for BioGPT) |
+| `ppl` | `exp(ce)`; perplexity. Random baseline = vocab size (31 for ProtGPT3's char vocab, ≈32 for ProGen2/Dayhoff, 42384 for BioGPT) |
 | `kl` | (CVAE only) KL(posterior‖prior), floored at `cvae_free_bits × cvae_d_w` |
 | `beta` | (CVAE only) current KL weight, warming 0 → `cvae_beta_max` |
 
@@ -536,7 +535,37 @@ hits if the decoder tokenizer ships without one. The generation collator
 sets `pad_token = eos_token` for ProGen2 already; if you swap decoders,
 verify the collator still handles the new tokenizer.
 
-**Dayhoff-3b / Jamba decoder notes.** It is a hybrid Mamba/attention MoE, so
+**ProtGPT3 (Mixtral) decoder notes.** `ProtGPT3-112M-dpo` is the default
+text→protein decoder: an 8-layer Mixtral sparse MoE (hidden 512, 8 experts,
+top-2 routing) with a char-level `WordLevel` vocab of 31. Three quirks the code
+handles for you, all in `src/decoder_adapters.py`:
+
+- **Direction marker.** ProtGPT3 was pretrained with a control token immediately
+  after BOS — `"1"` for N-to-C, `"2"` for C-to-N. It is an *ordinary* vocab
+  token, not a special token, so nothing adds it automatically. `target_prefix_ids`
+  supplies it, and every target is built as `[BOS] "1" …residues… [EOS]`; the
+  same prompt seeds `generate()` in both `src/generate.py` and
+  `src/roundtrip_eval.py`. Omit it and the decoder is off-distribution from
+  token 0.
+- **Decoding.** The `WordLevel` tokenizer decodes to *space-separated* residues
+  (`"1 M K T"`), and `skip_special_tokens` doesn't drop the marker. `decode_target`
+  reverses both, so candidates come back as bare sequences that feed straight
+  back into the protein encoder for round-trip scoring.
+- **Vocab mismatch.** The tokenizer carries three added tokens at ids 31–33
+  (`<s>`, `</s>`, `<unk>`) that sit *outside* the model's 31-row embedding table,
+  so `tokenizer.unk_token_id` is an out-of-range id. Encoding never emits them
+  (the WordLevel fallback is `[UNK]` = 3), but don't call
+  `resize_token_embeddings(len(tokenizer))` and don't feed `unk_token_id` to the
+  model.
+
+Adapters are injected via forward hooks (the layer returns a bare hidden-state
+tensor). LoRA covers self-attention q/k/v/o only: the MoE feed-forward stores its
+experts as fused Parameter tensors (`experts.gate_up_proj`, `experts.down_proj`),
+not `nn.Linear`, so there is nothing to wrap — those and the router stay frozen.
+At `--cross-attn-every 1` on all 8 layers the trainable set is ~11M params.
+
+**Dayhoff-3b / Jamba decoder notes.** (Still supported; set
+`FILIP_PROTEIN_DECODER` to a Dayhoff checkpoint.) It is a hybrid Mamba/attention MoE, so
 the text→protein adapters are injected via forward hooks (not module
 replacement) to preserve Jamba's per-layer `isinstance` mask routing. It loads
 with `use_mamba_kernels=False` (the fused mamba-ssm/causal-conv1d CUDA kernels
@@ -589,13 +618,14 @@ Trainable parameter counts:
 |---|---|
 | retrieval (projection + expansion heads + temperature) | ~2.0M |
 | reconstruction (expansion heads only, refines existing weights) | ~1.0M |
-| generation text→protein (ProGen2-class cross-attn @ every-2 + LoRA) | ~25M |
+| generation text→protein (ProtGPT3 cross-attn @ every-1 + LoRA) | ~11M |
 | generation protein→text (BioGPT cross-attn @ every-2 + LoRA) | ~48M |
 | CVAE heads, per direction (optional, `--use-cvae`) | ~0.2M |
 
-The text→protein figure is for a ProGen2-class decoder (what training run 1
-used); the shipped default decoder is the larger Dayhoff-3b Jamba MoE, whose
-cross-attention adapters scale with its hidden size and layer count.
+The text→protein figure is for the shipped default decoder, ProtGPT3-112M-dpo,
+with an adapter on every one of its 8 layers; adapter cost scales with the
+decoder's hidden size and layer count, so a larger decoder (ProGen2-class ≈25M
+@ every-2, Dayhoff-3b more still) moves it.
 Reconstruction trains the same expansion-head tensors as retrieval (no new
 parameters); the CVAE heads are tiny relative to the adapters.
 

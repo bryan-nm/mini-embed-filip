@@ -332,6 +332,20 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
+    # ---- length band on the reward (see the rollout loop for the rationale) ----
+    ap.add_argument("--length-lambda", type=float, default=0.0,
+                    help="weight on the two-sided length penalty (0 = off, reward is pure "
+                         "FILIP). Only within-group spread survives GRPO's standardizer, so "
+                         "size this against the logged rstd (within-group std of the FILIP "
+                         "reward): lambda ~ 4.5*rstd makes a 2x length error cost about one "
+                         "group-std at the default tolerance. Turn it up only if the length "
+                         "distribution is still wrong once the SFT-side fixes are in")
+    ap.add_argument("--length-tolerance", type=float, default=0.25,
+                    help="dead zone: no penalty while L_gen is in "
+                         "[L_true/(1+t), L_true*(1+t)] — log-symmetric, so 2x and 0.5x cost "
+                         "the same. A caption constrains domain composition, not exact "
+                         "length, so the band must be wide enough not to punish legitimate "
+                         "variation")
     ap.add_argument("--lr", type=float, default=1e-5, help="adapter/head LR")
     ap.add_argument("--unfreeze-lr", type=float, default=None,
                     help="separate LR for the (SFT-)unfrozen decoder blocks; defaults to --lr")
@@ -581,7 +595,12 @@ def main() -> None:
         payload = {"step": step, "adapter_state": adapter_state,
                    "optimizer_state": optim.state_dict(),
                    "rl": True, "direction": direction, "init_ckpt": args.init_ckpt,
-                   "kl_coef": args.kl_coef, "lr": args.lr, **meta}
+                   "kl_coef": args.kl_coef, "lr": args.lr,
+                   # Rollout budget + reward shaping this policy was trained under:
+                   # a checkpoint's length behaviour is only interpretable against them.
+                   "rl_max_new_tokens": args.max_new_tokens,
+                   "length_lambda": args.length_lambda,
+                   "length_tolerance": args.length_tolerance, **meta}
         path = ckpt_dir / f"step{step:06d}.pt"
         torch.save(payload, path)
         print(f"[rl][ckpt] saved {path}", flush=True)
@@ -673,8 +692,39 @@ def main() -> None:
             z_gen = tgt_proj(h_gen.float())                      # [B*G, Lp, D]
             z_src_g = z_src.repeat_interleave(G, dim=0)
             mask_src_g = mask_src.repeat_interleave(G, dim=0)
-            reward = filip_per_pair(z_gen, z_src_g, mask_gen, mask_src_g)   # [B*G]
-            # Group-relative advantage (per caption).
+            filip_r = filip_per_pair(z_gen, z_src_g, mask_gen, mask_src_g)  # [B*G]
+
+            # ---- two-sided length band (off at --length-lambda 0) ----
+            # FILIP is not monotone in length, but it does leave one exploitable
+            # channel: s_t2p is a max over protein positions, so DUPLICATING an
+            # already-well-matching region is nearly free (the copy adds no new
+            # per-position maxima to dilute s_p2t, and can only raise s_t2p).
+            #
+            # A one-sided correction can't fix that: score/L and score - lambda*L
+            # are both monotone, so their optimum sits at zero or at the cap. This
+            # penalizes |log(L_gen/L_true)| only OUTSIDE a +/-tolerance dead zone,
+            # quadratically, so the optimum IS the band. The dead zone matters
+            # because a caption fixes domain composition, not length — several
+            # lengths are legitimately correct, and a hard target would train the
+            # model to guess one reference protein's exact length.
+            #
+            # L_true is privileged training signal (unavailable at inference); what
+            # the policy internalizes is "caption => approximate length". Lengths
+            # are string lengths: residues for text2protein, characters for
+            # protein2text, and only their ratio enters.
+            len_gen = torch.tensor([max(len(s), 1) for s in gen_strs],
+                                   device=device, dtype=torch.float32)
+            len_true = torch.tensor(
+                [max(len(get_tgt(pairs[i])), 1) for i in prompt_idx],
+                device=device, dtype=torch.float32).repeat_interleave(G)
+            len_log_ratio = torch.log(len_gen / len_true)            # [B*G]
+            len_pen = (len_log_ratio.abs()
+                       - math.log(1.0 + args.length_tolerance)).clamp_min(0.0) ** 2
+            reward = filip_r - args.length_lambda * len_pen
+
+            # Group-relative advantage (per caption). Note a per-prompt constant is
+            # invisible here — only WITHIN-group spread survives standardization,
+            # which is what sizes --length-lambda (see its help text).
             r = reward.view(B, G)
             adv = (r - r.mean(dim=1, keepdim=True)) / (r.std(dim=1, keepdim=True) + args.adv_eps)
             adv = adv.reshape(B * G)                             # [B*G]
@@ -718,8 +768,14 @@ def main() -> None:
 
         if env.is_main and (step % args.log_every == 0 or step == args.steps - 1):
             gen_len = gen_valid.sum(1).float().mean().item()
+            # rstd is the within-group std of the FILIP reward — the scale GRPO
+            # actually sees, and what --length-lambda should be sized against.
+            rstd = filip_r.view(B, G).std(dim=1).mean().item()
+            len_ratio = (len_gen / len_true).median().item()
             print(f"[rl] step={step}/{args.steps} lr={optim.param_groups[0]['lr']:.2e} "
                   f"reward={reward.mean().item():.4f} (max {reward.max().item():.4f}) "
+                  f"filip={filip_r.mean().item():.4f} rstd={rstd:.4f} "
+                  f"lenratio={len_ratio:.2f} lenpen={len_pen.mean().item():.4f} "
                   f"adv|={adv.abs().mean().item():.3f} kl={kl_val.item():.4f} "
                   f"ent={ent_val.item():.3f} genlen={gen_len:.0f} empty={n_empty}/{B*G} "
                   f"pg={pg_loss.item():.4f} "

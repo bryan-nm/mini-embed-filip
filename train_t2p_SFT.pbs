@@ -1,0 +1,104 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_t2p_sft
+#PBS -l walltime=16:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m abe
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+# ---------------------------------------------------------------------------
+# text -> protein SFT. Split from the old shared train_generation.pbs: the two
+# directions no longer want the same regimen (target length, direction
+# augmentation, and adapter density all differ), and forcing them through one
+# file made every asymmetry look like an accident. See train_p2t_SFT.pbs.
+#
+# What is specific to THIS direction:
+#   --max-target-tokens 1024   proteins, not captions. 512 truncated ~a quarter
+#                              of SwissProt; at 1024 essentially everything fits,
+#                              so termination is learned across the whole length
+#                              distribution instead of only from short proteins.
+#   --direction-augment        ProtGPT3 is the only decoder with a C-to-N marker.
+#                              Each target is factorized N-to-C or C-to-N by coin
+#                              flip, so the C-terminus of a long protein is seen
+#                              even when the N-terminal window is what got cut.
+#   CAE=1                      cross-attn on every one of the 8 layers; cheap on
+#                              a 112M MoE and gives conditioning many entry points.
+# ---------------------------------------------------------------------------
+
+: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+
+# Sizing knobs, overridable from the qsub environment (-v BS=...). Defaults are
+# tuned for ProtGPT3-112M (hidden 512, 8 layers). The 1.3B decoder is ~4x the
+# per-token activation cost (hidden 1024, 17 layers): drop BS and/or set
+# GRAD_CKPT=1 there rather than editing this file.
+BS=${BS:-32}
+CAE=${CAE:-1}
+MAX_TGT=${MAX_TGT:-1024}
+EPOCHS=${EPOCHS:-20}
+LR=${LR:-1.5e-4}
+GRAD_CKPT=${GRAD_CKPT:-0}
+
+NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+# Stated explicitly rather than left to the config default so the job fails
+# loudly if the decoder isn't staged.
+export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29502
+export OMP_NUM_THREADS=8
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+# Do the rank/KVS exchange over MPI (PMIx), NOT oneCCL's internal TCP KVS. The
+# internal KVS is a single rendezvous server on rank 0; at O(1000s) of ranks the
+# simultaneous connect storm overruns it ("Connection reset by peer" -> "pmi init
+# failed" -> SIGSEGV during the first collective). Fine at a few nodes, fatal at
+# scale. CCL_KVS_MODE=mpi routes the exchange through MPI instead; the timeout is
+# headroom for the bring-up on a busy fabric.
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+EXTRA=""
+[ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
+
+source ~/bin/slack_notify.sh
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+
+echo "t2p SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}"
+
+# --pmi=pmix is REQUIRED to match CCL_PROCESS_LAUNCHER=pmix: it tells PALS to
+# expose a PMIx server for CCL to bootstrap against. Without it, pmix is requested
+# but unavailable and CCL falls back to the internal KVS (see CCL_KVS_MODE above).
+#
+# The per-step log carries trunc=<n>/<batch>: rows whose target overflowed the cap
+# and therefore carry NO EOS. It should be near zero at 1024 — if it isn't, the
+# cap is still shaping the length distribution and wants raising.
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
+    python -m src.train_generation --direction text2protein \
+    --retrieval-ckpt "${RCKPT}" --device xpu \
+    --memory-space aligned --cross-attn-mode aligned \
+    --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
+    --max-target-tokens "${MAX_TGT}" --direction-augment \
+    --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100 ${EXTRA}
+
+rc=$?
+if [ $rc -eq 0 ]; then
+    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
+else
+    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
+fi
+exit $rc

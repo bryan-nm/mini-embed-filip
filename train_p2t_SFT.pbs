@@ -1,0 +1,94 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_p2t_sft
+#PBS -l walltime=16:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m abe
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+# ---------------------------------------------------------------------------
+# protein -> text SFT. Split from the old shared train_generation.pbs; see
+# train_t2p_SFT.pbs for the other half.
+#
+# What is specific to THIS direction — and why it does NOT inherit the t2p fixes:
+#   --max-target-tokens 512    the target is a caption, and the text encoder caps
+#                              at 512 tokens anyway (DataCfg.max_text_tokens), so
+#                              512 already covers the corpus. The truncation
+#                              problem that forced t2p to 1024 is a protein-length
+#                              problem; raising it here would buy nothing.
+#   no --direction-augment     BioGPT has no C-to-N marker. reverse_prefix_ids()
+#                              raises for a non-Mixtral decoder by design, so
+#                              passing the flag here fails the job rather than
+#                              silently training a directionless decoder on
+#                              reversed text. Reversed captions are meaningless
+#                              anyway — the augmentation is a protein trick.
+#   BS=8, CAE=2                BioGPT is 24 layers; cross-attn every other layer,
+#                              smaller batch.
+#
+# The EOS-on-truncation fix in make_collate applies to both directions: a caption
+# cut at the cap no longer gets a synthetic EOS. It is close to a no-op here
+# (few captions overflow) — the per-step trunc= counter will confirm that.
+# ---------------------------------------------------------------------------
+
+: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+
+# Sizing knobs, overridable from the qsub environment (-v BS=...).
+BS=${BS:-8}
+CAE=${CAE:-2}
+MAX_TGT=${MAX_TGT:-512}
+EPOCHS=${EPOCHS:-20}
+LR=${LR:-1.5e-4}
+GRAD_CKPT=${GRAD_CKPT:-0}
+
+NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+export FILIP_TEXT_DECODER=${FILIP_MODELS_DIR}/biogpt
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29503
+export OMP_NUM_THREADS=8
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+# Route the rank/KVS exchange over MPI (PMIx), not oneCCL's internal TCP KVS —
+# the internal single-rendezvous KVS overruns at O(1000s) of ranks. See
+# train_t2p_SFT.pbs for the full rationale.
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+EXTRA=""
+[ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
+
+source ~/bin/slack_notify.sh
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+
+echo "p2t SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}"
+
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
+    python -m src.train_generation --direction protein2text \
+    --retrieval-ckpt "${RCKPT}" --device xpu \
+    --memory-space aligned --cross-attn-mode aligned \
+    --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
+    --max-target-tokens "${MAX_TGT}" \
+    --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100 ${EXTRA}
+
+rc=$?
+if [ $rc -eq 0 ]; then
+    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
+else
+    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
+fi
+exit $rc

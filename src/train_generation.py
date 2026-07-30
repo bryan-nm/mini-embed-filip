@@ -241,6 +241,13 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
     # forward ("1" + residues) or reverse ("2" + reversed residues) with equal
     # probability. Same protein, same conditioning memory, opposite decode order;
     # decode_target re-reverses a "2" sequence back to N-to-C at inference.
+    #
+    # EOS is appended only to targets that FIT under body_cap (see collate). A
+    # truncated target did not end where we cut it, and appending EOS there would
+    # teach exactly that — every over-cap protein in the corpus lands on the same
+    # stop position, so the model learns a hard "sequences end at body_cap" mode
+    # rather than a length distribution. Truncated rows still supervise the
+    # residues they contain; they just never claim the sequence terminated.
     max_prefix = max(len(prefix_ids), len(rev_prefix_ids))
     body_cap = (max_target_tokens - max_prefix
                 - (1 if bos_id is not None else 0)
@@ -257,9 +264,11 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
             h_pad[i, :l] = b["h"]
             m_pad[i, :l] = b["m"]
 
-        # Tokenize bodies without specials, then wrap with [BOS] [prefix] ... [EOS].
+        # Tokenize bodies without specials, then wrap with [BOS] [prefix] ... [EOS]
+        # — EOS only when the body fit (see the note above body_cap).
         seqs = []
         body_spans = []          # (start, length) of the residue body within each row
+        n_trunc = 0
         for b in batch:
             target, pfx = b["target"], prefix_ids
             # Coin-flip C-to-N: reverse the residue string (char == token for the
@@ -267,12 +276,16 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
             # separate from the device dropout RNG.
             if augment and bool(torch.rand(()) < 0.5):
                 target, pfx = target[::-1], rev_prefix_ids
-            body = target_tokenizer(
-                target, add_special_tokens=False, truncation=True,
-                max_length=body_cap,
-            )["input_ids"]
+            # Tokenize uncapped so we can SEE the overflow, then cut by hand;
+            # tokenizer truncation would hide whether this target actually ended.
+            body = target_tokenizer(target, add_special_tokens=False)["input_ids"]
+            truncated = len(body) > body_cap
+            if truncated:
+                body = body[:body_cap]
+                n_trunc += 1
             head = ([bos_id] if bos_id is not None else []) + pfx
-            ids = head + body + ([eos_id] if eos_id is not None else [])
+            tail = [eos_id] if (eos_id is not None and not truncated) else []
+            ids = head + body + tail
             seqs.append(ids)
             body_spans.append((len(head), len(body)))
 
@@ -297,6 +310,11 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
         out = {
             "h": h_pad, "m": m_pad,
             "input_ids": input_ids, "attn_mask": attn_mask, "labels": labels,
+            # Rows whose target overflowed body_cap (and so carry no EOS). Logged
+            # as a rate during training: it is the direct read on whether
+            # --max-target-tokens covers the corpus, and how much of the batch is
+            # contributing no termination signal.
+            "n_truncated": torch.tensor(n_trunc, dtype=torch.long),
         }
 
         # Optional target-side per-token hidden states (CVAE posterior). Padded
@@ -1006,7 +1024,9 @@ def main() -> None:
                 with torch.no_grad():
                     ppl = torch.exp(ce).item()
                 msg = (f"[{args.direction}] epoch={epoch} step={it+1}/{len(train_loader)} "
-                       f"lr={lr:.2e} ce={ce.item():.4f} ppl={ppl:.2f}")
+                       f"lr={lr:.2e} ce={ce.item():.4f} ppl={ppl:.2f} "
+                       f"trunc={int(batch['n_truncated'])}/{input_ids.size(0)} "
+                       f"L={input_ids.size(1)}")
                 if cvae is not None:
                     msg += f" kl={kl.item():.4f} beta={beta:.3f}"
                 if gap is not None:
