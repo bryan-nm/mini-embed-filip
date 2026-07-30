@@ -38,11 +38,11 @@ IDS=protein_ids.txt                                           # one primary_Acce
 OUT=generated_out/generated_proteins.csv                      # accession, prompt, true protein, generated
 N=64                                                          # best-of-N candidates per output
 NUM_OUTPUTS=5                                                 # sequences kept per accession
-SELECTION=margin                                              # margin | pos
+SELECTION=pos                                                 # margin | pos
 PANEL=256                                                     # reference captions for the margin
 TEMP=1.0
 TOP_P=0.95
-MAX_NEW_TOKENS=256
+MAX_NEW_TOKENS=1024
 CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
 MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
 
