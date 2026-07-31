@@ -23,8 +23,8 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 : "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
 : "${INIT_CKPT:?set -v INIT_CKPT=path/to/sft/protein2text/epochNN.pt (the working ckpt)}"
 
-# Contrastive reward ON, length band OFF. The two are calibrated differently and
-# that is deliberate:
+# Contrastive reward and length band both ON, but calibrated from different
+# evidence — worth keeping straight when reading a run that goes wrong:
 #
 #   REWARD_CONTRASTIVE has no direction-specific constant to get wrong. Its only
 #   parameter is beta, and beta=1.0 is the best_of_n margin definition, which is
@@ -33,19 +33,21 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 #   the generations are as specific as the references; margin far below cmargin
 #   means they are generic. See train_t2p_rl.pbs for the full reasoning.
 #
-#   LEN_LAMBDA does have a direction-specific constant and it is UNMEASURED here.
-#   text2protein got 0.4 from rstd~0.09 (debug jobs 8722544/8722785) with the
-#   trigger condition confirmed by lenratio~1.7. Neither number transfers: p2t
-#   lengths are text CHARACTERS not residues, and the reward re-encodes captions
-#   not proteins, so rstd and lenratio are different quantities here. Leaving it
-#   at 0 costs nothing; guessing could actively distort caption length.
-#   To calibrate: read rstd and lenratio off this run's step log (--log-every 10
-#   already prints both), then apply LEN_LAMBDA ~ 4.5*rstd — and only if lenratio
-#   is actually off 1.0.
+#   LEN_LAMBDA is now measured for THIS direction (debug job 8723416, epoch-19
+#   p2t SFT policy, MAXNEW=128): rstd 0.056-0.091, so 4.5*rstd ~ 0.3. The trigger
+#   condition is met, but in the OPPOSITE direction from t2p — lenratio ran
+#   0.55-0.77, i.e. generated captions are ~30% too SHORT, where t2p generations
+#   were ~70% too long. The band is two-sided and log-symmetric, so the same
+#   penalty pushes captions longer here; nothing about the sign needs changing.
+#
+#   Caveat on the evidence: this is 5 steps of one job, versus t2p's two jobs at
+#   10 steps. lenratio was also drifting upward across those 5 steps (0.55 -> 0.77),
+#   which could be warmup rather than a stable level. Re-read rstd and lenratio
+#   from the first --log-every 10 lines of this run and adjust if they disagree.
 #
 # NOTE: the contrastive reward is on a different scale from the raw one, so reward
 # curves here are not comparable to earlier p2t runs. R@K/mAP still are.
-LEN_LAMBDA=${LEN_LAMBDA:-0.0}
+LEN_LAMBDA=${LEN_LAMBDA:-0.3}
 REWARD_CONTRASTIVE=${REWARD_CONTRASTIVE:-1}
 MARGIN_BETA=${MARGIN_BETA:-1.0}
 

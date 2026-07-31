@@ -1003,6 +1003,12 @@ def main() -> None:
     optim = torch.optim.AdamW(
         param_groups, lr=args.lr, weight_decay=cfg.generation.weight_decay,
     )
+    # Captured now, re-applied after any optimizer_state load. torch's
+    # load_state_dict REPLACES each param_group with the SAVED dict (splicing the
+    # live params back in), so a custom key the current code sets but an older
+    # checkpoint never wrote is silently dropped — and the LR schedule reads
+    # base_lr every step. See the re-injection in the --resume block.
+    base_lrs = [g["base_lr"] for g in param_groups]
     train_params = head_params + backbone_params   # for grad clipping below
     if env.is_main:
         msg = (f"[gen] optim: heads={sum(p.numel() for p in head_params):,} @ lr={args.lr:.2e}")
@@ -1272,6 +1278,15 @@ def main() -> None:
             print("[resume] checkpoint has cvae_state but --use-cvae not set; ignoring it")
         if "optimizer_state" in ckpt:
             optim.load_state_dict(ckpt["optimizer_state"])
+            # Restore base_lr, which load_state_dict just dropped for any
+            # checkpoint written before that key existed (KeyError 'base_lr' at
+            # the first LR update otherwise — hit on a p2t epoch-19 checkpoint,
+            # job 8723416, while newer t2p checkpoints happened to carry it).
+            # Re-injected from THIS invocation's --lr / --unfreeze-lr, so a resume
+            # with a different LR does what you'd expect rather than silently
+            # inheriting the old one.
+            for g, blr in zip(optim.param_groups, base_lrs):
+                g["base_lr"] = blr
         elif env.is_main:
             print("[resume] checkpoint has no optimizer_state; "
                   "optimizer restarts from scratch")

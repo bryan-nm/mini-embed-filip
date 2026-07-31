@@ -60,7 +60,11 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 : "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
 : "${SFT_CKPT:?set -v SFT_CKPT=path/to/generation/protein2text/epochNN.pt}"
 
-PHASES=${PHASES:-1234}
+# Default 123: phase 4 (raw control) already ran clean on job 8723416 —
+# rstd 0.056-0.091, lenratio 0.55-0.77, filip 0.84-0.89, ~7s/step, empty=0/64.
+# Its budget goes to phase 3, which is the first RL phase and pays the cold load
+# of the policy + KL reference + both encoders (that is what timed it out).
+PHASES=${PHASES:-123}
 SUBSET=${SUBSET:-2000}         # tiny train subset: these phases measure, not train
 VAL_SUBSET=${VAL_SUBSET:-128}
 # p2t sizing, mirroring train_p2t_SFT.pbs: BioGPT is 24 dense layers, cross-attn
@@ -229,7 +233,7 @@ run_phase 1 10 "p2t coverage baseline (measure only, lambda=0)" \
 # (No --grad-checkpointing: the trainer rejects it with the aux, since the
 # penalty would read last_attn from the no_grad pass and silently no-op.)
 # ---------------------------------------------------------------------------
-run_phase 2 10 "p2t coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
+run_phase 2 8 "p2t coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
     ${MPI} python -m src.train_generation ${COMMON_SFT} \
     --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
     --ckpt-dir "${OUT}/p2"
@@ -246,7 +250,7 @@ run_phase 2 10 "p2t coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
 #   lenratio median L_gen/L_true in CHARACTERS here. Only reach for the length
 #            band if this is actually off 1.0 (t2p's was ~1.7).
 # ---------------------------------------------------------------------------
-run_phase 3 15 "p2t RL contrastive (beta=${BETA}, ${RL_STEPS} steps)" \
+run_phase 3 30 "p2t RL contrastive (beta=${BETA}, ${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl ${COMMON_RL} \
     --reward-contrastive --reward-margin-beta "${BETA}" \
     --reward-filip-chunk-rows "${REW_CHUNK}" --log-margin-ceiling \
@@ -256,7 +260,7 @@ run_phase 3 15 "p2t RL contrastive (beta=${BETA}, ${RL_STEPS} steps)" \
 # PHASE 4 — raw-reward control, same steps and seed. The rstd comparison, and
 # the check on whether the margin term changed the reward landscape at all.
 # ---------------------------------------------------------------------------
-run_phase 4 13 "p2t RL raw reward control (${RL_STEPS} steps)" \
+run_phase 4 8 "p2t RL raw reward control (${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl ${COMMON_RL} --ckpt-dir "${OUT}/p4"
 
 echo ""

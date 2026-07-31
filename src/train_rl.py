@@ -572,13 +572,21 @@ def main() -> None:
     if backbone_params:
         param_groups.append({"params": backbone_params, "base_lr": backbone_lr, "lr": backbone_lr})
     optim = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=0.0)
+    base_lrs = [g["base_lr"] for g in param_groups]
     train_params = head_params + backbone_params
     warmup = max(int(args.warmup_frac * args.steps), 1)
     # Resume the AdamW moments so updates stay well-conditioned across restarts
-    # (the param-group structure is identical, since unfreeze matches). The custom
-    # base_lr keys survive state_dict; the loop overwrites lr each step regardless.
+    # (the param-group structure is identical, since unfreeze matches).
     if resume_ck is not None and "optimizer_state" in resume_ck:
         optim.load_state_dict(resume_ck["optimizer_state"])
+        # base_lr does NOT reliably survive load_state_dict, contrary to what this
+        # comment used to claim: torch replaces each param_group with the SAVED
+        # dict, so the key only survives if the checkpoint was written by code that
+        # already set it. A checkpoint predating it crashes at the first LR update
+        # (KeyError 'base_lr'), which is what train_generation hit on an old p2t
+        # checkpoint in job 8723416. Re-inject from this invocation's LRs.
+        for g, blr in zip(optim.param_groups, base_lrs):
+            g["base_lr"] = blr
 
     bos = dtok.bos_token_id if dtok.bos_token_id is not None else dtok.eos_token_id
     pad_id = dtok.pad_token_id if dtok.pad_token_id is not None else dtok.eos_token_id
