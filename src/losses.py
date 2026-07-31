@@ -90,6 +90,61 @@ def positive_pair_score(filip_matrix: torch.Tensor) -> torch.Tensor:
     return filip_matrix.diagonal().mean()
 
 
+def filip_paired_scores(
+    z_p: torch.Tensor,        # [B, L_p, D] L2-normalized per token
+    z_d: torch.Tensor,        # [B, K, L_d, D] K candidates *per anchor*
+    mask_p: torch.Tensor,     # [B, L_p] bool
+    mask_d: torch.Tensor,     # [B, K, L_d] bool
+    neg_inf: float = -1e4,
+) -> torch.Tensor:
+    """FILIP score of each anchor against its OWN K candidates -> [B, K].
+
+    Same score as `filip_score_matrix` — 0.5 * (p2t max-sim + t2p max-sim) over
+    valid tokens — but paired rather than all-pairs: anchor i is scored only
+    against candidates i,0..K-1. That is exactly what hard decoys need (a decoy is
+    a perturbation of one specific caption, meaningless against other proteins),
+    and it costs B*K pair scores instead of B*(B*K).
+
+    Keeping the arithmetic identical to `filip_score_matrix` matters: the decoy
+    loss compares these against positive-pair scores produced by that function,
+    so any divergence in masking or normalization would show up as a constant
+    bias between truth and decoy.
+    """
+    sim = torch.einsum("bld,bkmd->bklm", z_p, z_d)   # [B, K, L_p, L_d]
+
+    mp = mask_p[:, None, :, None]                    # [B, 1, L_p, 1]
+    md = mask_d[:, :, None, :]                       # [B, K, 1, L_d]
+    sim = sim.masked_fill(~mp, neg_inf)
+    sim = sim.masked_fill(~md, neg_inf)
+
+    # p -> d: best matching decoy token for each protein position
+    max_per_p = sim.max(dim=3).values                                  # [B, K, L_p]
+    max_per_p = max_per_p.masked_fill(~mp.squeeze(3), 0.0)
+    n_valid_p = mask_p.sum(dim=1).clamp_min(1).to(max_per_p.dtype)     # [B]
+    score_p2d = max_per_p.sum(dim=2) / n_valid_p[:, None]              # [B, K]
+
+    # d -> p: best matching protein position for each decoy token
+    max_per_d = sim.max(dim=2).values                                  # [B, K, L_d]
+    max_per_d = max_per_d.masked_fill(~md.squeeze(2), 0.0)
+    n_valid_d = mask_d.sum(dim=2).clamp_min(1).to(max_per_d.dtype)     # [B, K]
+    score_d2p = max_per_d.sum(dim=2) / n_valid_d                       # [B, K]
+
+    return 0.5 * (score_p2d + score_d2p)
+
+
+def filip_paired_scores_chunked(
+    z_p: torch.Tensor, z_d: torch.Tensor,
+    mask_p: torch.Tensor, mask_d: torch.Tensor,
+    chunk_rows: int = 16,
+) -> torch.Tensor:
+    """Chunked `filip_paired_scores`: bounds the [chunk, K, L_p, L_d] transient."""
+    rows = []
+    for s in range(0, z_p.size(0), chunk_rows):
+        e = min(s + chunk_rows, z_p.size(0))
+        rows.append(filip_paired_scores(z_p[s:e], z_d[s:e], mask_p[s:e], mask_d[s:e]))
+    return torch.cat(rows, dim=0)
+
+
 # Finite "−inf" for masked logits: well below scale*FILIP (|logit| <= ~100), and
 # safe across fp32/bf16/autocast (true -inf can poison reductions).
 _NEG_LOGIT = -1e4
@@ -183,6 +238,85 @@ def masked_mean(z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     summed = (z * valid).sum(dim=1)                 # [B, D]
     count = valid.sum(dim=1).clamp_min(1.0)         # [B, 1]
     return summed / count
+
+
+# ---------------------------------------------------------------------------
+# Hard-decoy discrimination (see src/decoys.py, src/train_hard_negatives.py)
+# ---------------------------------------------------------------------------
+def hard_decoy_loss(
+    z_p: torch.Tensor,              # [B, L_p, D] anchor proteins
+    mask_p: torch.Tensor,           # [B, L_p]
+    z_d: torch.Tensor,              # [B, K, L_d, D] this anchor's decoy captions
+    mask_d: torch.Tensor,           # [B, K, L_d]
+    decoy_valid: torch.Tensor,      # [B, K] bool; False = padded/absent decoy slot
+    pos_score: torch.Tensor,        # [B] FILIP score of the anchor's TRUE caption
+    logit_scale: torch.Tensor,
+    *,
+    margin: float = 0.0,
+    chunk_rows: int = 0,
+) -> dict:
+    """Rank each protein's true caption above its own field-swapped decoys.
+
+    A decoy differs from the truth in exactly one templated field, so this term
+    asks a question the in-batch InfoNCE never does: not "which caption in the
+    batch describes this protein" (answerable from overall topic) but "is *this*
+    field right for this protein". It is deliberately per-anchor — a decoy built
+    from caption i says nothing about protein j, so cross-anchor decoy columns
+    would just be ordinary easy negatives at K times the cost.
+
+    Only the protein->text direction exists here: the reverse would need decoy
+    *proteins*, which is a different (and much less well-posed) construction.
+
+    Two forms:
+      margin == 0  (K+1)-way softmax over [s_true, s_decoy_1..K] scaled by the
+                   shared temperature — an InfoNCE whose negatives are all hard.
+                   Note this term also trains `logit_scale`.
+      margin > 0   hinge on the raw FILIP gap, relu(margin - (s_true - s_decoy)),
+                   which stops pushing once the truth leads by `margin`. Because
+                   truth and decoy share almost every token their scores start
+                   within ~1e-2 of each other, and the hinge is the safer choice
+                   if the unbounded softmax form distorts the geometry (watch
+                   R@K while the ramp comes up).
+
+    Rows with no valid decoy contribute nothing and are excluded from the mean,
+    so a batch of sparse captions cannot silently deflate the loss.
+    """
+    if chunk_rows > 0:
+        s_dec = filip_paired_scores_chunked(z_p, z_d, mask_p, mask_d, chunk_rows)
+    else:
+        s_dec = filip_paired_scores(z_p, z_d, mask_p, mask_d)          # [B, K]
+
+    row_ok = decoy_valid.any(dim=1)                                    # [B]
+    n_rows = row_ok.sum().clamp_min(1).to(s_dec.dtype)
+
+    if margin > 0.0:
+        gap = pos_score[:, None] - s_dec                               # [B, K]
+        hinge = F.relu(margin - gap) * decoy_valid.to(s_dec.dtype)
+        l_decoy = hinge.sum() / decoy_valid.sum().clamp_min(1).to(s_dec.dtype)
+    else:
+        scale = logit_scale.exp()
+        logits = scale * torch.cat([pos_score[:, None], s_dec], dim=1)  # [B, 1+K]
+        keep = torch.cat([torch.ones_like(row_ok)[:, None], decoy_valid], dim=1)
+        logits = logits.masked_fill(~keep, _NEG_LOGIT)
+        target = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        per_row = F.cross_entropy(logits, target, reduction="none")     # [B]
+        l_decoy = (per_row * row_ok.to(per_row.dtype)).sum() / n_rows
+
+    with torch.no_grad():
+        # Hardest decoy per anchor: the one the model is closest to preferring.
+        worst = s_dec.masked_fill(~decoy_valid, -1e4).max(dim=1).values  # [B]
+        ok = row_ok.to(s_dec.dtype)
+        decoy_acc = ((pos_score > worst).to(s_dec.dtype) * ok).sum() / n_rows
+        decoy_margin = ((pos_score - worst) * ok).sum() / n_rows
+        decoy_score = (worst * ok).sum() / n_rows
+
+    return {
+        "decoy": l_decoy,
+        "decoy_acc": decoy_acc,
+        "decoy_margin": decoy_margin,
+        "decoy_score": decoy_score,
+        "decoy_rows": row_ok.sum(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +440,11 @@ def phase_r2_loss_grouped(
     # Kept OUTSIDE no_grad so align_aux_weight * l_align actually backprops —
     # matching phase_r2_loss's diagonal filip_pos. (Under no_grad this term was a
     # silent no-op in the distributed path.)
-    filip_pos = mat_p2t.gather(1, target[:, None]).mean()
+    # The per-anchor vector is returned as well: the hard-decoy loss needs each
+    # anchor's true-caption score, and recomputing it would repeat a full FILIP
+    # pass over the positives.
+    filip_pos_vec = mat_p2t.gather(1, target[:, None]).squeeze(1)   # [B]
+    filip_pos = filip_pos_vec.mean()
     l_align = 1.0 - filip_pos
     l_recon = 0.5 * (
         reconstruction_loss(h_p_hat, h_p, mask_p)
@@ -335,6 +473,7 @@ def phase_r2_loss_grouped(
         "nce": l_nce,
         "acc": acc,
         "filip_pos": filip_pos,
+        "filip_pos_vec": filip_pos_vec,
     }
 
 

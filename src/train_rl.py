@@ -62,7 +62,6 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
-from src.best_of_n import pad_stack
 from src.data import dense_group_ids, group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
     LoRACfg, clear_cross_memory, count_trainable, decode_target,
@@ -74,7 +73,9 @@ from src.encoders import (
     encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
 )
 from src.losses import filip_score_matrix_chunked
-from src.roundtrip_eval import grouped_recall, load_retrieval
+from src.roundtrip_eval import (
+    load_retrieval, rng_restore, rng_snapshot, score_roundtrip_records,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,35 +177,6 @@ def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
 # ---------------------------------------------------------------------------
 # In-loop round-trip eval — the held-out version of the training reward
 # ---------------------------------------------------------------------------
-def _rng_snapshot(device):
-    """Save CPU + accelerator RNG so the eval's sampling doesn't perturb the
-    rollout stream. Without this, turning the eval on (or changing --eval-every)
-    silently shifts every subsequent rollout, making runs non-reproducible."""
-    dev_state = None
-    try:
-        if device.type == "xpu":
-            dev_state = torch.xpu.get_rng_state(device)
-        elif device.type == "cuda":
-            dev_state = torch.cuda.get_rng_state(device)
-    except Exception:
-        dev_state = None
-    return torch.get_rng_state(), dev_state
-
-
-def _rng_restore(device, state) -> None:
-    cpu_state, dev_state = state
-    torch.set_rng_state(cpu_state)
-    if dev_state is None:
-        return
-    try:
-        if device.type == "xpu":
-            torch.xpu.set_rng_state(dev_state, device)
-        elif device.type == "cuda":
-            torch.cuda.set_rng_state(dev_state, device)
-    except Exception:
-        pass
-
-
 @torch.no_grad()
 def roundtrip_eval_inloop(core, dtok, adapters, retrieval, pairs, eval_idx, prompt,
                           pad_id, enc_src, src_proj, enc_tgt, tgt_proj, get_src,
@@ -277,28 +249,11 @@ def roundtrip_eval_inloop(core, dtok, adapters, retrieval, pairs, eval_idx, prom
     if not env.is_main:
         return None, None
 
-    # Accession ids align rows/cols of every matrix below (a protein carries ~8.87
-    # captions, so sibling rows must count as positives, not distractors).
-    groups = torch.as_tensor(
-        group_ids_from_accessions([r["uid"] for r in recs]), device=device)
-    Z_src, m_src = pad_stack([r["z_src"].float() for r in recs], embed_dim, device)
-    Z_gen, m_gen = pad_stack([r["z_gen"].float() for r in recs], embed_dim, device)
-
-    S = filip_score_matrix_chunked(Z_gen, Z_src, m_gen, m_src,
-                                   chunk_rows=args.eval_filip_chunk_rows)
-    gen2src, _ = grouped_recall(S, groups, ks)             # generated target -> its source
-    src2gen, _ = grouped_recall(S.t().contiguous(), groups, ks)
-    del S
-
-    ceiling = None
-    if need_ceiling:
-        Z_true, m_true = pad_stack([r["z_true"].float() for r in recs], embed_dim, device)
-        S_true = filip_score_matrix_chunked(Z_true, Z_src, m_true, m_src,
-                                            chunk_rows=args.eval_filip_chunk_rows)
-        ceiling, _ = grouped_recall(S_true, groups, ks)
-        del S_true
-
-    return {"n": len(recs), "gen2src": gen2src, "src2gen": src2gen}, ceiling
+    # Scoring is shared with the offline tool and the SFT trainer (accession ids
+    # align rows/cols, so a protein's sibling captions count as positives).
+    return score_roundtrip_records(
+        recs, embed_dim, device, chunk_rows=args.eval_filip_chunk_rows,
+        ks=ks, need_ceiling=need_ceiling)
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +594,7 @@ def main() -> None:
             return
         barrier()
         t_ev = time.time()
-        rng = _rng_snapshot(device)
+        rng = rng_snapshot(device)
         torch.manual_seed(args.eval_seed + env.rank)
         try:
             metrics, ceiling = roundtrip_eval_inloop(
@@ -648,7 +603,7 @@ def main() -> None:
                 direction, meta["memory_map"], cfg.model.embed_dim, args, env, device,
                 need_ceiling=not eval_state["done"])
         finally:
-            _rng_restore(device, rng)
+            rng_restore(device, rng)
         if ceiling is not None:
             eval_state["ceiling"] = ceiling
         eval_state["done"] = True

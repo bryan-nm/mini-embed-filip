@@ -45,6 +45,12 @@ MAX_TGT=${MAX_TGT:-1024}
 EPOCHS=${EPOCHS:-20}
 LR=${LR:-1.5e-4}
 GRAD_CKPT=${GRAD_CKPT:-0}
+# Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart to
+# val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank here and
+# costs one generate + one N x N FILIP per epoch. RT_MAX_NEW is the real cost knob
+# (wall time is linear in it); RT_SAMPLES=0 turns the eval off.
+RT_SAMPLES=${RT_SAMPLES:-512}
+RT_MAX_NEW=${RT_MAX_NEW:-${MAX_TGT}}
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -74,11 +80,17 @@ export CCL_ZE_IPC_EXCHANGE=pidfd
 
 EXTRA=""
 [ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
+if [ "$RT_SAMPLES" = 0 ]; then
+    EXTRA="${EXTRA} --no-rt-eval"
+else
+    EXTRA="${EXTRA} --rt-samples ${RT_SAMPLES} --rt-max-new-tokens ${RT_MAX_NEW}"
+fi
 
 source ~/bin/slack_notify.sh
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 
-echo "t2p SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}"
+echo "t2p SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}" \
+     "rt_samples=${RT_SAMPLES} rt_max_new=${RT_MAX_NEW}"
 
 # --pmi=pmix is REQUIRED to match CCL_PROCESS_LAUNCHER=pmix: it tells PALS to
 # expose a PMIx server for CCL to bootstrap against. Without it, pmix is requested
@@ -87,6 +99,12 @@ echo "t2p SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}"
 # The per-step log carries trunc=<n>/<batch>: rows whose target overflowed the cap
 # and therefore carry NO EOS. It should be near zero at 1024 — if it isn't, the
 # cap is still shaping the length distribution and wants raising.
+#
+# Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val pool
+# (R@K/mAP back to the source caption, plus the ceiling from the true proteins) and
+# the mean generated vs true body length. That is the metric to watch: val CE can
+# fall while gen->src R@1 sits at the floor, which is exactly the teacher-forcing
+# confound train_rl.py exists to fix. Full history: <ckpt_dir>/sft_roundtrip.jsonl.
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_generation --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --device xpu \

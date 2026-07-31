@@ -187,6 +187,59 @@ class MapCfg:
 
 
 @dataclass
+class HardNegCfg:
+    """Hard-decoy negative mining (resume phase on top of a retrieval checkpoint).
+
+    A *decoy* is a caption built from a real caption by replacing exactly one
+    templated field (see `DataCfg.caption_field_labels`) with the corresponding
+    field taken from a different caption. It shares almost all of its tokens with
+    the true caption, so it is a much harder negative than any in-batch caption:
+    the model can only rank it below the truth by actually reading the swapped
+    field rather than matching the caption's overall topic.
+
+    Two stages, mirroring precompute -> train:
+      src/precompute_decoys.py  builds the decoy plan + packed per-token cache
+      src/train_hard_negatives.py  resumes a retrieval checkpoint with the R2
+                                   objective + a ramped decoy discrimination loss
+    """
+    # Packed decoy text cache (its own dir; the base cache is left untouched).
+    decoy_cache_dir: str = str(REPO_ROOT / "cache" / "decoys")
+    ckpt_dir: str = str(REPO_ROOT / "checkpoints" / "hard_negatives")
+    device: str = "auto"
+
+    batch_size: int = 128
+    num_workers: int = 0
+    epochs: int = 3
+    lr: float = 5e-5                          # fine-tune LR: we resume a converged model
+    weight_decay: float = 0.01
+    warmup_frac: float = 0.02
+    grad_clip: float = 1.0
+    log_every: int = 50
+
+    # --- decoy construction (precompute side) ---
+    decoys_per_row: int = 2                   # decoys generated per caption
+    decoy_seed: int = 1234                    # plan RNG; separate from the split seed
+    # Restrict which fields may be swapped. Empty = every label in
+    # DataCfg.caption_field_labels is swappable.
+    swap_fields: tuple = ()
+    # Donor rejection: never take the replacement field from a caption of the same
+    # protein (its fields may be legitimately true of the anchor) and never from a
+    # different train/val/test split (that would leak held-out caption text into
+    # training). Both default on; precompute_decoys exposes escape hatches.
+    donor_same_protein: bool = False
+    donor_cross_split: bool = False
+
+    # --- decoy loss (training side) ---
+    max_decoys: int = 2                       # decoys scored per anchor per step
+    decoy_weight: float = 0.5                 # final weight after the ramp
+    decoy_start_frac: float = 0.05            # fraction of the run before the ramp starts
+    decoy_ramp_frac: float = 0.35             # fraction of the run spent ramping 0 -> weight
+    # 0 => (K+1)-way softmax discrimination (temperature-scaled, shares logit_scale).
+    # >0 => hinge on the raw FILIP-score gap: relu(margin - (s_pos - s_decoy)).
+    decoy_margin: float = 0.0
+
+
+@dataclass
 class GenerationCfg:
     """One block per generation direction."""
     direction: str = "text2protein"           # or "protein2text"
@@ -276,6 +329,7 @@ class Cfg:
     retrieval: RetrievalCfg = field(default_factory=RetrievalCfg)
     recon: ReconCfg = field(default_factory=ReconCfg)
     memory_map: MapCfg = field(default_factory=MapCfg)
+    hard_neg: HardNegCfg = field(default_factory=HardNegCfg)
     generation: GenerationCfg = field(default_factory=GenerationCfg)
 
 

@@ -100,7 +100,16 @@ def resolve_resume_path(resume: str, ckpt_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Build data loaders
 # ---------------------------------------------------------------------------
-def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int = 0):
+def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int = 0,
+                  dataset_factory=None, collate_fn=None):
+    """Train/val loaders over the group-aware split, plus the per-row group ids.
+
+    `dataset_factory(cache_dir, indices) -> Dataset` and `collate_fn` let a
+    downstream phase swap in a dataset that returns extra fields (e.g.
+    `PackedDecoyDataset` for hard-negative mining) while reusing this function's
+    cache validation, caption-identity ids and split construction unchanged.
+    Both default to the plain packed pair dataset.
+    """
     if cfg.retrieval.use_cache:
         # Validate cache fingerprint
         expected = cache_fingerprint(
@@ -192,20 +201,18 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
               f"test={len(splits['test'])}")
 
     if cfg.retrieval.use_cache:
-        train_ds = PackedPerTokenDataset(
-            cfg.retrieval.cache_dir, splits["train"],
-            cfg.model.protein_hidden, cfg.model.text_hidden,
-        )
-        val_ds = PackedPerTokenDataset(
-            cfg.retrieval.cache_dir, val_indices,
-            cfg.model.protein_hidden, cfg.model.text_hidden,
-        )
-        collate = packed_collate
+        make = dataset_factory or (lambda cache_dir, indices: PackedPerTokenDataset(
+            cache_dir, indices, cfg.model.protein_hidden, cfg.model.text_hidden))
+        train_ds = make(cfg.retrieval.cache_dir, splits["train"])
+        val_ds = make(cfg.retrieval.cache_dir, val_indices)
+        collate = collate_fn or packed_collate
         bs = cfg.retrieval.batch_size
     else:
+        if dataset_factory is not None:
+            raise RuntimeError("dataset_factory is only supported on the cached path")
         train_ds = RawPairsDataset(pairs, splits["train"])
         val_ds = RawPairsDataset(pairs, val_indices)
-        collate = raw_collate
+        collate = collate_fn or raw_collate
         bs = cfg.retrieval.live_batch_size
 
     # Distributed: shard the train set across ranks. drop_last keeps a constant

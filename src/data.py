@@ -442,6 +442,99 @@ def packed_collate(batch):
 
 
 # ---------------------------------------------------------------------------
+# Hard-decoy reader (see src/decoys.py for how the decoy cache is built)
+# ---------------------------------------------------------------------------
+class PackedDecoyDataset(PackedPerTokenDataset):
+    """`PackedPerTokenDataset` + each row's hard decoy captions.
+
+    Adds `h_d` / `mask_d` (lists of per-token tensors, one per decoy) to the base
+    item. Decoy counts are per-row: `decoy_row_ptr` is a CSR index into the decoy
+    cache and `decoy_keep` masks out decoys the precompute rejected (their swapped
+    field landed outside the text encoder's truncation window, so they tokenize
+    identically to the truth and carry no signal). Rows can legitimately end up
+    with zero decoys — sparse captions with no swappable field, or a field whose
+    donor pool was exhausted; `decoy_collate` marks those slots invalid and the
+    decoy loss skips them.
+
+    When a row has more than `max_decoys` usable decoys a fresh random subset is
+    drawn per access, so successive epochs see different hard negatives at fixed
+    per-step cost.
+    """
+
+    def __init__(self, cache_dir: str, decoy_cache_dir: str, indices: Sequence[int],
+                 protein_dim: int = 960, text_dim: int = 768,
+                 max_decoys: int = 2,
+                 row_protein_idx: Optional[torch.Tensor] = None):
+        super().__init__(cache_dir, indices, protein_dim, text_dim,
+                         row_protein_idx=row_protein_idx)
+        d = Path(decoy_cache_dir)
+        self.decoy_cache = PackedPerTokenCache(decoy_cache_dir, "decoy", text_dim)
+        self.row_ptr = torch.load(d / "decoy_row_ptr.pt", map_location="cpu")
+        self.keep = torch.load(d / "decoy_keep.pt", map_location="cpu").bool()
+        self.max_decoys = int(max_decoys)
+        n_rows = int(self.row_ptr.numel() - 1)
+        if n_rows != len(self.text_cache):
+            raise ValueError(
+                f"decoy_row_ptr covers {n_rows} rows but the base text cache has "
+                f"{len(self.text_cache)}; the two caches were built from different "
+                f"CSV row sets. Rebuild with `python -m src.precompute_decoys`.")
+        if int(self.row_ptr[-1]) != len(self.decoy_cache):
+            raise ValueError(
+                f"decoy_row_ptr ends at {int(self.row_ptr[-1])} but the decoy cache "
+                f"holds {len(self.decoy_cache)} rows; the cache is incomplete "
+                f"(re-run the merge).")
+        if int(self.keep.numel()) != len(self.decoy_cache):
+            raise ValueError(
+                f"decoy_keep has {int(self.keep.numel())} entries but the decoy "
+                f"cache holds {len(self.decoy_cache)} rows.")
+
+    def __getitem__(self, i: int):
+        item = super().__getitem__(i)
+        idx = self.indices[i]
+        s, e = int(self.row_ptr[idx]), int(self.row_ptr[idx + 1])
+        cand = [j for j in range(s, e) if bool(self.keep[j])]
+        if len(cand) > self.max_decoys:
+            # torch RNG (not `random`) so a seeded run stays reproducible.
+            sel = torch.randperm(len(cand))[: self.max_decoys].tolist()
+            cand = [cand[j] for j in sel]
+        h_d, m_d = [], []
+        for j in cand:
+            h, m = self.decoy_cache.get(j)
+            h_d.append(h)
+            m_d.append(m)
+        item["h_d"] = h_d
+        item["mask_d"] = m_d
+        return item
+
+
+def decoy_collate(batch):
+    """`packed_collate` + a padded [B, K, L_d, D] decoy block and [B, K] validity.
+
+    K is the batch's max usable decoy count, floored at 1 so the decoy axis always
+    exists; rows with fewer decoys get zero-filled slots flagged invalid.
+    """
+    out = packed_collate(batch)
+    B = len(batch)
+    K = max(1, max(len(b["h_d"]) for b in batch))
+    L_d = max((h.size(0) for b in batch for h in b["h_d"]), default=1)
+    d_t = batch[0]["h_t"].size(-1)
+
+    h_d = torch.zeros(B, K, L_d, d_t, dtype=torch.bfloat16)
+    mask_d = torch.zeros(B, K, L_d, dtype=torch.bool)
+    valid = torch.zeros(B, K, dtype=torch.bool)
+    for i, b in enumerate(batch):
+        for k, (h, m) in enumerate(zip(b["h_d"], b["mask_d"])):
+            ld = h.size(0)
+            h_d[i, k, :ld] = h
+            mask_d[i, k, :ld] = m
+            valid[i, k] = True
+    out["h_d"] = h_d
+    out["mask_d"] = mask_d
+    out["decoy_valid"] = valid
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Raw fallback (live encoders during training)
 # ---------------------------------------------------------------------------
 class RawPairsDataset(Dataset):

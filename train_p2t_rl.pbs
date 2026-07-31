@@ -53,13 +53,23 @@ slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 # rollouts cheap (this direction iterates faster than text2protein). BioGPT's
 # strong fluency prior + the KL reference suppress text reward-hacking
 # (repetition / keyword-stuffing).
+# --resume auto continues from the latest checkpoint in the output dir (fresh
+# start on the first run), so re-queuing this job after a wall-time kill picks up
+# where it left off. --steps is the TOTAL budget; INIT_CKPT stays the fixed KL
+# anchor across restarts.
+# --eval-every 200 runs the held-out round-trip metric (fixed 1000 val rows,
+# sharded across ranks) alongside each checkpoint -> checkpoints/.../rl_roundtrip.jsonl.
+# The reward alone can't distinguish real conditioning from drift toward one
+# generic high-scoring caption; the pooled R@K/mAP can. ~1 rollout of extra
+# generation per eval, so <1% of wall time at this cadence.
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_rl --direction protein2text \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${INIT_CKPT}" --device xpu \
-    --steps 2000 --prompts-per-rank 8 --group-size 8 \
+    --resume auto --steps 2000 --prompts-per-rank 8 --group-size 8 \
     --max-new-tokens 128 --temperature 1.0 --top-p 0.95 \
     --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 \
-    --log-every 10 --save-every 200
+    --log-every 10 --save-every 200 \
+    --eval-every 200 --eval-samples 1000
 
 rc=$?
 if [ $rc -eq 0 ]; then

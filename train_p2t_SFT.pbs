@@ -47,6 +47,12 @@ MAX_TGT=${MAX_TGT:-512}
 EPOCHS=${EPOCHS:-20}
 LR=${LR:-1.5e-4}
 GRAD_CKPT=${GRAD_CKPT:-0}
+# Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart to
+# val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank here and
+# costs one generate + one N x N FILIP per epoch. RT_MAX_NEW is the real cost knob
+# (wall time is linear in it); RT_SAMPLES=0 turns the eval off.
+RT_SAMPLES=${RT_SAMPLES:-512}
+RT_MAX_NEW=${RT_MAX_NEW:-${MAX_TGT}}
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -71,12 +77,23 @@ export CCL_ZE_IPC_EXCHANGE=pidfd
 
 EXTRA=""
 [ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
+if [ "$RT_SAMPLES" = 0 ]; then
+    EXTRA="${EXTRA} --no-rt-eval"
+else
+    EXTRA="${EXTRA} --rt-samples ${RT_SAMPLES} --rt-max-new-tokens ${RT_MAX_NEW}"
+fi
 
 source ~/bin/slack_notify.sh
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 
-echo "p2t SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}"
+echo "p2t SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}" \
+     "rt_samples=${RT_SAMPLES} rt_max_new=${RT_MAX_NEW}"
 
+# Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val pool
+# (generated caption -> its source protein, R@K/mAP, plus the ceiling from the true
+# captions) and the mean generated vs true caption length. Val CE is teacher-forced
+# and can improve while this sits at the floor; full history lands in
+# <ckpt_dir>/sft_roundtrip.jsonl.
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_generation --direction protein2text \
     --retrieval-ckpt "${RCKPT}" --device xpu \

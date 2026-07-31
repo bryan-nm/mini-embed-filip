@@ -319,6 +319,37 @@ def _pad_stack(seqs, dim):
     return out, mask
 
 
+def rng_snapshot(device):
+    """Save CPU + accelerator RNG so an in-loop eval's sampling doesn't perturb
+    the training stream. Without this, turning the eval on (or changing its
+    period) silently shifts every subsequent training batch — the augmentation
+    coin flips, the input dropout, the rollout sampling — and runs stop being
+    reproducible against a no-eval baseline."""
+    dev_state = None
+    try:
+        if device.type == "xpu":
+            dev_state = torch.xpu.get_rng_state(device)
+        elif device.type == "cuda":
+            dev_state = torch.cuda.get_rng_state(device)
+    except Exception:
+        dev_state = None
+    return torch.get_rng_state(), dev_state
+
+
+def rng_restore(device, state) -> None:
+    cpu_state, dev_state = state
+    torch.set_rng_state(cpu_state)
+    if dev_state is None:
+        return
+    try:
+        if device.type == "xpu":
+            torch.xpu.set_rng_state(dev_state, device)
+        elif device.type == "cuda":
+            torch.cuda.set_rng_state(dev_state, device)
+    except Exception:
+        pass
+
+
 def grouped_recall(S: torch.Tensor, groups: torch.Tensor, ks):
     """Accession-grouped retrieval recall + mAP.
 
@@ -346,6 +377,44 @@ def grouped_recall(S: torch.Tensor, groups: torch.Tensor, ks):
     out["median_rank"] = float(ranks.median().item())
     out["mean_pos_score"] = float(best_pos.mean().item())
     return out, ranks
+
+
+@torch.no_grad()
+def score_roundtrip_records(recs, embed_dim: int, device, chunk_rows: int = 4,
+                            ks=(1, 5, 10), need_ceiling: bool = False):
+    """Score a merged list of round-trip records -> (metrics, ceiling).
+
+    Each record carries the per-token aligned embeddings of one row: `z_gen` (the
+    generated target, re-encoded), `z_src` (its source) and, when `need_ceiling`,
+    `z_true` (the true target). Any dtype is accepted (in-loop callers ship fp16
+    over the wire); everything is upcast to fp32 here.
+
+    This is the scoring half of the round-trip metric, shared by the offline tool
+    and both in-loop trainers (`train_rl`, `train_generation`) so a curve logged
+    during training is directly comparable to a `python -m src.roundtrip_eval`
+    number computed on the same pool. `ceiling` is the true target scored against
+    the same sources with the same scorer: it depends only on the frozen retrieval
+    model and the (fixed) pool, so an in-loop caller computes it once and reuses it.
+    """
+    groups = torch.as_tensor(
+        group_ids_from_accessions([r["uid"] for r in recs]), device=device)
+    Z_src, m_src = pad_stack([r["z_src"].float() for r in recs], embed_dim, device)
+    Z_gen, m_gen = pad_stack([r["z_gen"].float() for r in recs], embed_dim, device)
+
+    S = filip_score_matrix_chunked(Z_gen, Z_src, m_gen, m_src, chunk_rows=chunk_rows)
+    gen2src, _ = grouped_recall(S, groups, ks)              # generated target -> its source
+    src2gen, _ = grouped_recall(S.t().contiguous(), groups, ks)
+    del S
+
+    ceiling = None
+    if need_ceiling:
+        Z_true, m_true = pad_stack([r["z_true"].float() for r in recs], embed_dim, device)
+        S_true = filip_score_matrix_chunked(Z_true, Z_src, m_true, m_src,
+                                            chunk_rows=chunk_rows)
+        ceiling, _ = grouped_recall(S_true, groups, ks)
+        del S_true
+
+    return {"n": len(recs), "gen2src": gen2src, "src2gen": src2gen}, ceiling
 
 
 def score_and_write(args, device) -> None:

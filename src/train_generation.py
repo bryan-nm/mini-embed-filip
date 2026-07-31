@@ -26,6 +26,7 @@ import json
 import math
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import torch
@@ -56,6 +57,8 @@ from src.decoder_adapters import (
     clear_cross_memory,
     count_trainable,
     coverage_penalty,
+    coverage_profile,
+    decode_target,
     load_decoder_with_cross_attn,
     reverse_prefix_ids,
     set_cross_memory,
@@ -65,8 +68,12 @@ from src.decoder_adapters import (
     warm_start_q_align,
 )
 from src.cvae import build_cvae, beta_at
+from src.encoders import (
+    encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
+)
 from src.losses import masked_mean
 from src.model import MiniEmbedFilip
+from src.roundtrip_eval import rng_restore, rng_snapshot, score_roundtrip_records
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +524,41 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
                     help="evaluate on the first N val pairs each epoch (0 = full val split)")
+    # ---- per-epoch round-trip retrieval eval (free-running; see run_roundtrip) ----
+    ap.add_argument("--rt-eval", dest="rt_eval", action="store_true",
+                    help="once per epoch, generate a fixed held-out pool free-running, "
+                         "re-encode it and score accession-grouped R@K/mAP back to the "
+                         "sources — the prefix-free counterpart to val CE (default on)")
+    ap.add_argument("--no-rt-eval", dest="rt_eval", action="store_false")
+    ap.set_defaults(rt_eval=True)
+    ap.add_argument("--rt-samples", type=int, default=1000,
+                    help="val rows in the round-trip pool. Fixed across epochs and "
+                         "restarts (--rt-seed) so the curve is comparable epoch to epoch. "
+                         "Also the candidate-pool size, so R@K/mAP are NOT comparable "
+                         "across different values. Cost is one sharded generate: rows are "
+                         "split across ranks, so this is ~free until it exceeds world_size")
+    ap.add_argument("--rt-batch-size", type=int, default=8,
+                    help="per-rank generation batch during the round-trip eval")
+    ap.add_argument("--rt-max-new-tokens", type=int, default=None,
+                    help="default: --max-target-tokens (measure the whole length "
+                         "distribution the model was trained on). The main cost knob — "
+                         "eval wall time is linear in it")
+    ap.add_argument("--rt-temperature", type=float, default=1.0,
+                    help="round-trip sampling temperature (0 = greedy)")
+    ap.add_argument("--rt-top-p", type=float, default=0.9)
+    ap.add_argument("--rt-filip-chunk-rows", type=int, default=4,
+                    help="row chunk for the N x N FILIP scoring on rank 0; bounds the "
+                         "transient on top of the resident training state")
+    ap.add_argument("--rt-seed", type=int, default=1234,
+                    help="picks the fixed round-trip pool and seeds its sampling; the "
+                         "training RNG stream is saved/restored around each eval, so "
+                         "turning this on does not perturb training")
+    ap.add_argument("--rt-at-start", dest="rt_at_start", action="store_true",
+                    help="also run the round-trip eval before the first epoch: an "
+                         "epoch=-1 baseline, and it surfaces any problem with the eval "
+                         "in the first minute instead of at the end of epoch 0")
+    ap.add_argument("--no-rt-at-start", dest="rt_at_start", action="store_false")
+    ap.set_defaults(rt_at_start=True)
     # Generation-side CVAE (Feature 1).
     ap.add_argument("--use-cvae", action="store_true", default=cfg.generation.use_cvae,
                     help="train a conditional VAE latent injected as extra cross-attn memory tokens")
@@ -573,6 +615,8 @@ def main() -> None:
                 "the no_grad pass and would train as a silent no-op. Drop one of the two")
         if args.coverage_tau <= 0.0:
             raise SystemExit("--coverage-tau must be > 0 (it normalizes the penalty)")
+    if args.rt_max_new_tokens is None:
+        args.rt_max_new_tokens = args.max_target_tokens
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -751,6 +795,49 @@ def main() -> None:
                   f"latent_tokens={n_latent} beta_max={cvae.cfg.beta_max} "
                   f"({n_cvae:,} params)")
 
+    # 2c) Target-modality encoder — ONLY for the per-epoch round-trip eval, which
+    # has to re-encode text the model just generated (nothing in the cache covers a
+    # sequence that didn't exist yet). This is the one genuinely new resident cost of
+    # the eval: AMPLIFY-350M (~1.4 GB fp32) for text2protein, BioLinkBERT-base for
+    # protein2text. Everything else the eval needs — the source features AND the true
+    # targets for the ceiling row — comes from the packed cache, so no source encoder
+    # is ever loaded here. Loaded rank-0-first (AMPLIFY is trust_remote_code, same
+    # transformers_modules write race as the decoder above) and up front rather than
+    # lazily, so a missing/oversized encoder fails in the first minute of the job
+    # instead of at the end of epoch 0.
+    tgt_encoder = tgt_enc_tok = None
+    if args.rt_eval and args.rt_samples > 0:
+        def _load_tgt_encoder():
+            if args.direction == "text2protein":
+                return load_protein_encoder(cfg.model.protein_encoder_path, device)
+            return load_text_encoder(cfg.model.text_encoder_path, device,
+                                     cfg.data.caption_field_labels)
+
+        if env.is_main:
+            tgt_encoder, tgt_enc_tok = _load_tgt_encoder()
+        barrier()
+        if not env.is_main:
+            tgt_encoder, tgt_enc_tok = _load_tgt_encoder()
+        if env.is_main:
+            which = ("protein encoder (AMPLIFY)" if args.direction == "text2protein"
+                     else "text encoder (BioLinkBERT)")
+            print(f"[gen] round-trip eval ON: loaded the frozen {which} to re-encode "
+                  f"generated targets")
+
+    def encode_generated(strs):
+        """Generated target strings -> (per-token hidden states, valid mask).
+
+        Masking matches the cache the retrieval model was trained on (specials and
+        caption field labels dropped), so a generated row and a cached row are
+        scored on the same footing.
+        """
+        if args.direction == "text2protein":
+            return encode_protein_batch(tgt_encoder, tgt_enc_tok, strs, device,
+                                        cfg.data.max_protein_tokens, mask_specials=True)
+        return encode_text_batch(tgt_encoder, tgt_enc_tok, strs, device,
+                                 cfg.data.max_text_tokens, mask_specials=True,
+                                 mask_field_labels=True)
+
     # 3) Data
     pairs = load_pairs(
         cfg.data.csv_path,
@@ -828,6 +915,36 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size,
                             shuffle=False, collate_fn=val_collate,
                             num_workers=cfg.generation.num_workers)
+
+    # Round-trip pool: a FIXED random sample of val, drawn with its own generator so
+    # it is independent of --seed, of --val-subset (whose rows are the front of the
+    # same permutation and would otherwise couple the two metrics), and stable across
+    # restarts. Every rank derives the identical pool, then takes a round-robin shard
+    # of it — so the eval's wall time is one SMALL per-rank generate rather than one
+    # large one, and it stays flat as long as the pool fits in world_size batches.
+    # need_target=True hands the eval the TRUE target's cached per-token features,
+    # which is the ceiling row for free (no encoder pass, and identical to what the
+    # retrieval model itself reports on these rows).
+    rt_pool, rt_loader, rt_uids = [], None, []
+    if args.rt_eval and args.rt_samples > 0:
+        val_all = list(splits["val"])
+        g_rt = torch.Generator().manual_seed(args.rt_seed)
+        perm = torch.randperm(len(val_all), generator=g_rt).tolist()
+        rt_pool = [val_all[i] for i in perm[:args.rt_samples]]
+        my_rt = rt_pool[env.rank::env.world_size]
+        rt_uids = [pairs[i].uid for i in my_rt]
+        rt_ds = GenerationDataset(args.direction, args.cache_dir, pairs, my_rt,
+                                  cfg.model.protein_hidden, cfg.model.text_hidden,
+                                  need_target=True)
+        # shuffle=False: rows come back in `my_rt` order, which is how rt_uids is
+        # aligned to them (the collate carries no ids).
+        rt_loader = DataLoader(rt_ds, batch_size=args.rt_batch_size, shuffle=False,
+                               collate_fn=val_collate, num_workers=0)
+        if env.is_main:
+            print(f"[gen] round-trip pool: {len(rt_pool)} val rows "
+                  f"(~{len(rt_pool) / max(env.world_size, 1):.1f} rows/rank, "
+                  f"bs={args.rt_batch_size}, max_new={args.rt_max_new_tokens}, "
+                  f"temp={args.rt_temperature}, top_p={args.rt_top_p})")
     if len(train_loader) == 0:
         raise RuntimeError(
             f"train_loader has 0 batches (per-rank train_size≈"
@@ -885,6 +1002,207 @@ def main() -> None:
     if env.is_main:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     barrier()
+
+    # ---- per-epoch round-trip retrieval eval -------------------------------
+    # Val CE is teacher-forced: it scores next-token prediction with the TRUE prefix
+    # in hand, so it can improve while free-running generation ignores the
+    # conditioning entirely. This is the prefix-free counterpart — generate the pool
+    # free-running, re-encode each output, and ask whether it retrieves its own source
+    # against the whole pool (accession-grouped, so a protein's sibling captions count
+    # as positives). Same generation path, same FILIP scorer and same
+    # `score_roundtrip_records` as `python -m src.roundtrip_eval`, so the per-epoch
+    # curve and the offline number agree on an identical pool.
+    #
+    # Cost: the pool is sharded across ranks, so this is ONE small generate per rank
+    # (~pool/world_size rows), one encoder pass over those rows, and one N x N FILIP
+    # on rank 0. At the job scale in train_*_SFT.pbs (192 ranks) the default 256-row
+    # pool is 1-2 rows per rank — a minute or two per epoch against a multi-hour
+    # epoch. `--rt-max-new-tokens` is the knob that actually moves that number.
+    rt_prompt: list = []
+    rt_pad_id = rt_eos_id = None
+    rt_empty = "M" if args.direction == "text2protein" else "protein"
+    if rt_loader is not None:
+        bos = target_tok.bos_token_id
+        if bos is None:
+            bos = target_tok.eos_token_id
+        if bos is None:
+            raise SystemExit(
+                "--rt-eval needs a decoder tokenizer with a BOS or EOS token to seed "
+                "generation; this one has neither. Re-run with --no-rt-eval.")
+        # Forward (N-to-C) prefix only, even under --direction-augment: val CE and
+        # deployment are both forward, so the eval measures the same path. (A "2"
+        # rollout would still decode correctly — decode_target re-reverses it — but
+        # it would mix two distributions into one curve.)
+        rt_prompt = [bos] + prefix_ids
+        rt_pad_id = (target_tok.pad_token_id if target_tok.pad_token_id is not None
+                     else target_tok.eos_token_id)
+        rt_eos_id = (target_tok.eos_token_id if target_tok.eos_token_id is not None
+                     else rt_pad_id)
+
+    # The ceiling (true target -> source, same scorer and pool) depends only on the
+    # frozen retrieval model and the fixed pool, so it is computed on the first eval
+    # and reused. `done` is tracked on EVERY rank rather than inferred from rank 0's
+    # return value, or the off-main ranks would keep projecting true targets forever.
+    rt_state = {"ceiling": None, "done": False, "disabled": False}
+
+    @torch.no_grad()
+    def run_roundtrip(epoch_id: int):
+        """Round-trip eval over the fixed pool. Returns metrics on rank 0, else None."""
+        if rt_loader is None or rt_state["disabled"]:
+            return None
+        barrier()
+        t_rt = time.time()
+        was_training = decoder.training
+        core.eval()
+        if cvae is not None:
+            cvae.eval()
+        need_ceiling = not rt_state["done"]
+        # Seed the eval's own stream so the sampling noise is the same every epoch
+        # (the curve then moves because the model moved), and restore the training
+        # stream afterwards so enabling this eval doesn't shift training at all.
+        rng = rng_snapshot(device)
+        torch.manual_seed(args.rt_seed + env.rank)
+        recs, gen_lens, true_lens, failed = [], [], [], ""
+        try:
+            cursor = 0
+            for batch in rt_loader:
+                h = batch["h"].to(device).float()
+                mask = batch["m"].to(device)
+                B = h.size(0)
+                z = src_proj(h)                     # aligned source tokens (scored below)
+                mem = build_memory(z)               # cross-attn memory (expanded or aligned)
+                k_mask = mask
+                if cvae is not None:
+                    # Prior MEAN, matching the val-CE path: with one candidate per
+                    # source, sampling the latent would only add variance to the curve.
+                    pmu, _ = cvae.prior_params(masked_mean(z, mask))
+                    mem = torch.cat([mem, cvae.latent_tokens(pmu)], dim=1)
+                    k_mask = torch.cat(
+                        [mask, torch.ones(B, n_latent, dtype=torch.bool, device=device)],
+                        dim=1)
+
+                set_cross_memory(adapters, mem, k_mask)
+                input_ids = torch.tensor([rt_prompt] * B, device=device, dtype=torch.long)
+                # use_cache=True explicitly: --grad-checkpointing sets
+                # config.use_cache=False for training, and generating 1k tokens with
+                # no KV cache would cost more than the epoch it is measuring.
+                gen = core.generate(
+                    input_ids, max_new_tokens=args.rt_max_new_tokens,
+                    do_sample=args.rt_temperature > 0,
+                    temperature=max(args.rt_temperature, 1e-6),
+                    top_p=args.rt_top_p, pad_token_id=rt_pad_id, use_cache=True)
+                clear_cross_memory(adapters)
+
+                gen_strs = [decode_target(core, target_tok, row) for row in gen]
+                h_gen, m_gen = encode_generated(
+                    [g if g.strip() else rt_empty for g in gen_strs])
+                z_gen = tgt_proj(h_gen.float())
+                # Ceiling row: the TRUE target's per-token features straight from the
+                # cache (need_target=True), through the same frozen projection. No
+                # encoder pass, and exactly what retrieval itself scores on these rows.
+                if need_ceiling:
+                    z_true = tgt_proj(batch["h_tgt"].to(device).float())
+                    m_true = batch["m_tgt"].to(device)
+
+                # Length diagnostics, in decoder tokens, body only (no prompt, no EOS):
+                # a free-running length distribution that collapses onto the cap is
+                # invisible in CE but obvious here.
+                tail = gen[:, len(rt_prompt):]
+                is_eos = tail == rt_eos_id
+                hit = is_eos.any(dim=1)
+                first_eos = torch.where(
+                    hit, is_eos.float().argmax(dim=1).long(),
+                    torch.full((tail.size(0),), tail.size(1), device=tail.device,
+                               dtype=torch.long))
+                gen_lens.extend(first_eos.cpu().tolist())
+                am = batch["attn_mask"]
+                last = (am.sum(1) - 1).clamp(min=0)
+                last_tok = batch["input_ids"].gather(1, last[:, None]).squeeze(1)
+                true_lens.extend(
+                    (am.sum(1) - len(rt_prompt) - (last_tok == rt_eos_id).long())
+                    .clamp(min=0).tolist())
+
+                # fp16 on the wire: every rank receives the whole pool below.
+                for b in range(B):
+                    rec = {"uid": rt_uids[cursor + b],
+                           "z_gen": z_gen[b][m_gen[b]].half().cpu(),
+                           "z_src": z[b][mask[b]].half().cpu()}
+                    if need_ceiling:
+                        rec["z_true"] = z_true[b][m_true[b]].half().cpu()
+                    recs.append(rec)
+                cursor += B
+        except Exception:
+            # A metric must not take down a multi-hour training job — but it also
+            # must not deadlock it. Bailing out here would leave the other ranks
+            # blocked in the all-gather below until the walltime expires, so the
+            # failure is recorded, shipped through the SAME collective, and the eval
+            # is then disabled on EVERY rank (each one sees every payload, so they
+            # agree without an extra broadcast). Training continues; the traceback is
+            # printed in full so the cause is still diagnosable.
+            failed = traceback.format_exc()
+            print(f"[gen][rt] rank {env.rank}: eval failed at epoch={epoch_id}\n{failed}",
+                  flush=True)
+        finally:
+            rng_restore(device, rng)
+            if was_training:
+                decoder.train()
+                if cvae is not None:
+                    cvae.train()
+
+        payload = {"recs": recs, "gen": gen_lens, "true": true_lens, "failed": failed}
+        parts = [payload]
+        if env.distributed and torch.distributed.is_initialized():
+            parts = [None] * env.world_size
+            torch.distributed.all_gather_object(parts, payload)
+        bad = [i for i, p in enumerate(parts) if p["failed"]]
+        if bad:
+            rt_state["disabled"] = True
+            if env.is_main:
+                print(f"[gen][rt] DISABLED for the rest of the run: the eval raised on "
+                      f"{len(bad)}/{len(parts)} rank(s) (first: rank {bad[0]}). Training "
+                      f"is unaffected; re-run the metric offline with "
+                      f"`python -m src.roundtrip_eval`.", flush=True)
+            barrier()
+            return None
+        recs = [r for p in parts for r in p["recs"]]
+        gen_lens = [v for p in parts for v in p["gen"]]
+        true_lens = [v for p in parts for v in p["true"]]
+        rt_state["done"] = True
+
+        if not env.is_main:
+            barrier()
+            return None
+        metrics, ceiling = score_roundtrip_records(
+            recs, cfg.model.embed_dim, device, chunk_rows=args.rt_filip_chunk_rows,
+            need_ceiling=need_ceiling)
+        if ceiling is not None:
+            rt_state["ceiling"] = ceiling
+        metrics["ceiling"] = rt_state["ceiling"]
+        metrics["gen_len_mean"] = sum(gen_lens) / max(len(gen_lens), 1)
+        metrics["true_len_mean"] = sum(true_lens) / max(len(true_lens), 1)
+        metrics["seconds"] = round(time.time() - t_rt, 2)
+        g2s, s2g = metrics["gen2src"], metrics["src2gen"]
+        ceil = metrics["ceiling"] or {}
+        # R@K is only reported for k <= pool size, so a tiny --rt-samples has no R@10.
+        print(f"[gen][rt] epoch={epoch_id} n={metrics['n']} "
+              f"gen->src R@1={g2s['R@1']:.4f} "
+              f"R@10={g2s.get('R@10', float('nan')):.4f} "
+              f"mAP={g2s['mAP']:.4f} medrank={g2s['median_rank']:.0f} | "
+              f"src->gen R@1={s2g['R@1']:.4f} mAP={s2g['mAP']:.4f} | "
+              f"ceiling R@1={ceil.get('R@1', float('nan')):.4f} "
+              f"mAP={ceil.get('mAP', float('nan')):.4f} | "
+              f"len gen={metrics['gen_len_mean']:.0f} true={metrics['true_len_mean']:.0f} "
+              f"| {metrics['seconds']:.1f}s", flush=True)
+        with open(ckpt_dir / "sft_roundtrip.jsonl", "a") as f:
+            # Self-describing rows: R@K/mAP are only comparable at a fixed pool size
+            # and sampling config, so each line carries the ones that set them.
+            f.write(json.dumps({
+                "epoch": epoch_id, **metrics,
+                "pool": len(rt_pool), "temperature": args.rt_temperature,
+                "top_p": args.rt_top_p, "max_new_tokens": args.rt_max_new_tokens,
+            }) + "\n")
+        barrier()
+        return metrics
 
     global_step = 0
     log = []
@@ -952,6 +1270,12 @@ def main() -> None:
         if env.is_main:
             print(f"[resume] loaded {resume_path}; resuming at epoch {start_epoch} "
                   f"(global_step={global_step})")
+
+    # Baseline before any training — also a smoke test of the eval path on this
+    # config, surfaced in the first minute rather than at the end of epoch 0. Runs
+    # after --resume, so a continued job reports where it starts from.
+    if args.rt_at_start:
+        run_roundtrip(start_epoch - 1)
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
@@ -1097,6 +1421,11 @@ def main() -> None:
         if env.is_main:
             print(f"[{args.direction}] epoch={epoch} done in {dt:.1f}s")
 
+        # Round-trip retrieval eval — all ranks (the pool is sharded), so it runs
+        # BEFORE the rank-0-only val/checkpoint block, and its metrics go into the
+        # same train_log record.
+        rt_metrics = run_roundtrip(epoch)
+
         # Val pass + checkpoint on rank 0 only (uses the unwrapped decoder).
         if env.is_main:
             core.eval()
@@ -1149,6 +1478,8 @@ def main() -> None:
                 cvae.train()
             val_ce = sum(val_losses) / max(len(val_losses), 1)
             rec = {"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)}
+            if rt_metrics is not None:
+                rec["roundtrip"] = rt_metrics
             cov_msg = ""
             if val_cov:
                 rec["val_coverage"] = sum(val_cov) / len(val_cov)

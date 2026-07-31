@@ -90,6 +90,14 @@ python -m src.precompute --device cuda --batch-size 64
 # 2) Retrieval (FILIP) training.
 python -m src.train_retrieval --use-cache --device cuda
 
+# 2a) OPTIONAL: hard-negative mining. Builds decoy captions (one templated field
+#     swapped in from a different caption), then resumes the retrieval checkpoint
+#     with its own R2 objective plus a ramped decoy-discrimination loss. Writes a
+#     retrieval-format checkpoint, so 2b/3/4/5 consume it unchanged.
+python -m src.precompute_decoys --device cuda --batch-size 64
+python -m src.train_hard_negatives \
+    --resume checkpoints/retrieval/epochNN.pt --device cuda
+
 # 2b) OPTIONAL: expansion-only reconstruction phase. Freezes the projection
 #     heads (R@K unchanged) and trains only the expansion heads harder, so the
 #     generation conditioning memory expand(project(h)) is less lossy. Produces a
@@ -140,9 +148,12 @@ python -m src.train_reconstruction --ckpt checkpoints/retrieval/epoch02.pt \
 # Generation. The default text2protein decoder (ProtGPT3-112M-dpo) is small
 # enough to smoke-test on CPU; FILIP_PROTEIN_DECODER points it elsewhere.
 # --subset-size must match the cache so the by-accession split lines up.
+# The per-epoch round-trip eval is on by default and loads the target encoder;
+# shrink it here (or --no-rt-eval) so a CPU smoke test isn't dominated by decoding.
 python -m src.train_generation --direction text2protein \
     --retrieval-ckpt checkpoints/reconstruction/epoch01.pt \
-    --subset-size 512 --batch-size 4 --epochs 1 --device cpu --use-cvae
+    --subset-size 512 --batch-size 4 --epochs 1 --device cpu --use-cvae \
+    --rt-samples 16 --rt-max-new-tokens 64
 
 # Best-of-N inference (re-encodes candidates; loads the target encoder too).
 FILIP_PROTEIN_DECODER=/path/to/progen2-small \
@@ -213,6 +224,78 @@ Config knobs in `config.py` (`RetrievalCfg`) not on the CLI:
 - `recon_weight = 0.05` — autoencoder loop weight throughout both phases.
 - `init_temperature = 0.07` — learnable CLIP temperature, clamped to ≤ 100.
 
+### `src/precompute_decoys` and `src/train_hard_negatives`
+
+Optional phase after retrieval. A **decoy** is a caption with exactly one
+templated field (`DataCfg.caption_field_labels`) replaced by the corresponding
+field of a *different* caption — so it shares nearly every token with the truth
+and can only be ranked below it by reading the swapped field. In-batch negatives
+are separable from overall topic; decoys are not, which is why they keep biting
+after R@K looks good.
+
+Captions do **not** all carry the same fields (SwissProt annotation is sparse),
+so swap targets and donor pools are both per-label, and rows with no swappable
+field simply contribute no decoys.
+
+`src/precompute_decoys` runs in two steps: a single-process **plan** (parse every
+caption, index the field spans, assign each row `--decoys-per-row` (field, donor)
+swaps, deterministic given the seed) and a **distributed encode + merge** that
+writes a packed per-token cache in the same format as `src/precompute`. It is
+text-only — the protein side is reused from the base cache.
+
+Donors are rejected when they carry an identical field value (the decoy would
+equal the truth), come from the same protein (a sibling caption's field is often
+also true of this protein), or come from a different split (held-out caption text
+must not reach a training decoy — this needs the retrieval run's `splits.json`).
+A decoy whose swapped field lands beyond the text encoder's truncation window
+tokenizes identically to the truth; those are detected exactly at encode time and
+excluded via `decoy_keep.pt`. Check `decoy_stats.json` (`rows_with_usable_decoy`
+vs `rows_total`) before training.
+
+| flag (`precompute_decoys`) | default | meaning |
+|---|---|---|
+| `--cache-dir` | `cache/` | base cache; supplies row order + fingerprint |
+| `--decoy-cache-dir` | `cache/decoys/` | packed decoy cache written here |
+| `--decoys-per-row` | `2` | decoys planned per caption |
+| `--decoy-seed` | `1234` | plan RNG (separate from the split seed) |
+| `--swap-fields` | all labels | restrict which fields may be swapped |
+| `--splits` | `<cache-dir>/splits.json` | keeps donors inside the owner's split |
+| `--allow-same-protein-donor` | off | permit sibling-caption donors |
+| `--allow-cross-split-donors` | off | permit corpus-wide donors |
+| `--max-swap-char` | auto | only swap fields starting before this offset |
+| `--plan-only` / `--encode-only` / `--merge-only` | | run one phase |
+
+`src/train_hard_negatives` then resumes a retrieval checkpoint with **the same R2
+objective it finished on** and adds `w(step) * L_decoy`, where `w` ramps linearly
+from zero. Pass the same loss weights the retrieval run used (`--align-aux-weight`,
+`--recon-weight`, `--r2-uniformity-weight`) — otherwise "resume with its existing
+objective" silently isn't. The per-step log adds `w_dec` (current ramp weight),
+`d_acc` (anchors already ranked above their hardest decoy), `d_margin` (FILIP-score
+lead over it) and `d_rows` (anchors in this batch that had a decoy); the per-epoch
+val line adds `val_decoy_acc` / `val_decoy_margin`, and a **baseline** val line is
+printed before training so the ramp has a reference point. The goal is `d_acc` up
+with `R@K` flat — if R@K sags as the ramp tops out, lower `--decoy-weight` or
+switch to the bounded hinge (`--decoy-margin 0.02`).
+
+| flag (`train_hard_negatives`) | default | meaning |
+|---|---|---|
+| `--resume` | required | retrieval checkpoint (path, or `auto`) |
+| `--retrieval-ckpt-dir` | `checkpoints/retrieval/` | searched by `--resume auto` |
+| `--decoy-cache-dir` | `cache/decoys/` | |
+| `--ckpt-dir` | `checkpoints/hard_negatives/` | retrieval-format checkpoints |
+| `--epochs` / `--lr` | `3` / `5e-5` | fresh cosine schedule at fine-tune LR |
+| `--load-optimizer` | off | reuse the retrieval run's optimizer state |
+| `--decoy-weight` | `0.5` | weight after the ramp |
+| `--decoy-start-frac` | `0.05` | fraction of the run before the ramp starts |
+| `--decoy-ramp-frac` | `0.35` | fraction spent ramping 0 → weight |
+| `--decoy-margin` | `0.0` | `0` = (K+1)-way softmax; `>0` = hinge on the FILIP gap |
+| `--max-decoys` | `2` | decoys scored per anchor per step |
+| `--group-size` / `--filip-chunk-rows` | `16` / `0` | as in `train_retrieval` |
+
+The decoy term is protein→text only (the reverse would need decoy *proteins*) and
+per-anchor: a decoy built from caption *i* says nothing about protein *j*, so it
+is scored only against its own protein.
+
 ### `src/train_reconstruction`
 
 Optional phase between retrieval and generation. Loads a retrieval checkpoint,
@@ -254,6 +337,31 @@ per-epoch log re-runs the eval to confirm); the gain is a less-lossy
 | `--cvae-d-w` | `32` | latent dimension |
 | `--cvae-n-latent-tokens` | `4` | extra cross-attn memory tokens decoded from `w` |
 | `--cvae-beta-max` | `0.1` | KL weight after warmup |
+| `--rt-eval` / `--no-rt-eval` | on | per-epoch round-trip retrieval eval (below) |
+| `--rt-samples` | `256` | val rows in the fixed round-trip pool (0 ⇒ off) |
+| `--rt-batch-size` | `8` | per-rank generation batch during the eval |
+| `--rt-max-new-tokens` | `--max-target-tokens` | the eval's real cost knob |
+| `--rt-temperature` / `--rt-top-p` | `1.0` / `0.9` | eval sampling (0 ⇒ greedy) |
+| `--rt-seed` | `1234` | picks the pool; training RNG is restored around each eval |
+| `--rt-at-start` / `--no-rt-at-start` | on | epoch=−1 baseline; also smoke-tests the eval |
+
+**Per-epoch round-trip eval.** Val CE is teacher-forced, so it can fall while
+free-running generation ignores the conditioning entirely — the confound
+`src/train_rl.py` exists to fix. Each epoch the trainer therefore also
+generates a *fixed* val pool free-running, re-encodes each output, and scores
+accession-grouped R@K/mAP back to the sources, using the same
+`score_roundtrip_records` scorer as `python -m src.roundtrip_eval` (so an in-loop
+curve and an offline number agree on the same pool). Reported as `[gen][rt]`, with
+the mean generated vs true body length, and appended to
+`<ckpt-dir>/sft_roundtrip.jsonl` (also stored under `roundtrip` in `train_log`).
+
+Cost is deliberately small: the pool is sharded round-robin across ranks, so it is
+one *small* generate per rank, one encoder pass over those rows, and one N×N FILIP
+on rank 0 — flat in world size until the pool exceeds `world_size × --rt-batch-size`.
+The source features and the true targets (the ceiling row, computed once) come
+straight from the packed cache, so the only new resident model is the **target**
+encoder — AMPLIFY-350M for `text2protein`, BioLinkBERT for `protein2text` — loaded
+up front so a bad config fails in the first minute rather than at the end of epoch 0.
 
 Config knobs in `GenerationCfg` not on the CLI: `lora_rank=16`,
 `lora_alpha=32`, `lora_dropout=0.05`, `lora_targets_self_attn=True`,
