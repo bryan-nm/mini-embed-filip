@@ -326,6 +326,15 @@ def main() -> None:
     ap.add_argument("--reward-margin-beta", type=float, default=1.0,
                     help="weight on the hardest-negative term for --reward-contrastive. 0 "
                          "reproduces the raw positive score; 1.0 is the best_of_n margin")
+    ap.add_argument("--log-margin-ceiling", action="store_true",
+                    help="on logged steps, also encode the batch's TRUE targets and report "
+                         "the same margin for them (cmargin). Needed to read `margin` at "
+                         "all: the negative term is a MAX over B-1 draws, which is "
+                         "upward-biased against a single positive draw, so margin<0 is NOT "
+                         "by itself evidence of hubness — it has to be read against what "
+                         "the ground-truth pair scores under the identical statistic. "
+                         "Costs B extra encodes on logged steps only (~nothing next to the "
+                         "B*G generation that dominates the step)")
     ap.add_argument("--reward-filip-chunk-rows", type=int, default=8,
                     help="row chunk for the [B*G, B] reward matrix under "
                          "--reward-contrastive. Distinct from --eval-filip-chunk-rows, "
@@ -776,6 +785,21 @@ def main() -> None:
             # which is what sizes --length-lambda (see its help text).
             r = reward.view(B, G)
             adv = (r - r.mean(dim=1, keepdim=True)) / (r.std(dim=1, keepdim=True) + args.adv_eps)
+            # Ceiling: the same pos/hard-neg statistic on the GROUND-TRUTH targets.
+            # Only meaningful for the contrastive reward, and only on logged steps.
+            cmargin = None
+            if (args.reward_contrastive and args.log_margin_ceiling
+                    and (step % args.log_every == 0 or step == args.steps - 1)):
+                h_true, m_true = enc_tgt([get_tgt(pairs[i]) for i in prompt_idx])
+                z_true = tgt_proj(h_true.float())                    # [B, Lt, D]
+                S_t = filip_score_matrix_chunked(
+                    z_true, z_src, m_true, mask_src,
+                    chunk_rows=args.reward_filip_chunk_rows).clamp(-1.0, 1.0)  # [B, B]
+                eye = torch.arange(B, device=device)
+                cpos = S_t.gather(1, eye[:, None]).squeeze(1)
+                cneg = S_t.masked_fill(same, -1.0).max(dim=1).values
+                cmargin = (cpos - args.reward_margin_beta * cneg).mean()
+
             _dev_sync(device)
             t_rew = time.time() - t_step - t_gen
             adv = adv.reshape(B * G)                             # [B*G]
@@ -831,6 +855,10 @@ def main() -> None:
                 margin_msg = (f"pos={filip_pos.mean().item():.4f} "
                               f"neg={hard_neg.mean().item():.4f} "
                               f"margin={(filip_pos - hard_neg).mean().item():.4f} ")
+                if cmargin is not None:
+                    # Ground-truth pair under the identical max-over-negatives
+                    # statistic. margin is only readable relative to this.
+                    margin_msg += f"cmargin={cmargin.item():.4f} "
             print(f"[rl] step={step}/{args.steps} lr={optim.param_groups[0]['lr']:.2e} "
                   f"reward={reward.mean().item():.4f} (max {reward.max().item():.4f}) "
                   f"filip={filip_r.mean().item():.4f} {margin_msg}rstd={rstd:.4f} "

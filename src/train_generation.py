@@ -1263,9 +1263,16 @@ def main() -> None:
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt.get("global_step", start_epoch * len(train_loader))
         if start_epoch >= args.epochs:
+            # Report start_epoch, not ckpt['epoch'] — the old message compared the
+            # two but printed the third ("epoch 6 already at/past --epochs 7"),
+            # which is false on its face and sends you to --epochs 7 when the
+            # loop range(start_epoch, epochs) needs 8 to run even one epoch.
             raise RuntimeError(
-                f"--resume epoch {ckpt['epoch']} already at/past --epochs {args.epochs}; "
-                f"increase --epochs to continue")
+                f"--resume checkpoint finished epoch {ckpt['epoch']}, so training would "
+                f"start at epoch {start_epoch}, but --epochs is {args.epochs} and the "
+                f"loop runs range({start_epoch}, {args.epochs}) — nothing to do. "
+                f"Pass --epochs {args.epochs + 1} or higher to run "
+                f"{args.epochs + 1 - start_epoch} more epoch(s).")
         log = ckpt.get("train_log", [])
         if env.is_main:
             print(f"[resume] loaded {resume_path}; resuming at epoch {start_epoch} "

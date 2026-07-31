@@ -74,13 +74,14 @@ REW_CHUNK=${REW_CHUNK:-8}
 OUT=${OUT:-/flare/NLDesignProtein/bryan/FILIP-dev-space/debug_diag/${PBS_JOBID%%.*}}
 mkdir -p "${OUT}"
 
-# train_generation counts epochs ABSOLUTELY, not as "how many more to run": a
-# resume from epoch N with --epochs 1 is rejected outright
-#   ("--resume epoch N already at/past --epochs 1").
-# So read the checkpoint's epoch and ask for exactly one more. One epoch over
-# SUBSET rows is a couple of steps, and the coverage profile prints at the
-# END-of-epoch val pass — so the epoch must actually complete for phase 1 to
-# produce anything at all.
+# train_generation counts epochs ABSOLUTELY, not as "how many more to run", and
+# the loop is range(start_epoch, --epochs) with start_epoch = ckpt_epoch + 1.
+# So a checkpoint at epoch 6 needs --epochs 8 to run ONE more epoch: 7 is the
+# empty range and is rejected. (+1 was the first fix here and it was off by one;
+# the old error message said "epoch 6 already at/past --epochs 7", comparing
+# start_epoch but printing ckpt_epoch. That message is now fixed too.)
+# The epoch must actually complete: the coverage profile prints at the
+# END-of-epoch val pass.
 RESUME_EPOCH=$(python - "$SFT_CKPT" <<'PY'
 import sys, torch
 try:
@@ -94,8 +95,9 @@ if [ "${RESUME_EPOCH}" -lt 0 ]; then
     echo "FATAL: could not read 'epoch' from ${SFT_CKPT}" >&2
     exit 1
 fi
-EPOCHS=$(( RESUME_EPOCH + 1 ))
-echo "resume checkpoint is at epoch ${RESUME_EPOCH} -> running --epochs ${EPOCHS} (one more)"
+EPOCHS=$(( RESUME_EPOCH + 2 ))
+echo "resume checkpoint finished epoch ${RESUME_EPOCH} -> starts at $(( RESUME_EPOCH + 1 )), \
+--epochs ${EPOCHS} (exactly one more)"
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -123,7 +125,14 @@ COMMON_SFT="--direction text2protein --retrieval-ckpt ${RCKPT} --device xpu \
     --memory-space aligned --cross-attn-mode aligned --resume ${SFT_CKPT} \
     --batch-size ${BS} --epochs ${EPOCHS} --max-target-tokens ${MAX_TGT} --direction-augment \
     --cross-attn-every ${CAE} --unfreeze-top 0 --no-lora \
-    --subset-size ${SUBSET} --val-subset ${VAL_SUBSET}"
+    --subset-size ${SUBSET} --val-subset ${VAL_SUBSET} \
+    --no-rt-eval --no-rt-at-start"
+# --no-rt-eval / --no-rt-at-start: BOTH default ON (train_generation.py
+# set_defaults), so every SFT phase was free-running 85 val rows at max_new=1024
+# — once before the first epoch and once per epoch. Minutes of generation that
+# these phases have no use for: the coverage profile comes from the val CE pass,
+# not the round-trip. This is a large share of why phase 1 blew its cap on job
+# 8722785. Drop the flags if you ever want R@K out of a diagnostic run.
 
 # Each phase is time-boxed so one slow/hung phase cannot eat the whole job, and
 # non-fatal so a later phase still runs if an earlier one dies.
@@ -154,7 +163,7 @@ run_phase () {  # run_phase <n> <minutes> <description> <command...>
 #              the point at which to stop and rethink.
 #   p10/p50/p90 the distribution those fractions come from.
 # ---------------------------------------------------------------------------
-run_phase 1 12 "coverage baseline (measure only, lambda=0)" \
+run_phase 1 20 "coverage baseline (measure only, lambda=0)" \
     ${MPI} python -m src.train_generation ${COMMON_SFT} \
     --coverage-lambda 0 --coverage-tau "${COV_TAU}" \
     --ckpt-dir "${OUT}/p1"
@@ -169,7 +178,7 @@ run_phase 1 12 "coverage baseline (measure only, lambda=0)" \
 # aux would silently be a no-op under checkpointing), so a big decoder needs the
 # aux verified at small BS instead.
 # ---------------------------------------------------------------------------
-run_phase 2 12 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
+run_phase 2 13 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
     ${MPI} python -m src.train_generation ${COMMON_SFT} \
     --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
     --ckpt-dir "${OUT}/p2"
@@ -187,13 +196,13 @@ run_phase 2 12 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
 #           will actually train with.
 # Eval off (--eval-every 0) and save-every above the step count: pure measurement.
 # ---------------------------------------------------------------------------
-run_phase 3 22 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
+run_phase 3 16 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
     --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
     --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
     --reward-contrastive --reward-margin-beta "${BETA}" \
-    --reward-filip-chunk-rows "${REW_CHUNK}" \
+    --reward-filip-chunk-rows "${REW_CHUNK}" --log-margin-ceiling \
     --length-lambda 0.0 --kl-coef 0.05 --lr 1e-5 --unfreeze-lr 2e-6 \
     --log-every 1 --save-every 100000 --eval-every 0 \
     --ckpt-dir "${OUT}/p3"
@@ -203,7 +212,7 @@ run_phase 3 22 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
 # control that says whether the margin term changed the reward landscape at all.
 # Same seed and step count, so the two logs are directly comparable line by line.
 # ---------------------------------------------------------------------------
-run_phase 4 18 "RL raw reward control (${RL_STEPS} steps)" \
+run_phase 4 14 "RL raw reward control (${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
     --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
