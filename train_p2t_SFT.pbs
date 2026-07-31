@@ -53,6 +53,25 @@ GRAD_CKPT=${GRAD_CKPT:-0}
 # (wall time is linear in it); RT_SAMPLES=0 turns the eval off.
 RT_SAMPLES=${RT_SAMPLES:-512}
 RT_MAX_NEW=${RT_MAX_NEW:-${MAX_TGT}}
+# Cross-attention coverage aux — see train_t2p_SFT.pbs for what it does and why.
+#
+# COV_TAU HERE IS DERIVED, NOT MEASURED — the one number in these scripts that
+# rests on arithmetic rather than a run. tau is an absolute attention mass, so it
+# only means anything relative to source length. text2protein measured
+# unif=0.0104 (captions, ~96 effective valid tokens) and took tau = 2.4 * unif =
+# 0.025. This direction's source is a PROTEIN, a few hundred residues, so unif
+# lands near 0.003 and the same 2.4x multiple gives ~0.007. Carrying t2p's 0.025
+# over unchanged would have been 8x too strict and would have penalized nearly
+# every source position.
+#
+# CONFIRM ON THE FIRST RUN. [val][cov] prints unif and the frac_below ladder every
+# epoch regardless of COV_LAMBDA. Check two things in epoch 0's line:
+#   - unif is near 0.003. If it is not, rescale: tau = 2.4 * unif.
+#   - frac_below <0.01 is a minority (t2p's starved tail was 20%). If it is
+#     already ~0.9, tau is far too high for this direction and the aux is
+#     penalizing everything uniformly — rescale before trusting the run.
+COV_LAMBDA=${COV_LAMBDA:-0.5}
+COV_TAU=${COV_TAU:-0.007}
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -83,6 +102,14 @@ else
     EXTRA="${EXTRA} --rt-samples ${RT_SAMPLES} --rt-max-new-tokens ${RT_MAX_NEW}"
 fi
 
+if [ "$GRAD_CKPT" = 1 ] && [ "$COV_LAMBDA" != "0.0" ] && [ "$COV_LAMBDA" != "0" ]; then
+    echo "FATAL: COV_LAMBDA>0 cannot be combined with GRAD_CKPT=1 — under" >&2
+    echo "       checkpointing the aux reads last_attn from the no_grad pass and" >&2
+    echo "       would train as a silent no-op. The trainer rejects this too; this" >&2
+    echo "       check just fails before burning the queue slot on model loading." >&2
+    exit 1
+fi
+
 source ~/bin/slack_notify.sh
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 
@@ -100,6 +127,7 @@ mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     --memory-space aligned --cross-attn-mode aligned \
     --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
     --max-target-tokens "${MAX_TGT}" \
+    --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
     --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100 ${EXTRA}
 
 rc=$?

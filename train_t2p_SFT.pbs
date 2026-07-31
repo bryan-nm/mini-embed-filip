@@ -45,6 +45,31 @@ MAX_TGT=${MAX_TGT:-1024}
 EPOCHS=${EPOCHS:-20}
 LR=${LR:-1.5e-4}
 GRAD_CKPT=${GRAD_CKPT:-0}
+# Cross-attention coverage aux. Cross-attn softmaxes over the memory axis, so each
+# decoder position must spend its mass on the caption, but no caption position is
+# required to RECEIVE any — an unattended source token contributes ~0 to every
+# attn_out and cannot reach the output at all.
+#
+# The deficit is MEASURED on this exact config (job 8723205, epoch-6 checkpoint,
+# 39,216 val source positions): captions average ~96 valid tokens so uniform
+# attention is 0.0104, and the coverage distribution came out p10=0.006
+# p50=0.026 p90=0.128. ~20% of caption positions sit at or below uniform — no
+# decoder position attends them more than if attention ignored them outright.
+# TAU=0.025 (~2.4x uniform) targets that starved lower half.
+#
+# ON at LAMBDA=0.5 (~2% of CE at the measured covpen). Note what is and is not
+# established: the coverage DEFICIT is measured, the BENEFIT is not. No run has
+# yet shown this improves multi-clause fidelity or round-trip R@K — it is on by
+# decision, not by evidence. So treat the first job under it as the A/B:
+#   [gen][rt] gen->src R@1/mAP is the metric that has to hold or improve. If it
+#   drops versus the last COV_LAMBDA=0 run at the same epoch, the aux is buying
+#   coverage at the cost of the thing you actually want — set -v COV_LAMBDA=0.
+#   covpen should fall over training and val ce should not climb; ce drifting up
+#   while covpen collapses means lambda is too high for this tau.
+# Incompatible with GRAD_CKPT=1 — the trainer rejects the pair rather than let
+# the aux silently no-op.
+COV_LAMBDA=${COV_LAMBDA:-0.5}
+COV_TAU=${COV_TAU:-0.025}
 # Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart to
 # val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank here and
 # costs one generate + one N x N FILIP per epoch. RT_MAX_NEW is the real cost knob
@@ -90,7 +115,16 @@ source ~/bin/slack_notify.sh
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 
 echo "t2p SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}" \
-     "rt_samples=${RT_SAMPLES} rt_max_new=${RT_MAX_NEW}"
+     "rt_samples=${RT_SAMPLES} rt_max_new=${RT_MAX_NEW}" \
+     "cov_lambda=${COV_LAMBDA} cov_tau=${COV_TAU}"
+
+if [ "$GRAD_CKPT" = 1 ] && [ "$COV_LAMBDA" != "0.0" ] && [ "$COV_LAMBDA" != "0" ]; then
+    echo "FATAL: COV_LAMBDA>0 cannot be combined with GRAD_CKPT=1 — under" >&2
+    echo "       checkpointing the aux reads last_attn from the no_grad pass and" >&2
+    echo "       would train as a silent no-op. The trainer rejects this too; this" >&2
+    echo "       check just fails before burning the queue slot on model loading." >&2
+    exit 1
+fi
 
 # --pmi=pmix is REQUIRED to match CCL_PROCESS_LAUNCHER=pmix: it tells PALS to
 # expose a PMIx server for CCL to bootstrap against. Without it, pmix is requested
@@ -111,6 +145,7 @@ mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     --memory-space aligned --cross-attn-mode aligned \
     --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
     --max-target-tokens "${MAX_TGT}" --direction-augment \
+    --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
     --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100 ${EXTRA}
 
 rc=$?

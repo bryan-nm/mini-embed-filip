@@ -301,10 +301,16 @@ def main() -> None:
     ap.add_argument("--length-lambda", type=float, default=0.0,
                     help="weight on the two-sided length penalty (0 = off, reward is pure "
                          "FILIP). Only within-group spread survives GRPO's standardizer, so "
-                         "size this against the logged rstd (within-group std of the FILIP "
-                         "reward): lambda ~ 4.5*rstd makes a 2x length error cost about one "
-                         "group-std at the default tolerance. Turn it up only if the length "
-                         "distribution is still wrong once the SFT-side fixes are in")
+                         "size this against the logged rstd (within-group std of the reward): "
+                         "lambda ~ 4.5*rstd makes a 2x length error cost about one group-std "
+                         "at the default tolerance. MEASURED on text2protein (jobs 8722544 raw "
+                         "/ 8722785 contrastive, epoch-6 SFT policy): rstd 0.05-0.12 under "
+                         "BOTH rewards, so ~0.4. And the trigger condition is met — lenratio "
+                         "ran 1.57-2.21 (median ~1.7) across both jobs, i.e. the SFT-side "
+                         "fixes did NOT settle the length distribution on their own. "
+                         "train_t2p_rl.pbs now defaults LEN_LAMBDA=0.4 on that basis; "
+                         "protein2text is unmeasured (its lengths are text characters, not "
+                         "residues) and still defaults to 0")
     ap.add_argument("--length-tolerance", type=float, default=0.25,
                     help="dead zone: no penalty while L_gen is in "
                          "[L_true/(1+t), L_true*(1+t)] — log-symmetric, so 2x and 0.5x cost "

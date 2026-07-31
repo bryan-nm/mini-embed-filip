@@ -34,13 +34,37 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 # advantage degrades fast with a small group.
 MAXNEW=${MAXNEW:-1024}
 PPR=${PPR:-8}
-# Length band on the reward, OFF by default. The SFT-side fixes (no synthetic EOS
-# on truncated targets, 1024 cap, bidirectional factorization) are expected to fix
-# the length distribution on their own; this is the fallback if they don't. Size
-# it against the rstd printed in the step log — lambda ~ 4.5*rstd makes a 2x
-# length error cost about one group-std. Watch lenratio (median L_gen/L_true; 1.0
-# is on target) before reaching for it.
-LEN_LAMBDA=${LEN_LAMBDA:-0.0}
+# Length band on the reward, now ON. It was off pending evidence: the SFT-side
+# fixes (no synthetic EOS on truncated targets, 1024 cap, bidirectional
+# factorization) were expected to settle the length distribution by themselves,
+# and the stated condition for reaching for this was "watch lenratio (median
+# L_gen/L_true; 1.0 is on target)". That condition is now met by measurement —
+# debug jobs 8722544 and 8722785 (epoch-6 SFT policy, MAXNEW=1024) both ran
+# lenratio 1.57-2.21, median ~1.7. Generations are consistently ~70% too long.
+# 0.4 is the sizing rule applied to the measured rstd: 4.5 * 0.09, where rstd
+# came out 0.05-0.12 under BOTH the raw and contrastive rewards, so the same
+# value holds either way. Set LEN_LAMBDA=0 to reproduce the old behaviour.
+LEN_LAMBDA=${LEN_LAMBDA:-0.4}
+# Contrastive reward, now ON: reward = FILIP(gen, own caption) - beta * max_j
+# FILIP(gen, other caption in batch), instead of the raw positive score. The raw
+# score is absolute and negative-free, so it can be raised by a "hub" output that
+# scores well against EVERY caption; GRPO's standardizer cannot see that (it
+# removes a per-prompt constant, and hubness is a property of the sample).
+#
+# Job 8722785 showed margin -0.09 to -0.16 every step while the raw score looked
+# healthy at ~0.7 — the hubness signature. That is SUGGESTIVE, NOT ESTABLISHED:
+# the negative term is a MAX over B-1 draws and is upward-biased against a single
+# positive draw, so a negative margin is partly a property of the statistic.
+# --log-margin-ceiling is enabled below and settles it in this run's own log:
+#   cmargin is the identical statistic on GROUND-TRUTH pairs. If margin tracks
+#   cmargin, the negative number was the max-statistic and means nothing. If
+#   cmargin sits well above margin, the generations really are generic and this
+#   reward is doing the job. Read it in the first few step lines.
+# Watch eval R@K/mAP the same way as always — the reward changed scale, so reward
+# curves are NOT comparable to earlier runs, but R@K still is.
+# REWARD_CONTRASTIVE=0 reverts to the raw positive score.
+REWARD_CONTRASTIVE=${REWARD_CONTRASTIVE:-1}
+MARGIN_BETA=${MARGIN_BETA:-1.0}
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -87,6 +111,13 @@ slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 # The reward alone can't distinguish real conditioning from drift toward one
 # generic high-scoring output; the pooled R@K/mAP can. ~1 rollout of extra
 # generation per eval, so <1% of wall time at this cadence.
+REWARD_EXTRA=""
+[ "${REWARD_CONTRASTIVE}" = 1 ] && REWARD_EXTRA="--reward-contrastive \
+    --reward-margin-beta ${MARGIN_BETA} --log-margin-ceiling"
+
+echo "t2p RL: len_lambda=${LEN_LAMBDA} contrastive=${REWARD_CONTRASTIVE} \
+beta=${MARGIN_BETA} maxnew=${MAXNEW} ppr=${PPR}"
+
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${INIT_CKPT}" --device xpu \
@@ -94,7 +125,7 @@ mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
     --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 \
     --length-lambda "${LEN_LAMBDA}" --length-tolerance 0.25 \
-    --log-every 10 --save-every 200 \
+    --log-every 10 --save-every 200 ${REWARD_EXTRA} \
     --eval-every 200 --eval-samples 1000 --eval-max-new-tokens "${MAXNEW}"
 
 rc=$?

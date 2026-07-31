@@ -23,6 +23,32 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 : "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
 : "${INIT_CKPT:?set -v INIT_CKPT=path/to/sft/protein2text/epochNN.pt (the working ckpt)}"
 
+# Contrastive reward ON, length band OFF. The two are calibrated differently and
+# that is deliberate:
+#
+#   REWARD_CONTRASTIVE has no direction-specific constant to get wrong. Its only
+#   parameter is beta, and beta=1.0 is the best_of_n margin definition, which is
+#   modality-agnostic. --log-margin-ceiling reports cmargin (the same statistic on
+#   ground-truth pairs) so this run self-calibrates: margin tracking cmargin means
+#   the generations are as specific as the references; margin far below cmargin
+#   means they are generic. See train_t2p_rl.pbs for the full reasoning.
+#
+#   LEN_LAMBDA does have a direction-specific constant and it is UNMEASURED here.
+#   text2protein got 0.4 from rstd~0.09 (debug jobs 8722544/8722785) with the
+#   trigger condition confirmed by lenratio~1.7. Neither number transfers: p2t
+#   lengths are text CHARACTERS not residues, and the reward re-encodes captions
+#   not proteins, so rstd and lenratio are different quantities here. Leaving it
+#   at 0 costs nothing; guessing could actively distort caption length.
+#   To calibrate: read rstd and lenratio off this run's step log (--log-every 10
+#   already prints both), then apply LEN_LAMBDA ~ 4.5*rstd — and only if lenratio
+#   is actually off 1.0.
+#
+# NOTE: the contrastive reward is on a different scale from the raw one, so reward
+# curves here are not comparable to earlier p2t runs. R@K/mAP still are.
+LEN_LAMBDA=${LEN_LAMBDA:-0.0}
+REWARD_CONTRASTIVE=${REWARD_CONTRASTIVE:-1}
+MARGIN_BETA=${MARGIN_BETA:-1.0}
+
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
 # RL rollouts are embarrassingly parallel: effective GRPO batch scales with NRANKS.
@@ -62,13 +88,20 @@ slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 # The reward alone can't distinguish real conditioning from drift toward one
 # generic high-scoring caption; the pooled R@K/mAP can. ~1 rollout of extra
 # generation per eval, so <1% of wall time at this cadence.
+REWARD_EXTRA=""
+[ "${REWARD_CONTRASTIVE}" = 1 ] && REWARD_EXTRA="--reward-contrastive \
+    --reward-margin-beta ${MARGIN_BETA} --log-margin-ceiling"
+
+echo "p2t RL: len_lambda=${LEN_LAMBDA} contrastive=${REWARD_CONTRASTIVE} beta=${MARGIN_BETA}"
+
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     python -m src.train_rl --direction protein2text \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${INIT_CKPT}" --device xpu \
     --resume auto --steps 2000 --prompts-per-rank 8 --group-size 8 \
     --max-new-tokens 128 --temperature 1.0 --top-p 0.95 \
     --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 \
-    --log-every 10 --save-every 200 \
+    --length-lambda "${LEN_LAMBDA}" --length-tolerance 0.25 \
+    --log-every 10 --save-every 200 ${REWARD_EXTRA} \
     --eval-every 200 --eval-samples 1000
 
 rc=$?

@@ -1,0 +1,289 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_debug_diag_p2t
+#PBS -l walltime=01:00:00
+#PBS -l select=2
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m abe
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+# ---------------------------------------------------------------------------
+# protein -> text calibration run. The p2t counterpart of debug_diagnostics.pbs.
+#
+# WHY THIS EXISTS: every measured constant in the production scripts came from
+# text2protein, and none of it transfers. tau is an absolute attention mass, so
+# it only means anything relative to source length — t2p sources are captions
+# (unif=0.0104), p2t sources are proteins (unif expected ~10x smaller). And p2t
+# reward lengths are text CHARACTERS, not residues. train_p2t_SFT.pbs currently
+# ships COV_TAU=0.007 as DERIVED arithmetic (2.4 x an assumed unif~0.003) and
+# train_p2t_rl.pbs ships LEN_LAMBDA=0 for want of an rstd. This run replaces both
+# guesses with measurements.
+#
+# WHAT IT SETTLES:
+#   COV_TAU       phase 1 prints unif + the coverage distribution for a PROTEIN
+#                 source. Confirms or corrects the shipped 0.007.
+#   COV_LAMBDA    phase 2 gives covpen-vs-ce at that tau.
+#   LEN_LAMBDA    phases 3/4 print rstd and lenratio -> 4.5*rstd, and whether the
+#                 length band is even warranted (lenratio off 1.0).
+#   cmargin       phase 3 reports the margin ceiling on ground-truth pairs, which
+#                 is what makes `margin` readable at all.
+#
+# WHAT IT CANNOT SETTLE: whether either change IMPROVES anything. That needs
+# full-scale A/B on [gen][rt] R@K/mAP.
+#
+# CACHE SAFETY — the reason this script has a private cache block below:
+#   train_generation calls build_or_load_splits(<cache_dir>/splits.json, ...), and
+#   --subset-size makes the existing file look STALE (n mismatch), so it is
+#   REBUILT AND SAVED (train_generation.py:865, data.py:280-286). splits.json is
+#   the ONLY file any of these stages writes into cache_dir — everything else
+#   (*_h.bin, *_offsets.pt, *_mask.bin, row_protein_idx.pt) is opened read-only
+#   or memmapped mode="r", and train_rl only reads splits.json.
+#   So: a private cache dir of SYMLINKS to the read-only artifacts, plus its own
+#   real splits.json file, is fully isolated and copies none of the big buffers.
+#   Backing up and restoring the shared file would NOT be safe here — concurrent
+#   jobs are using that cache, and a restore would clobber their writes. This
+#   script never opens the shared cache for writing at all.
+#
+# Usage:
+#   qsub -v RCKPT=/path/retrieval/epochNN.pt,SFT_CKPT=/path/generation/protein2text/epochNN.pt \
+#        debug_diagnostics_p2t.pbs
+# Optional: -v PHASES=12, RL_STEPS=..., COV_TAU=..., REAL_CACHE=...
+# ---------------------------------------------------------------------------
+
+: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+: "${SFT_CKPT:?set -v SFT_CKPT=path/to/generation/protein2text/epochNN.pt}"
+
+PHASES=${PHASES:-1234}
+SUBSET=${SUBSET:-2000}         # tiny train subset: these phases measure, not train
+VAL_SUBSET=${VAL_SUBSET:-128}
+# p2t sizing, mirroring train_p2t_SFT.pbs: BioGPT is 24 dense layers, cross-attn
+# every other one, smaller batch, and the target is a 512-token caption.
+BS=${BS:-8}
+CAE=${CAE:-2}
+MAX_TGT=${MAX_TGT:-512}
+# The value under test. train_p2t_SFT.pbs ships this as derived-not-measured;
+# phase 1 measures the distribution it was guessed against.
+COV_TAU=${COV_TAU:-0.007}
+COV_LAMBDA=${COV_LAMBDA:-0.5}
+# p2t rollouts are short (captions, not proteins) and BioGPT is dense, so steps
+# are far cheaper than t2p's ~49s. 5 steps is enough for an rstd distribution.
+RL_STEPS=${RL_STEPS:-5}
+MAXNEW=${MAXNEW:-128}
+PPR=${PPR:-8}
+BETA=${BETA:-1.0}
+REW_CHUNK=${REW_CHUNK:-8}
+
+OUT=${OUT:-/flare/NLDesignProtein/bryan/FILIP-dev-space/debug_diag/${PBS_JOBID%%.*}_p2t}
+mkdir -p "${OUT}"
+JOB_START=$(date '+%Y-%m-%d %H:%M:%S')
+
+# ---------------------------------------------------------------------------
+# Private cache: symlink the read-only artifacts, own the one written file.
+# ---------------------------------------------------------------------------
+REAL_CACHE=${REAL_CACHE:-/flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip/cache}
+CACHE="${OUT}/cache"
+mkdir -p "${CACHE}"
+
+# Every file the loaders READ. Missing ones fail loudly here rather than as an
+# opaque memmap error 10 minutes into model loading.
+RO_FILES="text_h.bin text_offsets.pt text_mask.bin \
+protein_h.bin protein_offsets.pt protein_mask.bin row_protein_idx.pt"
+missing=""
+for f in ${RO_FILES}; do
+    if [ -e "${REAL_CACHE}/${f}" ]; then
+        ln -sfn "${REAL_CACHE}/${f}" "${CACHE}/${f}"
+    else
+        missing="${missing} ${f}"
+    fi
+done
+if [ -n "${missing}" ]; then
+    echo "FATAL: missing in ${REAL_CACHE}:${missing}" >&2
+    echo "       Set -v REAL_CACHE=... to the cache precompute actually wrote." >&2
+    exit 1
+fi
+
+# splits.json is deliberately NOT symlinked and NOT copied. Not symlinked because
+# a write would follow the link straight back into the shared cache — the exact
+# bug this block exists to prevent. Not copied because build_or_load_splits would
+# see the full-corpus file as stale under --subset-size and rebuild it anyway;
+# starting absent makes the split deterministic in (n, ratios, seed, group_ids)
+# and independent of whatever concurrent jobs are doing to the shared one.
+rm -f "${CACHE}/splits.json"
+
+# Fail rather than run if anything above could write through to the shared cache.
+if [ -L "${CACHE}/splits.json" ]; then
+    echo "FATAL: ${CACHE}/splits.json is a symlink; writes would reach the shared cache" >&2
+    exit 1
+fi
+echo "private cache: ${CACHE} (symlinks -> ${REAL_CACHE}, own splits.json)"
+echo "shared cache ${REAL_CACHE} is READ-ONLY for this job"
+
+# ---------------------------------------------------------------------------
+# Epoch arithmetic: the loop is range(ckpt_epoch + 1, --epochs), so one more
+# epoch needs ckpt_epoch + 2. The coverage profile prints at the END-of-epoch
+# val pass, so the epoch has to actually complete.
+# ---------------------------------------------------------------------------
+RESUME_EPOCH=$(python - "$SFT_CKPT" <<'PY'
+import sys, torch
+try:
+    print(int(torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+              .get("epoch", -1)))
+except Exception as e:
+    print(f"ERR {e}", file=sys.stderr); print(-1)
+PY
+)
+if [ "${RESUME_EPOCH}" -lt 0 ]; then
+    echo "FATAL: could not read 'epoch' from ${SFT_CKPT}" >&2
+    exit 1
+fi
+EPOCHS=$(( RESUME_EPOCH + 2 ))
+echo "resume checkpoint finished epoch ${RESUME_EPOCH} -> --epochs ${EPOCHS} (one more)"
+
+NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+# protein2text decoder: BioGPT. The protein encoder supplies the source memory and
+# the text encoder re-encodes generated captions for the reward.
+export FILIP_TEXT_DECODER=${FILIP_MODELS_DIR}/biogpt
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29507
+export OMP_NUM_THREADS=8
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+source ~/bin/slack_notify.sh
+slack ":microscope: START ${PBS_JOBID} ${PBS_JOBNAME} (${NNODES} nodes, p2t calibration)"
+
+MPI="mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8"
+# No --direction-augment: BioGPT has no C-to-N marker, reverse_prefix_ids() raises
+# for a non-Mixtral decoder by design, and reversed captions are meaningless.
+# --no-rt-eval / --no-rt-at-start: both default ON and free-run the val pool,
+# which these phases have no use for — the coverage profile comes from val CE.
+COMMON_SFT="--direction protein2text --retrieval-ckpt ${RCKPT} --device xpu \
+    --cache-dir ${CACHE} \
+    --memory-space aligned --cross-attn-mode aligned --resume ${SFT_CKPT} \
+    --batch-size ${BS} --epochs ${EPOCHS} --max-target-tokens ${MAX_TGT} \
+    --cross-attn-every ${CAE} --unfreeze-top 0 --no-lora \
+    --subset-size ${SUBSET} --val-subset ${VAL_SUBSET} \
+    --no-rt-eval --no-rt-at-start"
+
+COMMON_RL="--direction protein2text --retrieval-ckpt ${RCKPT} \
+    --init-ckpt ${SFT_CKPT} --device xpu --cache-dir ${CACHE} \
+    --steps ${RL_STEPS} --prompts-per-rank ${PPR} --group-size 8 \
+    --max-new-tokens ${MAXNEW} --temperature 1.0 --top-p 0.95 \
+    --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 --length-lambda 0.0 \
+    --log-every 1 --save-every 100000 --eval-every 0"
+
+run_phase () {  # run_phase <n> <minutes> <description> <command...>
+    local n=$1 mins=$2 desc=$3; shift 3
+    case "${PHASES}" in *"${n}"*) ;; *) echo "[phase ${n}] SKIPPED"; return 0 ;; esac
+    echo ""
+    echo "=================================================================="
+    echo "[phase ${n}] ${desc}  (cap ${mins}m)"
+    echo "=================================================================="
+    timeout "${mins}m" "$@" 2>&1 | tee "${OUT}/phase${n}.log"
+    local rc=${PIPESTATUS[0]}
+    [ "${rc}" = 124 ] && echo "[phase ${n}] HIT TIME CAP — partial log kept"
+    echo "[phase ${n}] exit=${rc}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 1 — THE POINT OF THIS JOB. --coverage-lambda 0, measurement only.
+# Read [val][cov]:
+#   unif        1/L for a PROTEIN source. train_p2t_SFT.pbs assumed ~0.003 to
+#               derive COV_TAU=0.007. If unif comes out elsewhere, correct it:
+#               tau = 2.4 * unif (the multiple that produced t2p's measured
+#               0.025 from its measured unif=0.0104).
+#   frac_below  t2p's starved tail was 20% of positions at or below uniform,
+#               with 70% below 0.05. If p2t's ladder looks similar, the same
+#               story holds in this direction. If frac_below at the shipped tau
+#               is already ~0.9, tau is far too high and the aux would penalize
+#               essentially every residue — fix it before any production run.
+#   p10/p50/p90 the distribution behind those fractions.
+# ---------------------------------------------------------------------------
+run_phase 1 10 "p2t coverage baseline (measure only, lambda=0)" \
+    ${MPI} python -m src.train_generation ${COMMON_SFT} \
+    --coverage-lambda 0 --coverage-tau "${COV_TAU}" \
+    --ckpt-dir "${OUT}/p1"
+
+# ---------------------------------------------------------------------------
+# PHASE 2 — does the aux train here, at the tau phase 1 just validated?
+# covpen should fall and ce should not jump. lambda*covpen wants to land around
+# 2% of ce. If covpen is ~0 the tau is too low to bite; if ce climbs, too high.
+# (No --grad-checkpointing: the trainer rejects it with the aux, since the
+# penalty would read last_attn from the no_grad pass and silently no-op.)
+# ---------------------------------------------------------------------------
+run_phase 2 10 "p2t coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
+    ${MPI} python -m src.train_generation ${COMMON_SFT} \
+    --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
+    --ckpt-dir "${OUT}/p2"
+
+# ---------------------------------------------------------------------------
+# PHASE 3 — contrastive reward + the ceiling that makes it readable.
+#   cmargin  the SAME pos-minus-hardest-negative statistic on GROUND-TRUTH
+#            captions. The negative term is a max over B-1 draws and is
+#            upward-biased, so a negative `margin` is not by itself evidence of
+#            anything. margin ~ cmargin => the number is just the max-statistic.
+#            margin << cmargin => generations really are generic.
+#   rstd     within-group std, the only scale GRPO sees. LEN_LAMBDA ~ 4.5*rstd.
+#            train_p2t_rl.pbs ships 0 purely because this was never measured.
+#   lenratio median L_gen/L_true in CHARACTERS here. Only reach for the length
+#            band if this is actually off 1.0 (t2p's was ~1.7).
+# ---------------------------------------------------------------------------
+run_phase 3 15 "p2t RL contrastive (beta=${BETA}, ${RL_STEPS} steps)" \
+    ${MPI} python -m src.train_rl ${COMMON_RL} \
+    --reward-contrastive --reward-margin-beta "${BETA}" \
+    --reward-filip-chunk-rows "${REW_CHUNK}" --log-margin-ceiling \
+    --ckpt-dir "${OUT}/p3"
+
+# ---------------------------------------------------------------------------
+# PHASE 4 — raw-reward control, same steps and seed. The rstd comparison, and
+# the check on whether the margin term changed the reward landscape at all.
+# ---------------------------------------------------------------------------
+run_phase 4 13 "p2t RL raw reward control (${RL_STEPS} steps)" \
+    ${MPI} python -m src.train_rl ${COMMON_RL} --ckpt-dir "${OUT}/p4"
+
+echo ""
+echo "=================================================================="
+echo "SUMMARY  (full logs in ${OUT})"
+echo "=================================================================="
+show_or_none () {
+    if [ -n "$1" ]; then printf '%s\n' "$1"
+    else echo "  (nothing — phase failed or was skipped)"; fi
+}
+echo "--- phase 1: p2t coverage distribution — CHECK unif vs the assumed 0.003 ---"
+show_or_none "$(grep -h '\[val\]\[cov\]' "${OUT}/phase1.log" 2>/dev/null)"
+echo "--- phase 2: does covpen fall, does ce hold? (first/last) ---"
+show_or_none "$(grep -h 'covpen=' "${OUT}/phase2.log" 2>/dev/null | sed -n '1p;$p')"
+echo "--- phase 3: margin vs cmargin, rstd, lenratio ---"
+show_or_none "$(grep -h '^\[rl\] step=' "${OUT}/phase3.log" 2>/dev/null | tail -3)"
+echo "--- phase 4: raw-reward rstd control ---"
+show_or_none "$(grep -h '^\[rl\] step=' "${OUT}/phase4.log" 2>/dev/null | tail -3)"
+echo ""
+echo "--- cache safety check (shared cache must be untouched) ---"
+if [ -e "${REAL_CACHE}/splits.json" ]; then
+    echo "  shared splits.json mtime: $(date -r "${REAL_CACHE}/splits.json" '+%Y-%m-%d %H:%M:%S')"
+    echo "  this job started at:      ${JOB_START}"
+    echo "  (an mtime AFTER the job start means something else wrote it — not this job,"
+    echo "   which never opens the shared cache for writing, but worth knowing.)"
+fi
+echo "  private splits.json: $(ls -l "${CACHE}/splits.json" 2>/dev/null || echo 'not created')"
+
+slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME} — logs in ${OUT}"
+exit 0

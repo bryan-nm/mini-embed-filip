@@ -512,14 +512,29 @@ def main() -> None:
                          "max-over-decoder-positions attention stays below --coverage-tau, "
                          "supplying the direction the retrieval FILIP score's t2p half has. "
                          "Requires --cross-attn-mode aligned; incompatible with "
-                         "--grad-checkpointing. Measure coverage before setting this")
-    ap.add_argument("--coverage-tau", type=float, default=0.1,
+                         "--grad-checkpointing. Measure coverage before setting this — "
+                         "[val][cov] prints even at 0. Sizing: at the measured text2protein "
+                         "covpen, 0.5 puts the penalty at ~2% of CE, which is enough to move "
+                         "without trading away the LM. Left at 0 because the coverage DEFICIT "
+                         "is measured but the BENEFIT is not: nothing yet shows this improves "
+                         "multi-clause fidelity or R@K, so enabling it is an A/B to run, not "
+                         "a settled default")
+    ap.add_argument("--coverage-tau", type=float, default=0.025,
                     help="attention-mass threshold a source position must reach to count as "
-                         "covered. Absolute mass, so read it against memory length: uniform "
-                         "attention over L valid positions gives 1/L (~0.002 at L=512), so any "
-                         "tau >> 1/L asks a position to be a near-argmax somewhere. The penalty "
-                         "is normalized by tau, so --coverage-lambda keeps its meaning if you "
-                         "retune this")
+                         "covered. Absolute mass, so it must be read against memory length: "
+                         "uniform attention over L valid positions gives 1/L, and a tau at or "
+                         "below that cannot separate attended from ignored. The penalty is "
+                         "normalized by tau, so --coverage-lambda keeps its meaning if you "
+                         "retune this. DEFAULT MEASURED ON text2protein (job 8723205, epoch-6 "
+                         "SFT): captions average ~96 valid tokens so unif=0.0104, and the "
+                         "coverage distribution was p10=0.006 p50=0.026 p90=0.128 with 20% of "
+                         "positions at or below uniform. 0.025 is ~2.4x uniform and targets "
+                         "that starved lower half; the old 0.1 default penalized 86% of "
+                         "positions, which is a blanket pressure rather than a targeted one. "
+                         "protein2text is UNMEASURED and wants a different value — its source "
+                         "is a protein up to 1024 tokens, so unif is ~10x smaller. Re-measure "
+                         "with --coverage-lambda 0 and read [val][cov] before trusting this "
+                         "number in that direction")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
