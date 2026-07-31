@@ -57,8 +57,8 @@ VAL_SUBSET=${VAL_SUBSET:-128}
 BS=${BS:-32}
 CAE=${CAE:-1}
 MAX_TGT=${MAX_TGT:-1024}
-COV_LAMBDA=${COV_LAMBDA:-0.1}  # phase-2 trial value; phase 1 tells you if it's sane
-COV_TAU=${COV_TAU:-0.1}        # phase-1 output replaces this for real runs
+COV_LAMBDA=${COV_LAMBDA:-0.5}  # phase-2 trial value; phase 1 tells you if it's sane
+COV_TAU=${COV_TAU:-0.025}        # phase-1 output replaces this for real runs
 # 5 steps is enough for an rstd/margin distribution — job 8722544's rstd bounced
 # 0.05-0.12 over 10 steps, so more steps buy spread, not precision. Fewer steps
 # also means a stalled phase 3 burns less of the hour before hitting its cap.
@@ -98,6 +98,30 @@ fi
 EPOCHS=$(( RESUME_EPOCH + 2 ))
 echo "resume checkpoint finished epoch ${RESUME_EPOCH} -> starts at $(( RESUME_EPOCH + 1 )), \
 --epochs ${EPOCHS} (exactly one more)"
+
+# --subset-size makes train_generation's build_or_load_splits see the existing
+# splits.json as STALE (n mismatch) and rebuild+SAVE a 2000-row split over the
+# SHARED cache dir (train_generation.py:850-864, data.py:280-286). Every other
+# stage — train_rl, roundtrip_eval, precompute_decoys, export_embeddings — reads
+# that same file, so a diagnostic run silently repartitions the real project.
+# Job 8722785's RL phase saw 1,829 train rows; job 8723205's saw 518,945 — the
+# pool these phases sample from was not stable across runs. Snapshot and restore.
+CACHE_DIR=${CACHE_DIR:-/flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip/cache}
+SPLITS="${CACHE_DIR}/splits.json"
+if [ -f "${SPLITS}" ]; then
+    cp -p "${SPLITS}" "${OUT}/splits.json.bak"
+    echo "backed up ${SPLITS} -> ${OUT}/splits.json.bak"
+    restore_splits () {
+        if [ -f "${OUT}/splits.json.bak" ]; then
+            cp -p "${OUT}/splits.json.bak" "${SPLITS}"
+            echo "restored ${SPLITS} from backup"
+        fi
+    }
+    trap restore_splits EXIT
+else
+    echo "WARNING: no ${SPLITS} to back up — check CACHE_DIR if the RL phase's" >&2
+    echo "         train-row count looks wrong." >&2
+fi
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -163,7 +187,7 @@ run_phase () {  # run_phase <n> <minutes> <description> <command...>
 #              the point at which to stop and rethink.
 #   p10/p50/p90 the distribution those fractions come from.
 # ---------------------------------------------------------------------------
-run_phase 1 20 "coverage baseline (measure only, lambda=0)" \
+run_phase 1 10 "coverage baseline (measure only, lambda=0)" \
     ${MPI} python -m src.train_generation ${COMMON_SFT} \
     --coverage-lambda 0 --coverage-tau "${COV_TAU}" \
     --ckpt-dir "${OUT}/p1"
@@ -178,7 +202,7 @@ run_phase 1 20 "coverage baseline (measure only, lambda=0)" \
 # aux would silently be a no-op under checkpointing), so a big decoder needs the
 # aux verified at small BS instead.
 # ---------------------------------------------------------------------------
-run_phase 2 13 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
+run_phase 2 10 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
     ${MPI} python -m src.train_generation ${COMMON_SFT} \
     --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
     --ckpt-dir "${OUT}/p2"
@@ -196,7 +220,7 @@ run_phase 2 13 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
 #           will actually train with.
 # Eval off (--eval-every 0) and save-every above the step count: pure measurement.
 # ---------------------------------------------------------------------------
-run_phase 3 16 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
+run_phase 3 28 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
     --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
