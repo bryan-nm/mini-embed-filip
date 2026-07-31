@@ -48,7 +48,10 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 : "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
 : "${SFT_CKPT:?set -v SFT_CKPT=path/to/generation/text2protein/epochNN.pt}"
 
-PHASES=${PHASES:-1234}
+# Default 123: phase 4 (raw-reward control) already ran clean on job 8722544 —
+# rstd 0.05-0.12, lenratio median ~1.7, ~49s/step, empty=0/64. Re-run it only to
+# re-baseline after a policy change (-v PHASES=1234).
+PHASES=${PHASES:-123}
 SUBSET=${SUBSET:-2000}         # tiny train subset: these phases measure, not train
 VAL_SUBSET=${VAL_SUBSET:-128}
 BS=${BS:-32}
@@ -56,13 +59,43 @@ CAE=${CAE:-1}
 MAX_TGT=${MAX_TGT:-1024}
 COV_LAMBDA=${COV_LAMBDA:-0.1}  # phase-2 trial value; phase 1 tells you if it's sane
 COV_TAU=${COV_TAU:-0.1}        # phase-1 output replaces this for real runs
-RL_STEPS=${RL_STEPS:-10}
+# 5 steps is enough for an rstd/margin distribution — job 8722544's rstd bounced
+# 0.05-0.12 over 10 steps, so more steps buy spread, not precision. Fewer steps
+# also means a stalled phase 3 burns less of the hour before hitting its cap.
+RL_STEPS=${RL_STEPS:-5}
 MAXNEW=${MAXNEW:-1024}         # keep at production value: rstd scales with it,
 PPR=${PPR:-8}                  # and rstd is the number we came here to measure
 BETA=${BETA:-1.0}
+# Reward-matrix row chunk. If phase 3 stalls again, this is the first knob:
+# it trades transient memory (chunk*B*L_gen*L_src floats) against the number
+# of sequential einsums. 8 matches the raw path's single-shot footprint.
+REW_CHUNK=${REW_CHUNK:-8}
 
 OUT=${OUT:-/flare/NLDesignProtein/bryan/FILIP-dev-space/debug_diag/${PBS_JOBID%%.*}}
 mkdir -p "${OUT}"
+
+# train_generation counts epochs ABSOLUTELY, not as "how many more to run": a
+# resume from epoch N with --epochs 1 is rejected outright
+#   ("--resume epoch N already at/past --epochs 1").
+# So read the checkpoint's epoch and ask for exactly one more. One epoch over
+# SUBSET rows is a couple of steps, and the coverage profile prints at the
+# END-of-epoch val pass — so the epoch must actually complete for phase 1 to
+# produce anything at all.
+RESUME_EPOCH=$(python - "$SFT_CKPT" <<'PY'
+import sys, torch
+try:
+    print(int(torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+              .get("epoch", -1)))
+except Exception as e:
+    print(f"ERR {e}", file=sys.stderr); print(-1)
+PY
+)
+if [ "${RESUME_EPOCH}" -lt 0 ]; then
+    echo "FATAL: could not read 'epoch' from ${SFT_CKPT}" >&2
+    exit 1
+fi
+EPOCHS=$(( RESUME_EPOCH + 1 ))
+echo "resume checkpoint is at epoch ${RESUME_EPOCH} -> running --epochs ${EPOCHS} (one more)"
 
 NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
@@ -88,7 +121,7 @@ slack ":microscope: START ${PBS_JOBID} ${PBS_JOBNAME} (${NNODES} nodes, calibrat
 MPI="mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8"
 COMMON_SFT="--direction text2protein --retrieval-ckpt ${RCKPT} --device xpu \
     --memory-space aligned --cross-attn-mode aligned --resume ${SFT_CKPT} \
-    --batch-size ${BS} --epochs 1 --max-target-tokens ${MAX_TGT} --direction-augment \
+    --batch-size ${BS} --epochs ${EPOCHS} --max-target-tokens ${MAX_TGT} --direction-augment \
     --cross-attn-every ${CAE} --unfreeze-top 0 --no-lora \
     --subset-size ${SUBSET} --val-subset ${VAL_SUBSET}"
 
@@ -154,12 +187,13 @@ run_phase 2 12 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
 #           will actually train with.
 # Eval off (--eval-every 0) and save-every above the step count: pure measurement.
 # ---------------------------------------------------------------------------
-run_phase 3 15 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
+run_phase 3 22 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
     --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
     --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
     --reward-contrastive --reward-margin-beta "${BETA}" \
+    --reward-filip-chunk-rows "${REW_CHUNK}" \
     --length-lambda 0.0 --kl-coef 0.05 --lr 1e-5 --unfreeze-lr 2e-6 \
     --log-every 1 --save-every 100000 --eval-every 0 \
     --ckpt-dir "${OUT}/p3"
@@ -169,7 +203,7 @@ run_phase 3 15 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
 # control that says whether the margin term changed the reward landscape at all.
 # Same seed and step count, so the two logs are directly comparable line by line.
 # ---------------------------------------------------------------------------
-run_phase 4 15 "RL raw reward control (${RL_STEPS} steps)" \
+run_phase 4 18 "RL raw reward control (${RL_STEPS} steps)" \
     ${MPI} python -m src.train_rl --direction text2protein \
     --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
     --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
@@ -182,13 +216,20 @@ echo ""
 echo "=================================================================="
 echo "SUMMARY  (full logs in ${OUT})"
 echo "=================================================================="
+# NB: `grep ... | sed ... || echo` never fires the fallback — a pipeline's status
+# is its LAST command's. Capture first, test the variable.
+show_or_none () {  # show_or_none <label> <text>
+    if [ -n "$2" ]; then printf '%s\n' "$2"; else echo "  (nothing — phase failed or was skipped)"; fi
+}
 echo "--- phase 1: coverage distribution (pick --coverage-tau from this) ---"
-grep -h "\[val\]\[cov\]" "${OUT}/phase1.log" 2>/dev/null || echo "  (no coverage line)"
+show_or_none p1 "$(grep -h '\[val\]\[cov\]' "${OUT}/phase1.log" 2>/dev/null)"
 echo "--- phase 2: does covpen fall, does ce hold? (first/last step lines) ---"
-grep -h "covpen=" "${OUT}/phase2.log" 2>/dev/null | sed -n '1p;$p' || echo "  (none)"
+show_or_none p2 "$(grep -h 'covpen=' "${OUT}/phase2.log" 2>/dev/null | sed -n '1p;$p')"
 echo "--- phase 3 vs 4: rstd + margin (size --length-lambda off the right one) ---"
-echo "  contrastive:"; grep -h "^\[rl\] step=" "${OUT}/phase3.log" 2>/dev/null | tail -3
-echo "  raw:";         grep -h "^\[rl\] step=" "${OUT}/phase4.log" 2>/dev/null | tail -3
+echo "  contrastive:"
+show_or_none p3 "$(grep -h '^\[rl\] step=' "${OUT}/phase3.log" 2>/dev/null | tail -3)"
+echo "  raw:"
+show_or_none p4 "$(grep -h '^\[rl\] step=' "${OUT}/phase4.log" 2>/dev/null | tail -3)"
 
 slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME} — logs in ${OUT}"
 exit 0

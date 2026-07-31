@@ -69,6 +69,16 @@ from src.decoder_adapters import (
     unfreeze_decoder_blocks,
 )
 from src.dist import barrier, cleanup, init_distributed
+
+
+def _dev_sync(device) -> None:
+    """Block until queued device work is done, so the phase timers below attribute
+    async kernel time to the phase that launched it instead of to whatever later
+    op happens to force the sync. No-op on CPU."""
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
 from src.encoders import (
     encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
 )
@@ -316,6 +326,14 @@ def main() -> None:
     ap.add_argument("--reward-margin-beta", type=float, default=1.0,
                     help="weight on the hardest-negative term for --reward-contrastive. 0 "
                          "reproduces the raw positive score; 1.0 is the best_of_n margin")
+    ap.add_argument("--reward-filip-chunk-rows", type=int, default=8,
+                    help="row chunk for the [B*G, B] reward matrix under "
+                         "--reward-contrastive. Distinct from --eval-filip-chunk-rows, "
+                         "which sizes the rank-0 N x N EVAL matrix and is far too small "
+                         "here (its default 4 splits a 64-row reward into 16 sequential "
+                         "einsums). The transient is chunk*B*L_gen*L_src floats; the "
+                         "default 8 matches the single-shot footprint of the raw "
+                         "filip_per_pair path it replaces (~134MB at 1024x512 fp32)")
     ap.add_argument("--lr", type=float, default=1e-5, help="adapter/head LR")
     ap.add_argument("--unfreeze-lr", type=float, default=None,
                     help="separate LR for the (SFT-)unfrozen decoder blocks; defaults to --lr")
@@ -645,6 +663,11 @@ def main() -> None:
                 device=device)
             txt_g = torch.as_tensor(dense_group_ids(srcs), device=device)
 
+        # Phase timers (gen / reward / policy). Cheap, and the only thing that
+        # localizes a stall: a step that never prints tells you nothing about
+        # WHICH phase hung, which cost a full debug-queue slot to learn once.
+        t_step = time.time()
+
         # ---- build aligned source memory (frozen), replicate G times ----
         with torch.no_grad():
             h_src, mask_src = enc_src(srcs)
@@ -665,6 +688,8 @@ def main() -> None:
         seqs = gen                                               # [B*G, P+T]
         gen_tokens = seqs[:, P:]
         gen_valid = _gen_valid_mask(gen_tokens, eos_id)          # [B*G, T]
+        _dev_sync(device)
+        t_gen = time.time() - t_step
 
         # ---- REWARD: re-encode generated proteins, FILIP vs source caption ----
         with torch.no_grad():
@@ -686,7 +711,7 @@ def main() -> None:
                 # average sample rather than a collapsed one.
                 S = filip_score_matrix_chunked(
                     z_gen, z_src, mask_gen, mask_src,
-                    chunk_rows=args.eval_filip_chunk_rows).clamp(-1.0, 1.0)
+                    chunk_rows=args.reward_filip_chunk_rows).clamp(-1.0, 1.0)
                 own = torch.arange(B, device=device).repeat_interleave(G)   # [B*G]
                 filip_pos = S.gather(1, own[:, None]).squeeze(1)            # [B*G]
 
@@ -751,6 +776,8 @@ def main() -> None:
             # which is what sizes --length-lambda (see its help text).
             r = reward.view(B, G)
             adv = (r - r.mean(dim=1, keepdim=True)) / (r.std(dim=1, keepdim=True) + args.adv_eps)
+            _dev_sync(device)
+            t_rew = time.time() - t_step - t_gen
             adv = adv.reshape(B * G)                             # [B*G]
 
         # ---- POLICY LOSS: recompute log pi over generated tokens (grad) ----
@@ -811,6 +838,10 @@ def main() -> None:
                   f"adv|={adv.abs().mean().item():.3f} kl={kl_val.item():.4f} "
                   f"ent={ent_val.item():.3f} genlen={gen_len:.0f} empty={n_empty}/{B*G} "
                   f"pg={pg_loss.item():.4f} "
+                  # gen/rew/pol: where the step actually goes. rew is the one to
+                  # watch under --reward-contrastive (it scores B columns, not 1).
+                  f"t[gen={t_gen:.1f} rew={t_rew:.1f} "
+                  f"pol={time.time()-t_step-t_gen-t_rew:.1f}] "
                   f"{(time.time()-t0-eval_state['seconds'])/(step-start_step+1):.1f}s/step",
                   flush=True)
 
