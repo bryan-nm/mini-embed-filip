@@ -265,6 +265,24 @@ vs `rows_total`) before training.
 | `--max-swap-char` | auto | only swap fields starting before this offset |
 | `--plan-only` / `--encode-only` / `--merge-only` | | run one phase |
 
+The same-split donor rule needs the retrieval run's `splits.json`. If that file is
+stale — most often a small `--subset-size` smoke run left behind in a directory
+that was later re-precomputed at full scale — the plan step aborts rather than
+guess. `splits.json` is *derived*, not source: it is a deterministic function of
+`(pair_ids, text_group_ids, ratios, seed)`, so regenerating reproduces byte-identical
+splits. `src/rebuild_splits` does that from the cache alone, no CSV and no trainer:
+
+```bash
+python -m src.rebuild_splits --cache-dir cache --check   # report only; exit 1 if stale
+python -m src.rebuild_splits --cache-dir cache --seed 0  # rewrite (seed MUST match the retrieval run)
+```
+
+A stale split file is also a hint worth chasing: `train_retrieval` rebuilds and
+re-saves a stale file at startup, so if it's stale, no retrieval run ever wrote
+splits for that cache directory. Confirm the checkpoint you're resuming was
+actually trained against that cache before building decoys against it — decoys are
+indexed by base-cache row.
+
 `src/train_hard_negatives` then resumes a retrieval checkpoint with **the same R2
 objective it finished on** and adds `w(step) * L_decoy`, where `w` ramps linearly
 from zero. Pass the same loss weights the retrieval run used (`--align-aux-weight`,

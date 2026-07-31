@@ -42,14 +42,28 @@ export CCL_ATL_TRANSPORT=mpi
 export FI_PROVIDER=cxi
 export CCL_ZE_IPC_EXCHANGE=pidfd
 
+# --- 0) preflight: the plan needs the retrieval run's splits.json to keep donors
+# inside the owner's split. A stale one (e.g. left by a --subset-size smoke run in
+# a directory later re-precomputed at full scale) fails the plan step. Splits are
+# a deterministic function of the cache + seed, so regenerating reproduces exactly
+# what train_retrieval used. Pass the SAME --seed the retrieval run used.
+python -m src.rebuild_splits --cache-dir "${CACHE_DIR}" --check || {
+    echo "splits.json missing or stale; regenerating"
+    python -m src.rebuild_splits --cache-dir "${CACHE_DIR}" --seed 0 || exit 1
+}
+
 # --- 1) plan: one process parses every caption and assigns (field, donor) swaps.
-# Deterministic and reusable, so it is skipped when it already exists. Donors are
-# drawn from the owner's own split, which needs the retrieval run's splits.json.
+# Deterministic and reusable, so it is skipped when it already exists. A failure
+# here MUST abort the job: without a plan every one of the ${NRANKS} ranks below
+# dies on the first line, burning the whole allocation for nothing.
 if [ ! -f "${DECOY_DIR}/decoy_plan.pt" ]; then
     echo "building decoy plan (single process)"
     python -m src.precompute_decoys --plan-only \
         --cache-dir "${CACHE_DIR}" --decoy-cache-dir "${DECOY_DIR}" \
-        --decoys-per-row 2 --decoy-seed 1234
+        --decoys-per-row 2 --decoy-seed 1234 || {
+        echo "decoy plan FAILED; not launching the ${NRANKS}-rank encode" >&2
+        exit 1
+    }
 else
     echo "reusing existing ${DECOY_DIR}/decoy_plan.pt"
 fi

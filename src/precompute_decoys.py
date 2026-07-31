@@ -162,10 +162,32 @@ def build_plan(args, cfg) -> None:
         with open(splits_path) as f:
             sp = json.load(f)
         if int(sp.get("n", -1)) != len(texts):
+            # `load_corpus` already matched the CSV against the base cache's
+            # pair_ids.json, so reaching here means the cache and CSV agree and
+            # only the split file is out of date. That is worth spelling out,
+            # because it is *also* evidence that train_retrieval never wrote
+            # splits for this cache dir: build_or_load_splits rebuilds a stale
+            # file and saves it back, so a run against this cache would have
+            # fixed it. Either the checkpoint was trained against a different
+            # --cache-dir (in which case the decoys belong there, since they are
+            # indexed by base-cache row), or this cache was re-precomputed at
+            # full scale after that run and the smoke-test split was left behind.
             raise RuntimeError(
-                f"{splits_path} covers {sp.get('n')} rows but the CSV has "
-                f"{len(texts)}; refusing to guess. Pass --splits explicitly or "
-                f"--allow-cross-split-donors.")
+                f"{splits_path} covers {sp.get('n')} rows but the cache/CSV has "
+                f"{len(texts)} (they agree with each other — only the split file "
+                f"is stale).\n"
+                f"Splits are a deterministic function of the cache + seed + "
+                f"ratios, so regenerating reproduces exactly what train_retrieval "
+                f"used:\n"
+                f"    python -m src.rebuild_splits --cache-dir {args.cache_dir} "
+                f"--seed <the retrieval run's --seed, default 0>\n"
+                f"First confirm this IS the cache the checkpoint was trained "
+                f"against: decoys are indexed by base-cache row, so building them "
+                f"against the wrong cache attaches every decoy to the wrong "
+                f"protein. Alternatively pass --splits <path> to point at the "
+                f"right file, or --allow-cross-split-donors to drop the "
+                f"same-split requirement (leaks held-out caption text into "
+                f"training decoys).")
         split_of_row = np.full(len(texts), 2, dtype=np.int8)     # default: test
         split_of_row[np.asarray(sp["train"], dtype=np.int64)] = 0
         split_of_row[np.asarray(sp["val"], dtype=np.int64)] = 1
