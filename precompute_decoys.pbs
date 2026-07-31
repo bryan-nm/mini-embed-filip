@@ -1,0 +1,67 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_precompute_decoys
+#PBS -l walltime=04:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+# Packed per-token cache for the hard decoy captions (see src/decoys.py).
+# Text-only: the protein side is reused from the base cache, so this is roughly
+# `decoys-per-row` x the *text* half of precompute.pbs and nothing more.
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+# Unlike the retrieval trainer, this DOES read the CSV: decoys are built from the
+# raw caption text, then encoded.
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
+
+CACHE_DIR=cache
+DECOY_DIR=cache/decoys
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+
+NNODES=$(wc -l < "$PBS_NODEFILE")
+RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29502
+export OMP_NUM_THREADS=8
+
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+# --- 1) plan: one process parses every caption and assigns (field, donor) swaps.
+# Deterministic and reusable, so it is skipped when it already exists. Donors are
+# drawn from the owner's own split, which needs the retrieval run's splits.json.
+if [ ! -f "${DECOY_DIR}/decoy_plan.pt" ]; then
+    echo "building decoy plan (single process)"
+    python -m src.precompute_decoys --plan-only \
+        --cache-dir "${CACHE_DIR}" --decoy-cache-dir "${DECOY_DIR}" \
+        --decoys-per-row 2 --decoy-seed 1234
+else
+    echo "reusing existing ${DECOY_DIR}/decoy_plan.pt"
+fi
+
+# --- 2) encode + merge: all ranks encode a slice of the plan, rank 0 merges.
+echo "encoding decoys on ${NNODES} nodes / ${NRANKS} ranks"
+mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
+    python -m src.precompute_decoys --device xpu --batch-size 64 \
+        --cache-dir "${CACHE_DIR}" --decoy-cache-dir "${DECOY_DIR}"
+
+rc=$?
+# Coverage lands in decoy_stats.json — check rows_with_usable_decoy/rows_total
+# before launching the training phase.
+[ -f "${DECOY_DIR}/decoy_stats.json" ] && cat "${DECOY_DIR}/decoy_stats.json"
+exit $rc
