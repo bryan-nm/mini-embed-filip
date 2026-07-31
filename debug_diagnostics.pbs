@@ -1,0 +1,194 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_debug_diag
+#PBS -l walltime=01:00:00
+#PBS -l select=2
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m abe
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+
+# ---------------------------------------------------------------------------
+# Calibration run for --coverage-lambda / --coverage-tau (SFT) and
+# --reward-contrastive / --reward-margin-beta (RL). Four short phases, each
+# writing to a scratch dir — nothing here touches a production checkpoint.
+#
+# WHAT THIS RUN CAN SETTLE (measurement, not search):
+#   tau            phase 1 prints the coverage DISTRIBUTION of the trained SFT
+#                  model. tau is then read off it, not guessed.
+#   lambda         phase 2 gives the covpen-vs-ce magnitude ratio, which fixes
+#                  lambda's order of magnitude.
+#   length-lambda  phases 3/4 print rstd under both rewards. The contrastive
+#                  reward is on a different scale, so the existing
+#                  "lambda ~ 4.5*rstd" rule needs the NEW rstd. This is a
+#                  required recalibration, not a nice-to-have.
+#   smoke          first execution of both new code paths against real models.
+#                  The math is unit-tested on synthetic tensors; the integration
+#                  is not. Expect this to be what phase 1-2 actually catch.
+#
+# WHAT IT CANNOT SETTLE:
+#   Whether either change IMPROVES anything. Coverage helping multi-clause
+#   fidelity, and the margin reward beating the raw one on R@K/mAP, are
+#   full-scale questions — a few hundred SFT steps and ~10 RL steps move
+#   neither metric out of noise. Use this to pick starting values and to prove
+#   the code runs; then A/B at scale.
+#
+# Usage:
+#   qsub -v RCKPT=/path/retrieval/epochNN.pt,SFT_CKPT=/path/generation/text2protein/epochNN.pt \
+#        debug_diagnostics.pbs
+# Optional: -v PHASES=13 to run only phases 1 and 3, RL_STEPS=..., COV_LAMBDA=...
+# ---------------------------------------------------------------------------
+
+: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+: "${SFT_CKPT:?set -v SFT_CKPT=path/to/generation/text2protein/epochNN.pt}"
+
+PHASES=${PHASES:-1234}
+SUBSET=${SUBSET:-2000}         # tiny train subset: these phases measure, not train
+VAL_SUBSET=${VAL_SUBSET:-128}
+BS=${BS:-32}
+CAE=${CAE:-1}
+MAX_TGT=${MAX_TGT:-1024}
+COV_LAMBDA=${COV_LAMBDA:-0.1}  # phase-2 trial value; phase 1 tells you if it's sane
+COV_TAU=${COV_TAU:-0.1}        # phase-1 output replaces this for real runs
+RL_STEPS=${RL_STEPS:-10}
+MAXNEW=${MAXNEW:-1024}         # keep at production value: rstd scales with it,
+PPR=${PPR:-8}                  # and rstd is the number we came here to measure
+BETA=${BETA:-1.0}
+
+OUT=${OUT:-/flare/NLDesignProtein/bryan/FILIP-dev-space/debug_diag/${PBS_JOBID%%.*}}
+mkdir -p "${OUT}"
+
+NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
+NRANKS=$(( NNODES * RANKS_PER_NODE ))
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
+export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+export MASTER_PORT=29506
+export OMP_NUM_THREADS=8
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export FI_PROVIDER=cxi
+export CCL_ZE_IPC_EXCHANGE=pidfd
+
+source ~/bin/slack_notify.sh
+slack ":microscope: START ${PBS_JOBID} ${PBS_JOBNAME} (${NNODES} nodes, calibration)"
+
+MPI="mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8"
+COMMON_SFT="--direction text2protein --retrieval-ckpt ${RCKPT} --device xpu \
+    --memory-space aligned --cross-attn-mode aligned --resume ${SFT_CKPT} \
+    --batch-size ${BS} --epochs 1 --max-target-tokens ${MAX_TGT} --direction-augment \
+    --cross-attn-every ${CAE} --unfreeze-top 0 --no-lora \
+    --subset-size ${SUBSET} --val-subset ${VAL_SUBSET}"
+
+# Each phase is time-boxed so one slow/hung phase cannot eat the whole job, and
+# non-fatal so a later phase still runs if an earlier one dies.
+run_phase () {  # run_phase <n> <minutes> <description> <command...>
+    local n=$1 mins=$2 desc=$3; shift 3
+    case "${PHASES}" in *"${n}"*) ;; *) echo "[phase ${n}] SKIPPED"; return 0 ;; esac
+    echo ""
+    echo "=================================================================="
+    echo "[phase ${n}] ${desc}  (cap ${mins}m)"
+    echo "=================================================================="
+    timeout "${mins}m" "$@" 2>&1 | tee "${OUT}/phase${n}.log"
+    local rc=${PIPESTATUS[0]}
+    [ "${rc}" = 124 ] && echo "[phase ${n}] HIT TIME CAP — partial log kept"
+    echo "[phase ${n}] exit=${rc}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 1 — coverage baseline. --coverage-lambda 0, so this only MEASURES.
+# Read [val][cov] in the log:
+#   unif       coverage a source position gets from attention that ignores it.
+#              Any tau at or below this cannot separate attended from ignored.
+#   frac_below the tau ladder. Pick tau where the fraction stops looking like
+#              "everything is starved" and starts isolating a real tail — if
+#              frac_below(0.05) is already 0.9, the adapter is ignoring almost
+#              the whole prompt and the aux has a lot to bite on; if it's 0.02,
+#              coverage is NOT your dropped-clause mechanism and phase 2 is
+#              the point at which to stop and rethink.
+#   p10/p50/p90 the distribution those fractions come from.
+# ---------------------------------------------------------------------------
+run_phase 1 12 "coverage baseline (measure only, lambda=0)" \
+    ${MPI} python -m src.train_generation ${COMMON_SFT} \
+    --coverage-lambda 0 --coverage-tau "${COV_TAU}" \
+    --ckpt-dir "${OUT}/p1"
+
+# ---------------------------------------------------------------------------
+# PHASE 2 — does the aux train, and is lambda scaled right?
+# Watch the step log: covpen should FALL and ce should not jump. Size lambda so
+# lambda*covpen is a few percent of ce — big enough to move, small enough not to
+# trade away the LM. If covpen is already ~0 at the tau from phase 1, the aux has
+# nothing to do; if ce climbs steadily, lambda is too high.
+# NOTE: no --grad-checkpointing here. The trainer rejects the combination (the
+# aux would silently be a no-op under checkpointing), so a big decoder needs the
+# aux verified at small BS instead.
+# ---------------------------------------------------------------------------
+run_phase 2 12 "coverage aux ON (lambda=${COV_LAMBDA} tau=${COV_TAU})" \
+    ${MPI} python -m src.train_generation ${COMMON_SFT} \
+    --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
+    --ckpt-dir "${OUT}/p2"
+
+# ---------------------------------------------------------------------------
+# PHASE 3 — contrastive reward calibration. --log-every 1 so every step prints.
+# Read pos / neg / margin / rstd:
+#   margin  headroom over the hardest in-batch negative at the SFT init. A margin
+#           near zero at step 0 means the SFT policy is already producing hub-ish
+#           outputs — which is the case the raw reward cannot see, and the
+#           strongest argument for turning this on.
+#   rstd    within-group std, the ONLY scale GRPO sees. Feed it to the existing
+#           length-lambda rule (~4.5*rstd for a 2x length error = one group-std).
+#           It differs from phase 4's rstd; use the one matching the reward you
+#           will actually train with.
+# Eval off (--eval-every 0) and save-every above the step count: pure measurement.
+# ---------------------------------------------------------------------------
+run_phase 3 15 "RL contrastive reward (beta=${BETA}, ${RL_STEPS} steps)" \
+    ${MPI} python -m src.train_rl --direction text2protein \
+    --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
+    --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
+    --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
+    --reward-contrastive --reward-margin-beta "${BETA}" \
+    --length-lambda 0.0 --kl-coef 0.05 --lr 1e-5 --unfreeze-lr 2e-6 \
+    --log-every 1 --save-every 100000 --eval-every 0 \
+    --ckpt-dir "${OUT}/p3"
+
+# ---------------------------------------------------------------------------
+# PHASE 4 — same steps, RAW reward. The rstd comparison against phase 3, and the
+# control that says whether the margin term changed the reward landscape at all.
+# Same seed and step count, so the two logs are directly comparable line by line.
+# ---------------------------------------------------------------------------
+run_phase 4 15 "RL raw reward control (${RL_STEPS} steps)" \
+    ${MPI} python -m src.train_rl --direction text2protein \
+    --retrieval-ckpt "${RCKPT}" --init-ckpt "${SFT_CKPT}" --device xpu \
+    --steps "${RL_STEPS}" --prompts-per-rank "${PPR}" --group-size 8 \
+    --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
+    --length-lambda 0.0 --kl-coef 0.05 --lr 1e-5 --unfreeze-lr 2e-6 \
+    --log-every 1 --save-every 100000 --eval-every 0 \
+    --ckpt-dir "${OUT}/p4"
+
+echo ""
+echo "=================================================================="
+echo "SUMMARY  (full logs in ${OUT})"
+echo "=================================================================="
+echo "--- phase 1: coverage distribution (pick --coverage-tau from this) ---"
+grep -h "\[val\]\[cov\]" "${OUT}/phase1.log" 2>/dev/null || echo "  (no coverage line)"
+echo "--- phase 2: does covpen fall, does ce hold? (first/last step lines) ---"
+grep -h "covpen=" "${OUT}/phase2.log" 2>/dev/null | sed -n '1p;$p' || echo "  (none)"
+echo "--- phase 3 vs 4: rstd + margin (size --length-lambda off the right one) ---"
+echo "  contrastive:"; grep -h "^\[rl\] step=" "${OUT}/phase3.log" 2>/dev/null | tail -3
+echo "  raw:";         grep -h "^\[rl\] step=" "${OUT}/phase4.log" 2>/dev/null | tail -3
+
+slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME} — logs in ${OUT}"
+exit 0

@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -127,6 +127,9 @@ class CrossAttentionAdapter(nn.Module):
         self.memory_mask: Optional[torch.Tensor] = None  # [B, L_mem] bool
         # Last attention weights (aligned mode) for interpretability / --dump-attn.
         self.last_attn: Optional[torch.Tensor] = None    # [B, T, L_mem]
+        # When True, `last_attn` keeps its autograd graph so a loss can attach to
+        # it (see `coverage_penalty`). Default False: inspection only, detached.
+        self.retain_attn: bool = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.memory is None:
@@ -181,7 +184,9 @@ class CrossAttentionAdapter(nn.Module):
             scores = scores.masked_fill(~self.memory_mask[:, None, :], float("-inf"))
 
         attn = F.softmax(scores, dim=-1)                              # [B, T, L]
-        self.last_attn = attn.detach()
+        # Stored BEFORE dropout: the coverage aux and the interpretability dumps
+        # both want the true attention distribution, not a dropped-out sample.
+        self.last_attn = attn if self.retain_attn else attn.detach()
         attn = self.drop(attn)
         v = self.v_proj(memory)                                       # [B, L, D]
         attn_out = attn @ v                                           # [B, T, D]
@@ -768,9 +773,144 @@ def set_cross_memory(adapters: List[CrossAttentionAdapter],
 
 
 def clear_cross_memory(adapters: List[CrossAttentionAdapter]) -> None:
+    """Release the per-step conditioning state. Read `last_attn` BEFORE calling."""
     for a in adapters:
         a.memory = None
         a.memory_mask = None
+        # Drop the attention reference too: under retain_attn it holds a grad_fn,
+        # and keeping it alive until the next forward pins the autograd graph.
+        a.last_attn = None
+
+
+def set_retain_attn(adapters: List[CrossAttentionAdapter], on: bool) -> int:
+    """Make aligned-mode adapters keep `last_attn` attached to the autograd graph.
+
+    Required before `coverage_penalty` can produce gradients. Returns the number
+    of adapters switched (aligned-mode only; `_forward_standard` never populates
+    `last_attn`).
+    """
+    n = 0
+    for a in adapters:
+        if a.score_space == "aligned":
+            a.retain_attn = on
+            n += 1
+    return n
+
+
+def coverage_penalty(
+    adapters: List[CrossAttentionAdapter],
+    decoder_valid: torch.Tensor,               # [B, T] bool; True = real position
+    tau: float = 0.1,
+    rows: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Penalize source positions that no decoder position attends to.
+
+    Cross-attention softmaxes over the memory axis, so each decoder position
+    spends its mass on the prompt — but nothing requires each prompt position to
+    receive any. A source token that no decoder position attends to contributes
+    ~0 to every `attn_out`, so it cannot influence the output at all. This is the
+    direction the retrieval FILIP score's t2p half supplies (losses.py:56-60) and
+    the adapter does not.
+
+    coverage[b, m] = max over VALID decoder positions t of attn[b, t, m], and the
+    penalty is the squared shortfall below `tau`, normalized by tau so it lands in
+    [0, 1] per position (1 = wholly unattended) and `--coverage-lambda` keeps its
+    meaning when tau is retuned. Averaged over valid memory positions, then over
+    examples, then over adapters.
+
+    `tau` is an absolute attention mass, so it must be read against the memory
+    length: uniform attention over L valid positions gives coverage 1/L, i.e.
+    ~0.002 at L=512. Anything at or above ~1/L is "not ignored"; the default 0.1
+    asks for a position to be a near-argmax somewhere. Measure before guessing:
+    train_generation reports val `cov` even at --coverage-lambda 0, so a baseline
+    run tells you where the real distribution sits.
+
+    `rows`: keep only the first `rows` batch entries — used by the contrastive-SFT
+    path, whose forward is 2B rows with the wrong (rolled) memory in the back half.
+
+    Returns (penalty, mean_coverage). mean_coverage is detached, for logging.
+
+    Note: with `--use-cvae` the injected latent memory tokens carry an all-True
+    mask, so they count as positions requiring coverage. That is intentional (an
+    ignored latent is a collapsed latent) but it does mean tau applies to them too.
+    """
+    pens, covs = [], []
+    for cov, mem_mask in _coverage_maps(adapters, decoder_valid, rows):
+        deficit = ((tau - cov).clamp_min(0.0) / tau) ** 2                  # [B, L]
+        denom = mem_mask.sum(dim=1).clamp_min(1).to(cov.dtype)
+        pens.append(((deficit * mem_mask).sum(dim=1) / denom).mean())
+        covs.append(((cov * mem_mask).sum(dim=1) / denom).mean().detach())
+
+    if not pens:
+        z = torch.zeros((), device=decoder_valid.device)
+        return z, z
+    return torch.stack(pens).mean(), torch.stack(covs).mean()
+
+
+def _coverage_maps(adapters, decoder_valid, rows=None):
+    """Yield (coverage [B, L], memory_mask [B, L]) per aligned-mode adapter.
+
+    coverage[b, m] = max over VALID decoder positions of attn[b, t, m]. Pad decoder
+    rows are zeroed first so they cannot spuriously "cover" a source position
+    (attn >= 0, so a zeroed row never wins the max while a real row exists).
+    """
+    for a in adapters:
+        attn = a.last_attn
+        if attn is None or a.score_space != "aligned":
+            continue
+        mem_mask = a.memory_mask
+        if rows is not None:
+            attn = attn[:rows]
+            mem_mask = None if mem_mask is None else mem_mask[:rows]
+        if mem_mask is None:
+            mem_mask = torch.ones(attn.shape[0], attn.shape[2],
+                                  dtype=torch.bool, device=attn.device)
+        valid = decoder_valid.to(attn.device).bool()
+        cov = attn.masked_fill(~valid[:, :, None], 0.0).max(dim=1).values
+        yield cov, mem_mask
+
+
+# Threshold ladder for `coverage_profile`. Spans "barely above uniform" to
+# "near-argmax somewhere", so one readout brackets any sensible --coverage-tau.
+COVERAGE_THRESHOLDS = (0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5)
+
+
+def coverage_profile(
+    adapters: List[CrossAttentionAdapter],
+    decoder_valid: torch.Tensor,
+    thresholds: Sequence[float] = COVERAGE_THRESHOLDS,
+    rows: Optional[int] = None,
+) -> dict:
+    """Distribution of per-source-position coverage — the readout that picks tau.
+
+    The mean coverage that `coverage_penalty` returns says where the mass sits but
+    not how many positions are starved, which is the quantity --coverage-tau is
+    really about. Returns:
+
+      frac_below[t]  fraction of valid source positions with coverage < t
+      p10/p50/p90    coverage percentiles over valid positions
+      uniform        mean 1/L_valid — the coverage a position gets from attention
+                     that ignores it entirely. Read the ladder against THIS: a
+                     tau below `uniform` cannot distinguish attended from ignored.
+
+    Cheap and grad-free; intended for a val pass with --coverage-lambda 0.
+    """
+    covs = []
+    unif = []
+    for cov, mem_mask in _coverage_maps(adapters, decoder_valid, rows):
+        covs.append(cov[mem_mask].detach().flatten())
+        unif.append((1.0 / mem_mask.sum(dim=1).clamp_min(1).to(cov.dtype)).mean())
+    if not covs:
+        return {}
+    flat = torch.cat(covs).float()
+    q = torch.tensor([0.1, 0.5, 0.9], device=flat.device, dtype=flat.dtype)
+    p10, p50, p90 = torch.quantile(flat, q).tolist()
+    return {
+        "frac_below": {t: (flat < t).float().mean().item() for t in thresholds},
+        "p10": p10, "p50": p50, "p90": p90,
+        "uniform": torch.stack(unif).mean().item(),
+        "n": int(flat.numel()),
+    }
 
 
 def warm_start_q_align(adapters: List[CrossAttentionAdapter],

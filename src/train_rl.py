@@ -63,7 +63,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
 from src.best_of_n import pad_stack
-from src.data import group_ids_from_accessions, load_pairs, load_splits
+from src.data import dense_group_ids, group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
     LoRACfg, clear_cross_memory, count_trainable, decode_target,
     load_decoder_with_cross_attn, set_cross_memory, target_prefix_ids,
@@ -346,6 +346,21 @@ def main() -> None:
                          "the same. A caption constrains domain composition, not exact "
                          "length, so the band must be wide enough not to punish legitimate "
                          "variation")
+    # ---- contrastive (margin) reward ----
+    ap.add_argument("--reward-contrastive", action="store_true",
+                    help="reward = FILIP(gen, own source) - beta * max_j FILIP(gen, other "
+                         "source in batch), instead of the raw positive score. The raw score "
+                         "is absolute and negative-free, so it can be raised by generating a "
+                         "'hub' output that scores well against EVERY caption; GRPO's "
+                         "standardizer cannot see this (it removes a per-prompt constant, and "
+                         "hubness is a property of the sample). Retrieval trains a symmetric "
+                         "InfoNCE and best_of_n selects on this same margin, so this makes the "
+                         "RL objective, the inference-time selector, and the R@K/mAP eval "
+                         "measure the same thing. Negatives are the other --prompts-per-rank "
+                         "sources in the batch (7 at the default B=8) — a small panel")
+    ap.add_argument("--reward-margin-beta", type=float, default=1.0,
+                    help="weight on the hardest-negative term for --reward-contrastive. 0 "
+                         "reproduces the raw positive score; 1.0 is the best_of_n margin")
     ap.add_argument("--lr", type=float, default=1e-5, help="adapter/head LR")
     ap.add_argument("--unfreeze-lr", type=float, default=None,
                     help="separate LR for the (SFT-)unfrozen decoder blocks; defaults to --lr")
@@ -600,7 +615,14 @@ def main() -> None:
                    # a checkpoint's length behaviour is only interpretable against them.
                    "rl_max_new_tokens": args.max_new_tokens,
                    "length_lambda": args.length_lambda,
-                   "length_tolerance": args.length_tolerance, **meta}
+                   "length_tolerance": args.length_tolerance,
+                   # Which reward this policy climbed: raw positive FILIP vs the
+                   # in-batch margin. They are on different scales, so a saved
+                   # reward curve is meaningless without it.
+                   "reward_contrastive": args.reward_contrastive,
+                   "reward_margin_beta": (args.reward_margin_beta
+                                          if args.reward_contrastive else None),
+                   **meta}
         path = ckpt_dir / f"step{step:06d}.pt"
         torch.save(payload, path)
         print(f"[rl][ckpt] saved {path}", flush=True)
@@ -661,6 +683,12 @@ def main() -> None:
 
         prompt_idx = next_prompts(B)
         srcs = [get_src(pairs[i]) for i in prompt_idx]
+        if args.reward_contrastive:
+            # Per-batch group ids so the margin reward can drop false negatives.
+            acc_g = torch.as_tensor(
+                group_ids_from_accessions([pairs[i].uid for i in prompt_idx]),
+                device=device)
+            txt_g = torch.as_tensor(dense_group_ids(srcs), device=device)
 
         # ---- build aligned source memory (frozen), replicate G times ----
         with torch.no_grad():
@@ -688,11 +716,52 @@ def main() -> None:
             gen_strs = [decode_target(core, dtok, row) for row in seqs]
             enc_in = [s if s.strip() else empty_tgt for s in gen_strs]
             h_gen, mask_gen = enc_tgt(enc_in)
-            n_empty = int((mask_gen.sum(dim=1) == 0).sum())   # gens with no valid tokens
+            empty_rows = mask_gen.sum(dim=1) == 0             # gens with no valid tokens
+            n_empty = int(empty_rows.sum())
             z_gen = tgt_proj(h_gen.float())                      # [B*G, Lp, D]
             z_src_g = z_src.repeat_interleave(G, dim=0)
             mask_src_g = mask_src.repeat_interleave(G, dim=0)
-            filip_r = filip_per_pair(z_gen, z_src_g, mask_gen, mask_src_g)  # [B*G]
+            if args.reward_contrastive:
+                # [B*G, B]: every rollout scored against EVERY source in the batch.
+                # z_src is already computed, so the negatives cost one wider FILIP
+                # call (B columns instead of 1) and no extra encoder work.
+                # Clamped for the same reason filip_per_pair clamps: a generation
+                # that encodes to zero valid tokens leaks the -1e4 max sentinel,
+                # which here would cancel between pos and neg and read as an
+                # average sample rather than a collapsed one.
+                S = filip_score_matrix_chunked(
+                    z_gen, z_src, mask_gen, mask_src,
+                    chunk_rows=args.eval_filip_chunk_rows).clamp(-1.0, 1.0)
+                own = torch.arange(B, device=device).repeat_interleave(G)   # [B*G]
+                filip_pos = S.gather(1, own[:, None]).squeeze(1)            # [B*G]
+
+                # False negatives: next_prompts draws captions independently and the
+                # augmented corpus carries ~8.87 captions per protein, so two prompts
+                # in one batch can be siblings of the same accession (or byte-identical
+                # generic captions). Penalizing a generation for matching its own
+                # protein's other caption is backwards — mask those columns, mirroring
+                # retrieval's mask_false_negatives. If every column of a row ends up
+                # blocked (tiny B, all siblings) the negative term is the constant
+                # -1.0, and a per-prompt constant is invisible to GRPO anyway.
+                same = ((acc_g[:, None] == acc_g[None, :])
+                        | (txt_g[:, None] == txt_g[None, :]))               # [B, B]
+                hard_neg = S.masked_fill(same[own], -1.0).max(dim=1).values  # [B*G]
+                filip_r = filip_pos - args.reward_margin_beta * hard_neg
+                # A generation that encodes to zero valid tokens clamps to -1 in
+                # EVERY column, so pos and neg cancel and the margin lands at
+                # -1 + beta -> 0 at the default beta: mid-pack, and above a merely
+                # generic sample. The floor has to be applied to the margin itself,
+                # not inherited from the clamp. -(1 + beta) is the true range floor:
+                # unambiguously worst, and bounded, so one junk rollout cannot blow
+                # up the group std and wash out the real advantages.
+                filip_r = torch.where(
+                    empty_rows,
+                    torch.full_like(filip_r, -(1.0 + args.reward_margin_beta)),
+                    filip_r)
+            else:
+                filip_pos = filip_per_pair(z_gen, z_src_g, mask_gen, mask_src_g)
+                hard_neg = None
+                filip_r = filip_pos                                          # [B*G]
 
             # ---- two-sided length band (off at --length-lambda 0) ----
             # FILIP is not monotone in length, but it does leave one exploitable
@@ -772,9 +841,17 @@ def main() -> None:
             # actually sees, and what --length-lambda should be sized against.
             rstd = filip_r.view(B, G).std(dim=1).mean().item()
             len_ratio = (len_gen / len_true).median().item()
+            # margin= is the headroom the contrastive reward buys: pos minus the
+            # hardest in-batch negative. Flat-or-falling margin while pos climbs is
+            # the hubness failure the raw reward can't see.
+            margin_msg = ""
+            if hard_neg is not None:
+                margin_msg = (f"pos={filip_pos.mean().item():.4f} "
+                              f"neg={hard_neg.mean().item():.4f} "
+                              f"margin={(filip_pos - hard_neg).mean().item():.4f} ")
             print(f"[rl] step={step}/{args.steps} lr={optim.param_groups[0]['lr']:.2e} "
                   f"reward={reward.mean().item():.4f} (max {reward.max().item():.4f}) "
-                  f"filip={filip_r.mean().item():.4f} rstd={rstd:.4f} "
+                  f"filip={filip_r.mean().item():.4f} {margin_msg}rstd={rstd:.4f} "
                   f"lenratio={len_ratio:.2f} lenpen={len_pen.mean().item():.4f} "
                   f"adv|={adv.abs().mean().item():.3f} kl={kl_val.item():.4f} "
                   f"ent={ent_val.item():.3f} genlen={gen_len:.0f} empty={n_empty}/{B*G} "

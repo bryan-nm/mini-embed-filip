@@ -55,9 +55,11 @@ from src.decoder_adapters import (
     LoRACfg,
     clear_cross_memory,
     count_trainable,
+    coverage_penalty,
     load_decoder_with_cross_attn,
     reverse_prefix_ids,
     set_cross_memory,
+    set_retain_attn,
     target_prefix_ids,
     unfreeze_decoder_blocks,
     warm_start_q_align,
@@ -494,6 +496,23 @@ def main() -> None:
     ap.add_argument("--contrast-margin", type=float, default=0.5,
                     help="target nats/token by which the correct memory should beat a wrong one "
                          "(the hinge margin for --contrast-lambda)")
+    ap.add_argument("--coverage-lambda", type=float, default=0.0,
+                    help="weight on the cross-attention coverage aux (0 = off). Cross-attn "
+                         "softmaxes over the memory axis, so each decoder position must spend "
+                         "its mass on the prompt, but no prompt position is required to RECEIVE "
+                         "any — an unattended source token contributes ~0 to every attn_out and "
+                         "cannot influence the output. This penalizes source positions whose "
+                         "max-over-decoder-positions attention stays below --coverage-tau, "
+                         "supplying the direction the retrieval FILIP score's t2p half has. "
+                         "Requires --cross-attn-mode aligned; incompatible with "
+                         "--grad-checkpointing. Measure coverage before setting this")
+    ap.add_argument("--coverage-tau", type=float, default=0.1,
+                    help="attention-mass threshold a source position must reach to count as "
+                         "covered. Absolute mass, so read it against memory length: uniform "
+                         "attention over L valid positions gives 1/L (~0.002 at L=512), so any "
+                         "tau >> 1/L asks a position to be a near-argmax somewhere. The penalty "
+                         "is normalized by tau, so --coverage-lambda keeps its meaning if you "
+                         "retune this")
     ap.add_argument("--subset-size", type=int, default=cfg.data.subset_size)
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--val-subset", type=int, default=1000,
@@ -539,6 +558,21 @@ def main() -> None:
         raise SystemExit(
             "--warm-start-qalign requires --cross-attn-mode aligned (q_align exists only "
             "in aligned mode)")
+    if args.coverage_lambda > 0.0:
+        if args.cross_attn_mode != "aligned":
+            raise SystemExit(
+                "--coverage-lambda requires --cross-attn-mode aligned: only _forward_aligned "
+                "populates last_attn, which the coverage aux reads")
+        if args.grad_checkpointing:
+            # Under checkpointing the first forward runs in no_grad and the recompute
+            # happens inside backward — so last_attn read after the forward carries no
+            # graph and the aux would silently contribute nothing. Fail instead.
+            raise SystemExit(
+                "--coverage-lambda is incompatible with --grad-checkpointing: the aux reads "
+                "last_attn after the forward, but under checkpointing that tensor comes from "
+                "the no_grad pass and would train as a silent no-op. Drop one of the two")
+        if args.coverage_tau <= 0.0:
+            raise SystemExit("--coverage-tau must be > 0 (it normalizes the penalty)")
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
@@ -635,6 +669,18 @@ def main() -> None:
         print(f"[gen] decoder trainable params (cross-attn"
               f"{' + LoRA' if lora_on else ', LoRA OFF'}): {n_train:,}")
         print(f"[gen] num cross-attention adapters: {len(adapters)}")
+
+    # Coverage aux: keep the attention weights attached to the graph so the
+    # penalty can backprop into q_align / logit_scale (and, through the residual,
+    # the rest of the trainable stack).
+    if args.coverage_lambda > 0.0:
+        n_retained = set_retain_attn(adapters, True)
+        if n_retained == 0:
+            raise SystemExit(
+                "--coverage-lambda set but no aligned-mode adapters were injected")
+        if env.is_main:
+            print(f"[gen] coverage aux ON: lambda={args.coverage_lambda} "
+                  f"tau={args.coverage_tau} over {n_retained} adapters")
 
     # Gradient checkpointing: recompute layer activations in backward instead of
     # storing them across the deep stack. Essential for the 3B Jamba decoder,
@@ -982,6 +1028,16 @@ def main() -> None:
             beta = beta_at(global_step, total_steps, cvae.cfg) if cvae is not None else 0.0
             loss = ce + beta * kl
 
+            cov_pen, cov_mean = None, None
+            if args.coverage_lambda > 0.0:
+                # rows=B under --contrast-lambda: the back half of the 2B forward
+                # attends the ROLLED (wrong) memory, and demanding coverage of a
+                # mismatched prompt is exactly backwards.
+                cov_pen, cov_mean = coverage_penalty(
+                    adapters, attn_mask.bool(), tau=args.coverage_tau,
+                    rows=input_ids.size(0) if contrast_on else None)
+                loss = loss + args.coverage_lambda * cov_pen
+
             gap = None
             if contrast_on:
                 # Hinge: the correct memory should beat a wrong one by >= margin
@@ -1031,6 +1087,10 @@ def main() -> None:
                     msg += f" kl={kl.item():.4f} beta={beta:.3f}"
                 if gap is not None:
                     msg += f" gap={gap.item():+.4f}"   # train-time content gain (ce_neg-ce_pos)
+                if cov_pen is not None:
+                    # cov = mean max-attention per source position (the quantity tau
+                    # thresholds); covpen = normalized squared shortfall, 0 = all covered.
+                    msg += f" cov={cov_mean.item():.4f} covpen={cov_pen.item():.4f}"
                 print(msg, flush=True)
 
         dt = time.time() - t0
@@ -1041,6 +1101,7 @@ def main() -> None:
         if env.is_main:
             core.eval()
             val_losses = []
+            val_cov, val_covpen, cov_profile = [], [], None
             if cvae is not None:
                 cvae.eval()
             with torch.no_grad():
@@ -1060,6 +1121,20 @@ def main() -> None:
                         mask = torch.cat([mask, k_mask], dim=1)
                     set_cross_memory(adapters, mem, mask)
                     out = core(input_ids=input_ids, attention_mask=attn_mask)
+                    # Read coverage BEFORE clearing — clear_cross_memory drops
+                    # last_attn. Reported whenever the attention is available, not
+                    # just when the aux is on: with --coverage-lambda 0 this is the
+                    # baseline measurement that tells you where to put --coverage-tau.
+                    if args.cross_attn_mode == "aligned":
+                        vp, vc = coverage_penalty(adapters, attn_mask.bool(),
+                                                  tau=args.coverage_tau)
+                        val_cov.append(vc.item())
+                        val_covpen.append(vp.item())
+                        # Full distribution from the FIRST val batch only: it is the
+                        # tau-picking readout, and one batch of source positions is
+                        # already O(BS * L) samples.
+                        if cov_profile is None:
+                            cov_profile = coverage_profile(adapters, attn_mask.bool())
                     clear_cross_memory(adapters)
                     logits = out.logits
                     shift_logits = logits[:, :-1, :].contiguous()
@@ -1073,8 +1148,25 @@ def main() -> None:
             if cvae is not None:
                 cvae.train()
             val_ce = sum(val_losses) / max(len(val_losses), 1)
-            print(f"[val] epoch={epoch} ce={val_ce:.4f} ppl={math.exp(val_ce):.2f}")
-            log.append({"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)})
+            rec = {"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)}
+            cov_msg = ""
+            if val_cov:
+                rec["val_coverage"] = sum(val_cov) / len(val_cov)
+                rec["val_coverage_pen"] = sum(val_covpen) / len(val_covpen)
+                cov_msg = (f" cov={rec['val_coverage']:.4f} "
+                           f"covpen={rec['val_coverage_pen']:.4f}")
+            print(f"[val] epoch={epoch} ce={val_ce:.4f} ppl={math.exp(val_ce):.2f}{cov_msg}")
+            if cov_profile:
+                rec["coverage_profile"] = cov_profile
+                fb = " ".join(f"<{t:g}:{f:.3f}"
+                              for t, f in cov_profile["frac_below"].items())
+                # A tau at or below `unif` cannot separate attended from ignored:
+                # that is the mass a position gets when attention spreads evenly.
+                print(f"[val][cov] unif={cov_profile['uniform']:.5f} "
+                      f"p10={cov_profile['p10']:.4f} p50={cov_profile['p50']:.4f} "
+                      f"p90={cov_profile['p90']:.4f} | frac_below {fb} "
+                      f"(n={cov_profile['n']})")
+            log.append(rec)
 
             # Save every trainable tensor (cross-attn + LoRA + any unfrozen
             # blocks), keyed by requires_grad so partial-unfreeze weights persist.
