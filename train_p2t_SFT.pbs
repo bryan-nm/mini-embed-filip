@@ -55,21 +55,27 @@ RT_SAMPLES=${RT_SAMPLES:-512}
 RT_MAX_NEW=${RT_MAX_NEW:-${MAX_TGT}}
 # Cross-attention coverage aux — see train_t2p_SFT.pbs for what it does and why.
 #
-# COV_TAU HERE IS DERIVED, NOT MEASURED — the one number in these scripts that
-# rests on arithmetic rather than a run. tau is an absolute attention mass, so it
-# only means anything relative to source length. text2protein measured
-# unif=0.0104 (captions, ~96 effective valid tokens) and took tau = 2.4 * unif =
-# 0.025. This direction's source is a PROTEIN, a few hundred residues, so unif
-# lands near 0.003 and the same 2.4x multiple gives ~0.007. Carrying t2p's 0.025
-# over unchanged would have been 8x too strict and would have penalized nearly
-# every source position.
+# COV_TAU=0.007 is now MEASURED-VALIDATED, but not by the reasoning that produced
+# it. It was derived as 2.4 * an ASSUMED unif~0.003. Job 8723638 measured
+# unif=0.00490 — the assumption was 63% low, so the intended 2.4x multiple would
+# have been 0.012, not 0.007. Keeping 0.007 anyway, because the quantity that
+# actually matters is what fraction of source positions the penalty bites on, and
+# on the measured distribution 0.007 lands well:
 #
-# CONFIRM ON THE FIRST RUN. [val][cov] prints unif and the frac_below ladder every
-# epoch regardless of COV_LAMBDA. Check two things in epoch 0's line:
-#   - unif is near 0.003. If it is not, rescale: tau = 2.4 * unif.
-#   - frac_below <0.01 is a minority (t2p's starved tail was 20%). If it is
-#     already ~0.9, tau is far too high for this direction and the aux is
-#     penalizing everything uniformly — rescale before trusting the run.
+#   p2t measured: unif=0.00490  p10=0.0030  p50=0.0098  p90=0.0741
+#   frac_below <0.001:0.001 <0.005:0.245 <0.01:0.506 <0.05:0.860  (n=42,984)
+#
+#   tau=0.007 penalizes ~37% of positions   (t2p's tau=0.025 penalizes ~49%)
+#   tau=0.012 would penalize ~55%           and needs LAMBDA ~0.13, not 0.5
+#
+# And the loss scale is confirmed, not estimated: at tau=0.007 the measured covpen
+# is 0.031, so LAMBDA=0.5 contributes 0.0155 against val ce 1.119 — 1.4% of the
+# loss, in the intended band. Raising tau to 0.012 would push covpen to ~0.175
+# (~7.8% of ce at the same lambda), which is why the pair moves together.
+#
+# Structural note: ~25% of p2t source positions sit at or below uniform, against
+# ~20% for t2p. The starved tail is not a t2p quirk — both directions ignore a
+# comparable slice of the source.
 COV_LAMBDA=${COV_LAMBDA:-0.5}
 COV_TAU=${COV_TAU:-0.007}
 

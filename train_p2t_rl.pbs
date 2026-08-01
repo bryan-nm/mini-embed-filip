@@ -33,21 +33,27 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 #   the generations are as specific as the references; margin far below cmargin
 #   means they are generic. See train_t2p_rl.pbs for the full reasoning.
 #
-#   LEN_LAMBDA is now measured for THIS direction (debug job 8723416, epoch-19
-#   p2t SFT policy, MAXNEW=128): rstd 0.056-0.091, so 4.5*rstd ~ 0.3. The trigger
-#   condition is met, but in the OPPOSITE direction from t2p — lenratio ran
-#   0.55-0.77, i.e. generated captions are ~30% too SHORT, where t2p generations
-#   were ~70% too long. The band is two-sided and log-symmetric, so the same
-#   penalty pushes captions longer here; nothing about the sign needs changing.
+#   LEN_LAMBDA is measured for THIS direction, and it has to be sized against the
+#   reward actually in use — the two differ here, unlike t2p where both gave the
+#   same answer. Job 8723416 (raw): rstd 0.056-0.091 -> 0.31. Job 8723638
+#   (contrastive, the default above): rstd 0.077-0.104, mean ~0.095 -> 4.5*rstd
+#   ~ 0.43. Shipping 0.4 for the contrastive reward. Drop to 0.3 if you set
+#   REWARD_CONTRASTIVE=0.
 #
-#   Caveat on the evidence: this is 5 steps of one job, versus t2p's two jobs at
-#   10 steps. lenratio was also drifting upward across those 5 steps (0.55 -> 0.77),
-#   which could be warmup rather than a stable level. Re-read rstd and lenratio
-#   from the first --log-every 10 lines of this run and adjust if they disagree.
+#   The trigger condition is met, but in the OPPOSITE direction from t2p —
+#   lenratio ran 0.55-0.74 across BOTH jobs, i.e. generated captions are ~30% too
+#   SHORT, where t2p generations were ~70% too long. The band is two-sided and
+#   log-symmetric, so the same penalty pushes captions longer here; nothing about
+#   the sign needs changing.
+#
+#   Caveat: 5 steps per job. lenratio drifted upward within each run
+#   (0.55 -> ~0.74), which may be warmup rather than a stable level, though it
+#   reproduced across two independent jobs. Re-read rstd and lenratio from the
+#   first --log-every 10 lines of this run and adjust if they disagree.
 #
 # NOTE: the contrastive reward is on a different scale from the raw one, so reward
 # curves here are not comparable to earlier p2t runs. R@K/mAP still are.
-LEN_LAMBDA=${LEN_LAMBDA:-0.3}
+LEN_LAMBDA=${LEN_LAMBDA:-0.4}
 REWARD_CONTRASTIVE=${REWARD_CONTRASTIVE:-1}
 MARGIN_BETA=${MARGIN_BETA:-1.0}
 

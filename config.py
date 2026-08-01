@@ -208,7 +208,13 @@ class HardNegCfg:
     device: str = "auto"
 
     batch_size: int = 128
-    num_workers: int = 0
+    # Nonzero by default, unlike the retrieval phase: this loader reads 1+max_decoys
+    # text rows per sample instead of 1, so the per-step random-read count on the
+    # shared filesystem triples. With num_workers=0 every one of those reads is
+    # serialized into the training step; workers overlap them with compute. The
+    # decoy MATH is <1% of the R2 contrastive math, so if a step is slow it is
+    # essentially always this.
+    num_workers: int = 4
     epochs: int = 3
     lr: float = 5e-5                          # fine-tune LR: we resume a converged model
     weight_decay: float = 0.01

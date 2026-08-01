@@ -224,6 +224,10 @@ def main() -> None:
     ap.add_argument("--filip-chunk-rows", type=int, default=0,
                     help=">0 chunks the FILIP score matrices over the anchor axis")
     ap.add_argument("--val-subset", type=int, default=1000)
+    ap.add_argument("--num-workers", type=int, default=hn.num_workers,
+                    help="DataLoader workers. This phase reads 1+max_decoys text "
+                         "rows per sample, so 0 serializes ~3x the random reads "
+                         "into the training step; raise until data_wait falls")
     ap.add_argument("--load-optimizer", action="store_true",
                     help="restore the retrieval run's optimizer state instead of "
                          "starting fresh (default: fresh, since this phase runs its "
@@ -250,7 +254,7 @@ def main() -> None:
     cfg.retrieval.use_cache = True
     cfg.retrieval.cache_dir = args.cache_dir
     cfg.retrieval.batch_size = args.batch_size
-    cfg.retrieval.num_workers = hn.num_workers
+    cfg.retrieval.num_workers = args.num_workers
     cfg.data.subset_size = args.subset_size
     cfg.data.seed = args.seed
     cfg.retrieval.align_aux_weight = args.align_aux_weight
@@ -358,7 +362,19 @@ def main() -> None:
             train_sampler.set_epoch(epoch)
         model.train()
         t0 = time.time()
+        # Split wall-clock into "waiting for the loader" vs "doing the step". This
+        # phase reads 1+max_decoys text rows per sample, and the decoy math is <1%
+        # of the R2 contrastive math, so a slow epoch is almost always data_wait.
+        # If data_wait dominates: raise --num-workers, then lower --max-decoys.
+        # If step dominates: it is the R2 [B, group_size*batch_size] FILIP matrix,
+        # not the decoys — lower --group-size or --filip-chunk-rows.
+        # No explicit device sync is added: average_gradients' all-reduce and the
+        # .item() in the log line already force one, so the split is meaningful.
+        t_data = t_step = 0.0
+        t_mark = time.time()
         for it, batch in enumerate(train_loader):
+            t_data += time.time() - t_mark
+            t_mark = time.time()
             lr = cosine_warmup_lr(global_step, total_steps, warmup_steps, args.lr)
             for g in optimizer.param_groups:
                 g["lr"] = lr
@@ -434,9 +450,12 @@ def main() -> None:
             optimizer.step()
             core.clamp_temperature()
             global_step += 1
+            t_step += time.time() - t_mark
 
             if env.is_main and ((it + 1) % hn.log_every == 0 or it == 0):
                 tau = 1.0 / core.logit_scale.exp().item()
+                n_done = it + 1
+                frac_data = t_data / max(t_data + t_step, 1e-9)
                 print(
                     f"[hardneg] epoch={epoch} step={it+1}/{steps_per_epoch} "
                     f"lr={lr:.2e} loss={total.item():.4f} "
@@ -448,13 +467,26 @@ def main() -> None:
                     f"d_acc={dec['decoy_acc'].item():.3f} "
                     f"d_margin={dec['decoy_margin'].item():.4f} "
                     f"d_rows={int(dec['decoy_rows'].item())}/{h_p.size(0)} "
-                    f"tau={tau:.4f}",
+                    f"tau={tau:.4f} "
+                    f"| {(t_data + t_step)/n_done:.2f}s/step "
+                    f"data_wait={t_data/n_done:.2f}s ({100*frac_data:.0f}%) "
+                    f"step={t_step/n_done:.2f}s",
                     flush=True,
                 )
+            t_mark = time.time()
 
         dt = time.time() - t0
         if env.is_main:
-            print(f"[hardneg] epoch={epoch} done in {dt:.1f}s")
+            frac_data = t_data / max(t_data + t_step, 1e-9)
+            print(f"[hardneg] epoch={epoch} done in {dt:.1f}s "
+                  f"({steps_per_epoch} steps, {dt/max(steps_per_epoch,1):.2f}s/step; "
+                  f"data_wait {100*frac_data:.0f}%, compute {100*(1-frac_data):.0f}%)")
+            if frac_data > 0.5:
+                print(f"[hardneg] NOTE: over half the epoch was spent waiting on the "
+                      f"loader (num_workers={args.num_workers}, max_decoys="
+                      f"{args.max_decoys}). The decoy loss is <1% of the step's FILIP "
+                      f"math, so this is I/O, not the new objective: raise "
+                      f"--num-workers, then lower --max-decoys.")
             t_eval = time.time()
             metrics = evaluate_split(
                 core, val_loader, device, None,

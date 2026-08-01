@@ -50,7 +50,7 @@ mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
         --cache-dir cache --decoy-cache-dir cache/decoys \
         --ckpt-dir checkpoints/hard_negatives \
         --batch-size 16 --group-size 16 --filip-chunk-rows 8 \
-        --epochs 4 --lr 5e-5 \
+        --epochs 4 --lr 5e-5 --num-workers 4 \
         --align-aux-weight 0 --r2-uniformity-weight 0 \
         --decoy-weight 0.5 --decoy-start-frac 0.05 --decoy-ramp-frac 0.35 \
         --max-decoys 2
