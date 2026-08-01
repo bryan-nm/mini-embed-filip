@@ -146,7 +146,8 @@ mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
     --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
     --max-target-tokens "${MAX_TGT}" --direction-augment \
     --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
-    --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100 ${EXTRA}
+    --contrast-lambda 0.2 \
+    --cross-attn-every "${CAE}" --unfreeze-top 2 --no-lora --val-subset 100 ${EXTRA}
 
 rc=$?
 if [ $rc -eq 0 ]; then
