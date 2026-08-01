@@ -33,7 +33,7 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 #                              a 112M MoE and gives conditioning many entry points.
 # ---------------------------------------------------------------------------
 
-: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+RCKPT=checkpoints/retrieval/epoch50.pt
 
 # Sizing knobs, overridable from the qsub environment (-v BS=...). Defaults are
 # tuned for ProtGPT3-112M (hidden 512, 8 layers). The 1.3B decoder is ~4x the
