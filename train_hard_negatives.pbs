@@ -44,13 +44,29 @@ slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 # decoy weight to 0.5 over the next 35% and hold. Watch d_acc / val_decoy_acc
 # rise while R@K holds; if R@K sags as the ramp tops out, lower --decoy-weight or
 # switch to the bounded hinge (--decoy-margin 0.02).
+#
+# Restart-safe: if this phase already wrote checkpoints, continue from the latest
+# (restoring epoch, global_step, optimizer and the decoy-ramp position) instead of
+# replaying from scratch. A single node or fabric failure — a SIGBUS on an mmap'd
+# cache page, then the oneCCL "RECV entry failed" cascade as peers lose a
+# participant — costs one epoch rather than the whole job. Recovery is just
+# resubmitting this script.
+HN_DIR=checkpoints/hard_negatives
+if ls ${HN_DIR}/epoch*.pt >/dev/null 2>&1; then
+    RESUME_ARGS="--continue-from auto"
+    echo "found checkpoints in ${HN_DIR}; continuing the interrupted run"
+else
+    RESUME_ARGS="--resume checkpoints/retrieval/epoch50.pt"
+    echo "no checkpoints in ${HN_DIR}; starting the phase from the retrieval checkpoint"
+fi
+
 mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
     python -m src.train_hard_negatives --device xpu \
-        --resume checkpoints/retrieval/epoch20.pt \
+        ${RESUME_ARGS} \
         --cache-dir cache --decoy-cache-dir cache/decoys \
-        --ckpt-dir checkpoints/hard_negatives \
+        --ckpt-dir ${HN_DIR} \
         --batch-size 16 --group-size 16 --filip-chunk-rows 8 \
-        --epochs 4 --lr 5e-5 --num-workers 4 \
+        --epochs 10 --lr 5e-5 --num-workers 4 \
         --align-aux-weight 0 --r2-uniformity-weight 0 \
         --decoy-weight 0.5 --decoy-start-frac 0.05 --decoy-ramp-frac 0.35 \
         --max-decoys 2

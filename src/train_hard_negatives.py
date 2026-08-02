@@ -205,9 +205,16 @@ def main() -> None:
     cfg = default_cfg()
     hn = cfg.hard_neg
     ap = argparse.ArgumentParser()
-    ap.add_argument("--resume", required=True,
+    ap.add_argument("--resume", default=None,
                     help="retrieval checkpoint to continue: a path to an epochNN.pt, "
                          "or 'auto' to pick the latest in --retrieval-ckpt-dir")
+    ap.add_argument("--continue-from", default=None,
+                    help="restart an INTERRUPTED hard-negative run from its own "
+                         "checkpoint ('auto' = latest in --ckpt-dir). Restores the "
+                         "epoch, global_step, optimizer and log, so the decoy ramp "
+                         "picks up where it stopped instead of replaying from zero. "
+                         "Use this after a node/fabric failure; --resume starts a "
+                         "fresh run from a retrieval checkpoint.")
     ap.add_argument("--retrieval-ckpt-dir", default=cfg.retrieval.ckpt_dir,
                     help="searched by --resume auto")
     ap.add_argument("--device", default=hn.device)
@@ -296,13 +303,22 @@ def main() -> None:
         cfg, splits_path, env, pairs=None, val_subset=args.val_subset,
         dataset_factory=make_ds, collate_fn=decoy_collate)
 
-    # --- resume ---
-    resume_path = resolve_resume_path(args.resume, Path(args.retrieval_ckpt_dir))
+    # --- resume: either start a fresh phase from a retrieval checkpoint, or
+    # continue an interrupted one from this phase's own checkpoint ---
+    if args.continue_from:
+        resume_path = resolve_resume_path(args.continue_from, ckpt_dir)
+    elif args.resume:
+        resume_path = resolve_resume_path(args.resume, Path(args.retrieval_ckpt_dir))
+    else:
+        raise SystemExit(
+            "pass --resume <retrieval checkpoint> to start this phase, or "
+            "--continue-from <hard-negative checkpoint|auto> to restart an "
+            "interrupted run")
     ckpt = torch.load(resume_path, map_location="cpu")
     model = build_model(cfg, ckpt["model_state"], device)
     core = model
     if env.is_main:
-        print(f"[hardneg] resumed {resume_path} (epoch {ckpt.get('epoch')}, "
+        print(f"[hardneg] loaded {resume_path} (epoch {ckpt.get('epoch')}, "
               f"global_step {ckpt.get('global_step')})")
 
     # The checkpoint's projection heads carry the corpus means as buffers. Fall
@@ -324,25 +340,61 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=hn.weight_decay)
-    if args.load_optimizer and "optimizer_state" in ckpt:
+    # Continuing this phase always restores the optimizer (an interrupted run must
+    # not restart Adam's moments mid-schedule); starting the phase restores it only
+    # on request, since a fresh LR schedule at a lower LR is the sane default.
+    if (args.continue_from or args.load_optimizer) and "optimizer_state" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if env.is_main:
-            print("[hardneg] restored optimizer state from the retrieval checkpoint")
+            print("[hardneg] restored optimizer state")
 
     steps_per_epoch = max(len(train_loader), 1)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = max(int(hn.warmup_frac * total_steps), 1)
+
+    log = []
+    start_epoch = 0
+    global_step = 0
+    if args.continue_from:
+        start_epoch = int(ckpt["epoch"]) + 1
+        # global_step drives BOTH the LR cosine and the decoy ramp, so restoring it
+        # is what makes the restart continuous rather than a replay.
+        global_step = int(ckpt.get("global_step", start_epoch * steps_per_epoch))
+        log = ckpt.get("train_log", [])
+        if start_epoch >= args.epochs:
+            raise SystemExit(
+                f"--continue-from is at epoch {ckpt['epoch']}, already at/past "
+                f"--epochs {args.epochs}; raise --epochs to keep training")
+        prev = ckpt.get("hard_neg_args", {})
+        drift = {k: (prev.get(k), getattr(args, k)) for k in
+                 ("decoy_weight", "decoy_start_frac", "decoy_ramp_frac",
+                  "decoy_margin", "max_decoys", "epochs", "lr", "batch_size",
+                  "group_size", "align_aux_weight", "recon_weight",
+                  "r2_uniformity_weight")
+                 if k in prev and prev[k] != getattr(args, k)}
+        if drift and env.is_main:
+            print(f"[hardneg] WARNING: these flags differ from the interrupted run; "
+                  f"the schedule will not match what it would have done:")
+            for k, (was, now) in drift.items():
+                print(f"[hardneg]   {k}: {was} -> {now}")
+
     if env.is_main:
         ramp_end = int((args.decoy_start_frac + args.decoy_ramp_frac) * total_steps)
+        w_now = decoy_weight_at(global_step, total_steps, args.decoy_weight,
+                                args.decoy_start_frac, args.decoy_ramp_frac)
         print(f"[hardneg] {total_steps} steps ({args.epochs} epochs x "
               f"{steps_per_epoch}); decoy weight reaches {args.decoy_weight} at "
               f"step {ramp_end}")
+        if args.continue_from:
+            print(f"[hardneg] continuing at epoch {start_epoch}, "
+                  f"global_step {global_step}, decoy weight now {w_now:.3f}")
 
-    log = []
     # Baseline before any decoy gradient: the number every later epoch is judged
     # against. Without it the first val report already sits partway up the ramp,
-    # and "did hard negatives help" has no reference point.
-    if env.is_main:
+    # and "did hard negatives help" has no reference point. Skipped when continuing
+    # an interrupted run — the baseline is already in the restored log, and
+    # re-measuring it here would record a mid-ramp model under the "baseline" label.
+    if env.is_main and not args.continue_from:
         base = evaluate_split(
             core, val_loader, device, None,
             cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
@@ -356,9 +408,10 @@ def main() -> None:
         log.append({"epoch": -1, "phase": "baseline", "decoy_weight_end": 0.0, **base})
     barrier()
 
-    global_step = 0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
+            # Seeded by epoch, so a continued run reshuffles exactly as an
+            # uninterrupted one would have at this epoch.
             train_sampler.set_epoch(epoch)
         model.train()
         t0 = time.time()
