@@ -50,7 +50,7 @@ from src.dist import (
 from src.evaluate import evaluate_split
 from src.compute_means import load_means
 from src.losses import phase_r1_loss, phase_r2_loss_grouped
-from src.model import MiniEmbedFilip
+from src.model import build_retrieval
 
 
 # ---------------------------------------------------------------------------
@@ -361,19 +361,7 @@ def main() -> None:
     train_loader, val_loader, train_sampler, row_group_ids, row_text_ids = build_loaders(
         cfg, splits_path, env, pairs=pairs, val_subset=args.val_subset)
 
-    model = MiniEmbedFilip(
-        text_hidden=cfg.model.text_hidden,
-        protein_hidden=cfg.model.protein_hidden,
-        proj_d_hidden=cfg.model.proj_d_hidden,
-        proj_d_mid=cfg.model.proj_d_mid,
-        embed_dim=cfg.model.embed_dim,
-        proj_dropout=cfg.model.proj_dropout,
-        expand_d_mid=cfg.model.expand_d_mid,
-        expand_d_hidden=cfg.model.expand_d_hidden,
-        expand_dropout=cfg.model.expand_dropout,
-        init_temperature=cfg.retrieval.init_temperature,
-        max_temperature=cfg.retrieval.max_temperature,
-    ).to(device)
+    model = build_retrieval(cfg).to(device)
     if env.is_main:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[train] trainable params: {n_params:,}")

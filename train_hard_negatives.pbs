@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
-#PBS -N filip_hardneg
+#PBS -N filip_hard_negatives
 #PBS -l walltime=08:00:00
 #PBS -l select=16
 #PBS -l place=scatter
@@ -10,71 +10,88 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
 
-# Resume the retrieval checkpoint with its own R2 objective and ramp in the hard
-# decoy loss. Requires cache/decoys/ from precompute_decoys.pbs.
-
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
-
-NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))           # 16*12 = 192 ranks, 12 groups of 16
-
-export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-# FILIP_DATA_CSV intentionally unset: this phase is cache-only (base cache +
-# decoy cache + the retrieval run's splits.json). The CSV was only needed to
+# ---------------------------------------------------------------------------
+# Hard-decoy negative mining: resume a retrieval checkpoint with its own R2
+# objective plus a ramped decoy-discrimination loss. Cache-only (base cache +
+# decoy cache + the retrieval run's splits.json); the CSV was needed only to
 # build the decoys.
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE"); export MASTER_PORT=29503
-export OMP_NUM_THREADS=8
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export FI_PROVIDER=cxi
-export CCL_ZE_IPC_EXCHANGE=pidfd
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
-
-source ~/bin/slack_notify.sh
-slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
-
-# --align-aux-weight 0 / --r2-uniformity-weight 0 mirror train_retrieval.pbs:
-# these MUST match what the resumed run finished with, or "resume with its
-# existing objective" silently isn't.
 #
+# Model and dataset locations are NOT set here — config.py owns them.
+# ---------------------------------------------------------------------------
+
+MASTER_PORT=29507
+source ./pbs_common.sh
+
+# ===========================================================================
+# Checkpoints and caches
+# ===========================================================================
+RETRIEVAL_CKPT=checkpoints/retrieval/epoch50.pt
+CACHE_DIR=cache
+DECOY_DIR=cache/decoys
+CKPT_DIR=checkpoints/hard_negatives
+
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# Mirrors train_retrieval.pbs — these MUST match the run being resumed, since
+# the negative pool is part of the objective. See that file for why 32 fits at
+# the 512-token protein cap. WALL TIME BASIS is the same as retrieval's: ~2x
+# cheaper per step, fewer steps/epoch, 10 epochs instead of 21.
+BATCH_SIZE=32
+GROUP_SIZE=16
+FILIP_CHUNK_ROWS=8
+EPOCHS=10
+LR=5e-5                 # fine-tune LR: we resume a converged model
+NUM_WORKERS=4           # this loader reads 1+MAX_DECOYS text rows per sample
+# These MUST match what the resumed run finished with (train_retrieval.pbs), or
+# "resume with its existing objective" silently isn't.
+ALIGN_AUX_WEIGHT=0
+R2_UNIFORMITY_WEIGHT=0
 # Decoy schedule: 5% of the run pure R2 (re-warm at the lower LR), then ramp the
-# decoy weight to 0.5 over the next 35% and hold. Watch d_acc / val_decoy_acc
-# rise while R@K holds; if R@K sags as the ramp tops out, lower --decoy-weight or
-# switch to the bounded hinge (--decoy-margin 0.02).
-#
+# decoy weight to DECOY_WEIGHT over the next 35% and hold. Watch d_acc /
+# val_decoy_acc rise while R@K holds; if R@K sags as the ramp tops out, lower
+# DECOY_WEIGHT or switch to the bounded hinge (DECOY_MARGIN=0.02).
+DECOY_WEIGHT=0.5
+DECOY_START_FRAC=0.05
+DECOY_RAMP_FRAC=0.35
+DECOY_MARGIN=0.0
+MAX_DECOYS=2
+
+# ===========================================================================
 # Restart-safe: if this phase already wrote checkpoints, continue from the latest
-# (restoring epoch, global_step, optimizer and the decoy-ramp position) instead of
-# replaying from scratch. A single node or fabric failure — a SIGBUS on an mmap'd
-# cache page, then the oneCCL "RECV entry failed" cascade as peers lose a
-# participant — costs one epoch rather than the whole job. Recovery is just
+# (restoring epoch, global_step, optimizer and the decoy-ramp position) instead
+# of replaying from scratch. A single node or fabric failure — a SIGBUS on an
+# mmap'd cache page, then the oneCCL "RECV entry failed" cascade as peers lose a
+# participant — then costs one epoch rather than the whole job. Recovery is just
 # resubmitting this script.
-HN_DIR=checkpoints/hard_negatives
-if ls ${HN_DIR}/epoch*.pt >/dev/null 2>&1; then
+if ls ${CKPT_DIR}/epoch*.pt >/dev/null 2>&1; then
     RESUME_ARGS="--continue-from auto"
-    echo "found checkpoints in ${HN_DIR}; continuing the interrupted run"
+    RESUME_MODE="continuing the interrupted run from ${CKPT_DIR}"
 else
-    RESUME_ARGS="--resume checkpoints/retrieval/epoch50.pt"
-    echo "no checkpoints in ${HN_DIR}; starting the phase from the retrieval checkpoint"
+    RESUME_ARGS="--resume ${RETRIEVAL_CKPT}"
+    RESUME_MODE="starting the phase from ${RETRIEVAL_CKPT}"
 fi
 
-mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
-    python -m src.train_hard_negatives --device xpu \
-        ${RESUME_ARGS} \
-        --cache-dir cache --decoy-cache-dir cache/decoys \
-        --ckpt-dir ${HN_DIR} \
-        --batch-size 16 --group-size 16 --filip-chunk-rows 8 \
-        --epochs 10 --lr 5e-5 --num-workers 4 \
-        --align-aux-weight 0 --r2-uniformity-weight 0 \
-        --decoy-weight 0.5 --decoy-start-frac 0.05 --decoy-ramp-frac 0.35 \
-        --max-decoys 2
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "hard-negative mining (src.train_hard_negatives)" \
+    RETRIEVAL_CKPT CACHE_DIR DECOY_DIR CKPT_DIR RESUME_MODE \
+    BATCH_SIZE GROUP_SIZE FILIP_CHUNK_ROWS EPOCHS LR NUM_WORKERS \
+    ALIGN_AUX_WEIGHT R2_UNIFORMITY_WEIGHT \
+    DECOY_WEIGHT DECOY_START_FRAC DECOY_RAMP_FRAC DECOY_MARGIN MAX_DECOYS
+require_files RETRIEVAL_CKPT CACHE_DIR DECOY_DIR
 
-rc=$?
-if [ $rc -eq 0 ]; then
-    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
-else
-    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
-fi
-exit $rc
+"${MPI_LAUNCH[@]}" \
+    python -m src.train_hard_negatives --device xpu ${RESUME_ARGS} \
+        --cache-dir "${CACHE_DIR}" --decoy-cache-dir "${DECOY_DIR}" \
+        --ckpt-dir "${CKPT_DIR}" \
+        --batch-size "${BATCH_SIZE}" --group-size "${GROUP_SIZE}" \
+        --filip-chunk-rows "${FILIP_CHUNK_ROWS}" \
+        --epochs "${EPOCHS}" --lr "${LR}" --num-workers "${NUM_WORKERS}" \
+        --align-aux-weight "${ALIGN_AUX_WEIGHT}" \
+        --r2-uniformity-weight "${R2_UNIFORMITY_WEIGHT}" \
+        --decoy-weight "${DECOY_WEIGHT}" \
+        --decoy-start-frac "${DECOY_START_FRAC}" \
+        --decoy-ramp-frac "${DECOY_RAMP_FRAC}" \
+        --decoy-margin "${DECOY_MARGIN}" --max-decoys "${MAX_DECOYS}"
+
+finish $?

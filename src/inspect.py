@@ -29,28 +29,11 @@ from src.data import (
     PackedPerTokenCache,
     load_row_protein_idx,
 )
-from src.model import MiniEmbedFilip
+from src.model import MiniEmbedFilip, load_retrieval
 
 
 def _load_model(ckpt_path: str, device: torch.device) -> MiniEmbedFilip:
-    cfg = default_cfg()
-    model = MiniEmbedFilip(
-        text_hidden=cfg.model.text_hidden,
-        protein_hidden=cfg.model.protein_hidden,
-        proj_d_hidden=cfg.model.proj_d_hidden,
-        proj_d_mid=cfg.model.proj_d_mid,
-        embed_dim=cfg.model.embed_dim,
-        proj_dropout=cfg.model.proj_dropout,
-        expand_d_mid=cfg.model.expand_d_mid,
-        expand_d_hidden=cfg.model.expand_d_hidden,
-        expand_dropout=cfg.model.expand_dropout,
-        init_temperature=cfg.retrieval.init_temperature,
-        max_temperature=cfg.retrieval.max_temperature,
-    )
-    state = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(state["model_state"])
-    model.eval().to(device)
-    return model
+    return load_retrieval(ckpt_path, device, default_cfg())
 
 
 def compute_similarity_matrix_from_cache(
@@ -69,7 +52,7 @@ def compute_similarity_matrix_from_cache(
     row_protein_idx = load_row_protein_idx(cache_dir)
     h_p, m_p = p_cache.get(int(row_protein_idx[pair_idx]))
     h_t, m_t = t_cache.get(pair_idx)
-    h_p = h_p.to(device).float().unsqueeze(0)               # [1, L_p, 640]
+    h_p = h_p.to(device).float().unsqueeze(0)               # [1, L_p, protein_hidden]
     h_t = h_t.to(device).float().unsqueeze(0)               # [1, L_t, 768]
     m_p = m_p.to(device).unsqueeze(0)
     m_t = m_t.to(device).unsqueeze(0)
@@ -305,7 +288,8 @@ def main() -> None:
     ap.add_argument("--text", type=str, default=None, help="raw caption text")
     # Live mode: look accessions up in a CSV
     ap.add_argument("--csv", type=str, default=None,
-                    help="CSV to resolve --protein-id / --id-file accessions")
+                    help="corpus to resolve accessions in; defaults to "
+                         "config.DataCfg.csv_path, which is where the path belongs")
     ap.add_argument("--protein-id", nargs="+", default=None,
                     help="one or more primary_Accession to inspect live (needs --csv)")
     ap.add_argument("--id-file", type=str, default=None,
@@ -339,6 +323,8 @@ def main() -> None:
     if args.protein and args.text:
         worklist.append(("query", args.protein, args.text))
     elif args.protein_id or args.id_file:
+        if args.csv is None:
+            args.csv = cfg.data.csv_path
         if not args.csv:
             raise SystemExit("--protein-id / --id-file require --csv")
         ids = list(args.protein_id or [])

@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_t2p_sft
-#PBS -l walltime=16:00:00
+#PBS -l walltime=08:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -10,113 +10,105 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m abe
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
-
 # ---------------------------------------------------------------------------
 # text -> protein SFT. Split from the old shared train_generation.pbs: the two
 # directions no longer want the same regimen (target length, direction
 # augmentation, and adapter density all differ), and forcing them through one
 # file made every asymmetry look like an accident. See train_p2t_SFT.pbs.
 #
-# What is specific to THIS direction:
-#   --max-target-tokens 1024   proteins, not captions. 512 truncated ~a quarter
-#                              of SwissProt; at 1024 essentially everything fits,
-#                              so termination is learned across the whole length
-#                              distribution instead of only from short proteins.
-#   --direction-augment        ProtGPT3 is the only decoder with a C-to-N marker.
-#                              Each target is factorized N-to-C or C-to-N by coin
-#                              flip, so the C-terminus of a long protein is seen
-#                              even when the N-terminal window is what got cut.
-#   CAE=1                      cross-attn on every one of the 8 layers; cheap on
-#                              a 112M MoE and gives conditioning many entry points.
+# Everything this job depends on is set below and printed to the .o file by
+# job_banner. Model and dataset locations are NOT set here — config.py owns them.
 # ---------------------------------------------------------------------------
 
-RCKPT=checkpoints/retrieval/epoch50.pt
+MASTER_PORT=29502
+source ./pbs_common.sh
 
-# Sizing knobs, overridable from the qsub environment (-v BS=...). Defaults are
-# tuned for ProtGPT3-112M (hidden 512, 8 layers). The 1.3B decoder is ~4x the
-# per-token activation cost (hidden 1024, 17 layers): drop BS and/or set
-# GRAD_CKPT=1 there rather than editing this file.
-BS=${BS:-32}
-CAE=${CAE:-1}
-MAX_TGT=${MAX_TGT:-1024}
-EPOCHS=${EPOCHS:-20}
-LR=${LR:-1.5e-4}
-GRAD_CKPT=${GRAD_CKPT:-0}
-# Cross-attention coverage aux. Cross-attn softmaxes over the memory axis, so each
-# decoder position must spend its mass on the caption, but no caption position is
-# required to RECEIVE any — an unattended source token contributes ~0 to every
-# attn_out and cannot reach the output at all.
+# ===========================================================================
+# Checkpoints
+# ===========================================================================
+RETRIEVAL_CKPT=checkpoints/retrieval/epoch50.pt
+CKPT_DIR=checkpoints/generation            # writes <CKPT_DIR>/text2protein/
+
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# Sizing, tuned for ProtGPT3-112M (hidden 512, 8 layers). The 1.3B decoder is
+# ~4x the per-token activation cost (hidden 1024, 17 layers): drop BATCH_SIZE
+# and/or set GRAD_CKPT=1 there.
 #
-# The deficit is MEASURED on this exact config (job 8723205, epoch-6 checkpoint,
-# 39,216 val source positions): captions average ~96 valid tokens so uniform
-# attention is 0.0104, and the coverage distribution came out p10=0.006
-# p50=0.026 p90=0.128. ~20% of caption positions sit at or below uniform — no
-# decoder position attends them more than if attention ignored them outright.
-# TAU=0.025 (~2.4x uniform) targets that starved lower half.
+# BATCH_SIZE doubled from 32 with the 512-token target cap. At (B=32, T=1024)
+# vs (B=64, T=512) the linear term B*T is identical and the attention term B*T^2
+# is halved, so this is the same-or-smaller footprint at twice the batch.
 #
-# ON at LAMBDA=0.5 (~2% of CE at the measured covpen). Note what is and is not
-# established: the coverage DEFICIT is measured, the BENEFIT is not. No run has
-# yet shown this improves multi-clause fidelity or round-trip R@K — it is on by
-# decision, not by evidence. So treat the first job under it as the A/B:
-#   [gen][rt] gen->src R@1/mAP is the metric that has to hold or improve. If it
-#   drops versus the last COV_LAMBDA=0 run at the same epoch, the aux is buying
-#   coverage at the cost of the thing you actually want — set -v COV_LAMBDA=0.
-#   covpen should fall over training and val ce should not climb; ce drifting up
-#   while covpen collapses means lambda is too high for this tau.
-# Incompatible with GRAD_CKPT=1 — the trainer rejects the pair rather than let
-# the aux silently no-op.
-COV_LAMBDA=${COV_LAMBDA:-0.5}
-COV_TAU=${COV_TAU:-0.025}
-# Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart to
-# val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank here and
-# costs one generate + one N x N FILIP per epoch. RT_MAX_NEW is the real cost knob
-# (wall time is linear in it); RT_SAMPLES=0 turns the eval off.
-RT_SAMPLES=${RT_SAMPLES:-512}
-RT_MAX_NEW=${RT_MAX_NEW:-${MAX_TGT}}
+# WALL TIME BASIS: per step is same-to-half the old cost, steps/epoch halve from
+# the doubled batch, and the row count falls with one caption per accession. The
+# per-epoch round-trip eval also halves (RT_MAX_NEW tracks the cap). 8h against
+# the old 16h; read the per-epoch "done in" line on the first job.
+BATCH_SIZE=64
+EPOCHS=20
+LR=1.5e-4
+GRAD_CKPT=0
 
-NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))
+# Proteins, not captions — but this corpus is filtered to <=500 residues, so 512
+# fits every target with nothing truncated and termination is learned across the
+# whole length distribution. (An unfiltered SwissProt needs 1024: at 512 it
+# truncated ~a quarter of the corpus, and a truncated target carries no EOS.)
+# Raise this alongside the corpus if that ever changes.
+MAX_TARGET_TOKENS=512
+# ProtGPT3 is the only decoder with a C-to-N marker. Each target is factorized
+# N-to-C or C-to-N by coin flip, so the C-terminus of a long protein is seen even
+# when the N-terminal window is what got cut.
+DIRECTION_AUGMENT=1
+# Cross-attn on every one of the 8 layers: cheap on a 112M MoE, and it gives the
+# conditioning many entry points.
+CROSS_ATTN_EVERY=1
+CROSS_ATTN_MODE=aligned
+MEMORY_SPACE=aligned
+UNFREEZE_TOP=2
+UNFREEZE_WHERE=top
+VAL_SUBSET=100
 
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
-export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-# Stated explicitly rather than left to the config default so the job fails
-# loudly if the decoder isn't staged.
-export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
-export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
-export MASTER_PORT=29502
-export OMP_NUM_THREADS=8
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-# Do the rank/KVS exchange over MPI (PMIx), NOT oneCCL's internal TCP KVS. The
-# internal KVS is a single rendezvous server on rank 0; at O(1000s) of ranks the
-# simultaneous connect storm overruns it ("Connection reset by peer" -> "pmi init
-# failed" -> SIGSEGV during the first collective). Fine at a few nodes, fatal at
-# scale. CCL_KVS_MODE=mpi routes the exchange through MPI instead; the timeout is
-# headroom for the bring-up on a busy fabric.
-export CCL_KVS_MODE=mpi
-export CCL_KVS_CONNECTION_TIMEOUT=600
-export FI_PROVIDER=cxi
-export CCL_ZE_IPC_EXCHANGE=pidfd
+# Contrastive negative-memory hinge: each step also runs the decoder on a
+# shuffled (wrong) memory and penalizes the correct memory unless it beats the
+# wrong one by CONTRAST_MARGIN nats/token. Doubles the forward batch to 2B.
+CONTRAST_LAMBDA=0.2
+CONTRAST_MARGIN=0.5
 
+# Cross-attention coverage aux. Cross-attn softmaxes over the memory axis, so
+# each decoder position must spend its mass on the caption, but no caption
+# position is required to RECEIVE any — an unattended source token contributes
+# ~0 to every attn_out and cannot reach the output at all.
+#
+# The deficit is MEASURED on this exact config (epoch-6 checkpoint, 39,216 val
+# source positions): captions average ~96 valid tokens so uniform attention is
+# 0.0104, and the coverage distribution came out p10=0.006 p50=0.026 p90=0.128.
+# ~20% of caption positions sit at or below uniform. COV_TAU=0.025 (~2.4x
+# uniform) targets that starved lower half; COV_LAMBDA=0.5 puts the penalty at
+# ~2% of CE there.
+#
+# Note what is and is not established: the coverage DEFICIT is measured, the
+# BENEFIT is not. Treat the first job under it as the A/B — [gen][rt] gen->src
+# R@1/mAP has to hold or improve. If it drops versus the last COV_LAMBDA=0 run
+# at the same epoch, set COV_LAMBDA=0. Incompatible with GRAD_CKPT=1.
+COV_LAMBDA=0.5
+COV_TAU=0.025
+
+# Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart
+# to val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank and
+# costs one generate + one N x N FILIP per epoch. RT_MAX_NEW is the real cost
+# knob (wall time is linear in it); RT_SAMPLES=0 turns the eval off.
+RT_SAMPLES=512
+RT_MAX_NEW=${MAX_TARGET_TOKENS}
+
+# ===========================================================================
 EXTRA=""
 [ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
+[ "$DIRECTION_AUGMENT" = 1 ] && EXTRA="${EXTRA} --direction-augment"
 if [ "$RT_SAMPLES" = 0 ]; then
     EXTRA="${EXTRA} --no-rt-eval"
 else
     EXTRA="${EXTRA} --rt-samples ${RT_SAMPLES} --rt-max-new-tokens ${RT_MAX_NEW}"
 fi
-
-source ~/bin/slack_notify.sh
-slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
-
-echo "t2p SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}" \
-     "rt_samples=${RT_SAMPLES} rt_max_new=${RT_MAX_NEW}" \
-     "cov_lambda=${COV_LAMBDA} cov_tau=${COV_TAU}"
 
 if [ "$GRAD_CKPT" = 1 ] && [ "$COV_LAMBDA" != "0.0" ] && [ "$COV_LAMBDA" != "0" ]; then
     echo "FATAL: COV_LAMBDA>0 cannot be combined with GRAD_CKPT=1 — under" >&2
@@ -126,33 +118,35 @@ if [ "$GRAD_CKPT" = 1 ] && [ "$COV_LAMBDA" != "0.0" ] && [ "$COV_LAMBDA" != "0" 
     exit 1
 fi
 
-# --pmi=pmix is REQUIRED to match CCL_PROCESS_LAUNCHER=pmix: it tells PALS to
-# expose a PMIx server for CCL to bootstrap against. Without it, pmix is requested
-# but unavailable and CCL falls back to the internal KVS (see CCL_KVS_MODE above).
-#
-# The per-step log carries trunc=<n>/<batch>: rows whose target overflowed the cap
-# and therefore carry NO EOS. It should be near zero at 1024 — if it isn't, the
-# cap is still shaping the length distribution and wants raising.
-#
-# Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val pool
-# (R@K/mAP back to the source caption, plus the ceiling from the true proteins) and
-# the mean generated vs true body length. That is the metric to watch: val CE can
-# fall while gen->src R@1 sits at the floor, which is exactly the teacher-forcing
-# confound train_rl.py exists to fix. Full history: <ckpt_dir>/sft_roundtrip.jsonl.
-mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
-    python -m src.train_generation --direction text2protein \
-    --retrieval-ckpt "${RCKPT}" --device xpu \
-    --memory-space aligned --cross-attn-mode aligned \
-    --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
-    --max-target-tokens "${MAX_TGT}" --direction-augment \
-    --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
-    --contrast-lambda 0.2 \
-    --cross-attn-every "${CAE}" --unfreeze-top 2 --no-lora --val-subset 100 ${EXTRA}
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "text2protein SFT (src.train_generation)" \
+    RETRIEVAL_CKPT CKPT_DIR \
+    BATCH_SIZE EPOCHS LR GRAD_CKPT MAX_TARGET_TOKENS DIRECTION_AUGMENT \
+    CROSS_ATTN_EVERY CROSS_ATTN_MODE MEMORY_SPACE UNFREEZE_TOP UNFREEZE_WHERE \
+    CONTRAST_LAMBDA CONTRAST_MARGIN COV_LAMBDA COV_TAU \
+    RT_SAMPLES RT_MAX_NEW VAL_SUBSET
+require_files RETRIEVAL_CKPT
 
-rc=$?
-if [ $rc -eq 0 ]; then
-    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
-else
-    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
-fi
-exit $rc
+# The per-step log carries trunc=<n>/<batch>: rows whose target overflowed the
+# cap and therefore carry NO EOS. It should be ZERO on this corpus — every
+# protein is <=500 residues. Anything else means the CSV is not the filtered one.
+#
+# Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val
+# pool (R@K/mAP back to the source caption, plus the ceiling from the true
+# proteins) and the mean generated vs true body length. That is the metric to
+# watch: val CE can fall while gen->src R@1 sits at the floor, which is exactly
+# the teacher-forcing confound train_rl.py exists to fix. Full history:
+# <CKPT_DIR>/text2protein/sft_roundtrip.jsonl.
+"${MPI_LAUNCH[@]}" \
+    python -m src.train_generation --direction text2protein --device xpu \
+    --retrieval-ckpt "${RETRIEVAL_CKPT}" --ckpt-dir "${CKPT_DIR}" \
+    --memory-space "${MEMORY_SPACE}" --cross-attn-mode "${CROSS_ATTN_MODE}" \
+    --cross-attn-every "${CROSS_ATTN_EVERY}" \
+    --unfreeze-top "${UNFREEZE_TOP}" --unfreeze-where "${UNFREEZE_WHERE}" \
+    --batch-size "${BATCH_SIZE}" --epochs "${EPOCHS}" --lr "${LR}" \
+    --max-target-tokens "${MAX_TARGET_TOKENS}" \
+    --contrast-lambda "${CONTRAST_LAMBDA}" --contrast-margin "${CONTRAST_MARGIN}" \
+    --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
+    --val-subset "${VAL_SUBSET}" ${EXTRA}
+
+finish $?

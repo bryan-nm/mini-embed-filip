@@ -1,12 +1,12 @@
 """Cross-attention adapters for the generation decoders.
 
 Supported architectures: Mixtral (ProtGPT3, the default text->protein decoder),
-Jamba (Dayhoff), ProGen2, and BioGPT.
+ProGen2, and BioGPT.
 
 Decoders are loaded as their pretrained `ForCausalLM` classes. We inject
 a `CrossAttentionAdapter` into a subset of decoder blocks (every Nth, by
-default) and freeze everything else. Optionally, LoRA is added on top of the
-existing self-attention QKV projections and FFN.
+default) and freeze everything else. The adapters (plus any explicitly
+unfrozen decoder blocks) are the only trainable parameters.
 
 Cross-attention "memory" is set on the model before each forward call via
 `set_cross_memory(model, memory, mask)`, which stores the tensors on each
@@ -19,28 +19,27 @@ The injection points differ slightly:
                   cross-attention "residual update" after the parallel block.
   BioGPT block:   standard pre-norm self-attn + FFN. We insert cross-attention
                   between them, also as a residual update.
-  Mixtral/Jamba:  the layer is left intact and a forward hook applies the
+  Mixtral:        the layer is left intact and a forward hook applies the
                   cross-attention residual to its output (see
                   `_make_cross_attn_hook`).
 
 The user-facing API:
   load_decoder_with_cross_attn(direction, path, cross_attn_every, memory_dim,
-                               lora_cfg, device)
+                               device)
       -> (model, tokenizer, adapter_blocks)
   set_cross_memory(adapter_blocks, memory, mask) -> None
   target_prefix_ids(model, tokenizer) -> List[int]   # decoder control tokens
   decode_target(model, tokenizer, ids) -> str        # inverse of the above
   count_trainable(model) -> int
 
-`memory_dim` is the dimension of the per-token expansion-head output (e.g.
-640 for protein encoder memory, 768 for text encoder memory). It is *not*
-the decoder hidden dim; the cross-attention K/V projections handle the
+`memory_dim` is the width of the conditioning memory (the shared embed_dim for
+aligned memory, the encoder hidden dim for expanded memory). It is *not* the
+decoder hidden dim; the cross-attention K/V projections handle the
 re-projection internally.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -244,44 +243,6 @@ class CrossAttentionAdapter(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Minimal LoRA wrapper (avoids hard dep on peft)
-# ---------------------------------------------------------------------------
-class LoRALinear(nn.Module):
-    """Wraps an existing nn.Linear, freezes it, and adds a low-rank update."""
-
-    def __init__(self, base: nn.Linear, rank: int, alpha: int, dropout: float):
-        super().__init__()
-        self.base = base
-        for p in self.base.parameters():
-            p.requires_grad_(False)
-        in_f, out_f = base.in_features, base.out_features
-        self.lora_A = nn.Linear(in_f, rank, bias=False)
-        self.lora_B = nn.Linear(rank, out_f, bias=False)
-        self.scaling = alpha / rank
-        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        # B initialized to zero -> adapter starts as a no-op
-        nn.init.zeros_(self.lora_B.weight)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base(x)
-        # Low-rank update runs in the LoRA params' dtype (fp32), then casts back —
-        # so an fp32 adapter on a bf16-loaded frozen base stays dtype-consistent.
-        lx = self.drop(x).to(self.lora_A.weight.dtype)
-        lora = self.scaling * self.lora_B(self.lora_A(lx))
-        return base_out + lora.to(base_out.dtype)
-
-
-def _replace_linear_with_lora(module: nn.Module, attr: str,
-                              rank: int, alpha: int, dropout: float) -> bool:
-    target = getattr(module, attr, None)
-    if isinstance(target, nn.Linear):
-        setattr(module, attr, LoRALinear(target, rank, alpha, dropout))
-        return True
-    return False
-
-
-# ---------------------------------------------------------------------------
 # ProGen2 block wrapper
 # ---------------------------------------------------------------------------
 class _ProGenBlockWithCrossAttn(nn.Module):
@@ -328,15 +289,6 @@ class _BioGptBlockWithCrossAttn(nn.Module):
 # ---------------------------------------------------------------------------
 # Loading and injection
 # ---------------------------------------------------------------------------
-@dataclass
-class LoRACfg:
-    rank: int = 16
-    alpha: int = 32
-    dropout: float = 0.05
-    target_self_attn: bool = True
-    target_ffn: bool = True
-
-
 def _freeze(model: nn.Module) -> None:
     for p in model.parameters():
         p.requires_grad_(False)
@@ -352,7 +304,7 @@ def _decoder_arch(model: nn.Module) -> str:
     work regardless of which checkpoint a direction is pointed at."""
     model = _unwrap(model)
     mt = getattr(getattr(model, "config", None), "model_type", "")
-    if mt in ("jamba", "mixtral"):
+    if mt == "mixtral":
         return mt
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return "progen"
@@ -369,12 +321,12 @@ def _decoder_blocks(model: nn.Module):
         return model.transformer.h            # ProGen2
     if arch == "biogpt":
         return model.biogpt.layers            # BioGPT
-    return model.model.layers                 # Jamba / Mixtral (ProtGPT3)
+    return model.model.layers                 # Mixtral (ProtGPT3)
 
 
 def unfreeze_decoder_blocks(model: nn.Module, n: int, where: str = "top") -> int:
     """Unfreeze `n` decoder blocks in place (full fine-tune of those blocks, on
-    top of the adapters/LoRA). Returns # params unfrozen.
+    top of the adapters). Returns # params unfrozen.
 
     Gives the decoder real capacity to incorporate the cross-attention memory
     when small adapters alone can't overcome the frozen prior. Keep `n` small and
@@ -404,11 +356,10 @@ def unfreeze_decoder_blocks(model: nn.Module, n: int, where: str = "top") -> int
     return count
 
 
-def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+def _progen_inject(model, every: int, mem_dim: int,
                    cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
-    """Inject cross-attention adapters + LoRA into a ProGen2 model in-place."""
+    """Inject cross-attention adapters into a ProGen2 model in-place."""
     base = model.transformer                              # ProGenModel
-    cfg = base.h[0].attn  # type: ignore[attr-defined]
     dec_hidden = base.embed_dim
     n_heads = model.config.n_head
 
@@ -418,30 +369,14 @@ def _progen_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
             continue
         ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
                                    score_space=cross_attn_mode)
-        wrapped = _ProGenBlockWithCrossAttn(block, ca)
-        base.h[i] = wrapped
+        base.h[i] = _ProGenBlockWithCrossAttn(block, ca)
         adapters.append(ca)
-
-    if lora_cfg.target_self_attn:
-        for block in base.h:
-            inner = block.inner if isinstance(block, _ProGenBlockWithCrossAttn) else block
-            _replace_linear_with_lora(inner.attn, "qkv_proj",
-                                      lora_cfg.rank, lora_cfg.alpha, lora_cfg.dropout)
-            _replace_linear_with_lora(inner.attn, "out_proj",
-                                      lora_cfg.rank, lora_cfg.alpha, lora_cfg.dropout)
-    if lora_cfg.target_ffn:
-        for block in base.h:
-            inner = block.inner if isinstance(block, _ProGenBlockWithCrossAttn) else block
-            for attr in ("fc_in", "fc_out"):
-                _replace_linear_with_lora(inner.mlp, attr,
-                                          lora_cfg.rank, lora_cfg.alpha, lora_cfg.dropout)
-
     return adapters
 
 
-def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+def _biogpt_inject(model, every: int, mem_dim: int,
                    cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
-    """Inject cross-attention adapters + LoRA into a BioGPT model in-place."""
+    """Inject cross-attention adapters into a BioGPT model in-place."""
     base = model.biogpt                                   # BioGptModel
     dec_hidden = model.config.hidden_size
     n_heads = model.config.num_attention_heads
@@ -452,39 +387,21 @@ def _biogpt_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
             continue
         ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
                                    score_space=cross_attn_mode)
-        wrapped = _BioGptBlockWithCrossAttn(block, ca)
-        base.layers[i] = wrapped
+        base.layers[i] = _BioGptBlockWithCrossAttn(block, ca)
         adapters.append(ca)
-
-    if lora_cfg.target_self_attn:
-        for block in base.layers:
-            inner = block.inner if isinstance(block, _BioGptBlockWithCrossAttn) else block
-            for attr in ("q_proj", "k_proj", "v_proj", "out_proj"):
-                _replace_linear_with_lora(inner.self_attn, attr,
-                                          lora_cfg.rank, lora_cfg.alpha, lora_cfg.dropout)
-    if lora_cfg.target_ffn:
-        for block in base.layers:
-            inner = block.inner if isinstance(block, _BioGptBlockWithCrossAttn) else block
-            _replace_linear_with_lora(inner, "fc1",
-                                      lora_cfg.rank, lora_cfg.alpha, lora_cfg.dropout)
-            _replace_linear_with_lora(inner, "fc2",
-                                      lora_cfg.rank, lora_cfg.alpha, lora_cfg.dropout)
-
     return adapters
 
 
 # ---------------------------------------------------------------------------
-# Jamba (Dayhoff) / Mixtral (ProtGPT3) injection — via forward hooks
+# Mixtral (ProtGPT3) injection — via forward hooks
 # ---------------------------------------------------------------------------
 def _make_cross_attn_hook(adapter: CrossAttentionAdapter):
     """Forward hook that applies the cross-attention residual to a layer output.
 
-    These decoders are hooked *in place* rather than wrapped in a new module.
-    For Jamba that is mandatory: JambaModel picks the per-layer attention mask
-    with `isinstance(layer, JambaMambaDecoderLayer)`, so wrapping a mamba layer
-    would route the wrong mask to it. A forward hook leaves the layer's class
-    intact. Modern decoder layers return a bare hidden-state tensor; older ones
-    return a tuple.
+    The layer is hooked *in place* rather than wrapped in a new module, which
+    keeps the adapter inside the layer `__call__` — that is what makes it
+    recompute correctly under gradient checkpointing. Modern decoder layers
+    return a bare hidden-state tensor; older ones return a tuple.
     """
     def hook(module, inputs, output):
         if isinstance(output, tuple):
@@ -493,95 +410,13 @@ def _make_cross_attn_hook(adapter: CrossAttentionAdapter):
     return hook
 
 
-def _load_protein_tokenizer(path: str):
-    """Load Dayhoff's tokenizer, working around transformers-5.
-
-    The repo ships a custom slow char tokenizer (`ProteinTokenizer`, written for
-    transformers 4.42). transformers 5's `AutoTokenizer` routes it through the
-    fast backend and fails to instantiate, but the class itself works when
-    constructed directly. Try Auto first (so a future model with a normal
-    tokenizer still works), then fall back to importing the repo's
-    `tokenizers.py` (same trust model as trust_remote_code).
-    """
-    from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-    except Exception:
-        import importlib.util
-        import os
-        tok_file = os.path.join(path, "tokenizers.py")
-        if not os.path.exists(tok_file):
-            raise
-        spec = importlib.util.spec_from_file_location("_dayhoff_tokenizer", tok_file)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.ProteinTokenizer()
-
-
-def _jamba_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
-                  cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
-    """Inject cross-attention adapters (via hooks) + LoRA into a Jamba model.
-
-    Cross-attention is added after every Nth decoder layer (mamba or attention
-    alike — the adapter only needs the [B, T, hidden] output). LoRA targets the
-    attention layers' self-attn projections and the dense MLP layers; the MoE
-    blocks' fused expert Parameters (not nn.Linear) and the SSM mixers are left
-    frozen.
-    """
-    base = model.model                                   # JambaModel
-    dec_hidden = model.config.hidden_size
-    n_heads = model.config.num_attention_heads
-
-    adapters: List[CrossAttentionAdapter] = []
-    for i, layer in enumerate(base.layers):
-        if i % every != 0:
-            continue
-        ca = CrossAttentionAdapter(dec_hidden, mem_dim, n_heads, dropout=0.0,
-                                   score_space=cross_attn_mode)
-        layer.register_forward_hook(_make_cross_attn_hook(ca))
-        adapters.append(ca)
-    # Register the adapters on the model so their params are tracked by the
-    # optimizer / state_dict / .to(device). The hooks above hold the same module
-    # objects, so set_cross_memory() reaches them.
-    model.cross_attn_adapters = nn.ModuleList(adapters)
-
-    if lora_cfg.target_self_attn:
-        for layer in base.layers:
-            attn = getattr(layer, "self_attn", None)     # attention layers only
-            if attn is not None:
-                for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                    _replace_linear_with_lora(attn, attr, lora_cfg.rank,
-                                              lora_cfg.alpha, lora_cfg.dropout)
-    if lora_cfg.target_ffn:
-        for layer in base.layers:
-            ff = getattr(layer, "feed_forward", None)
-            # Dense MLP layers (gate/up/down Linear) are LoRA-able; MoE blocks
-            # use fused expert Parameter tensors and are left frozen.
-            if ff is not None and hasattr(ff, "gate_proj"):
-                for attr in ("gate_proj", "up_proj", "down_proj"):
-                    _replace_linear_with_lora(ff, attr, lora_cfg.rank,
-                                              lora_cfg.alpha, lora_cfg.dropout)
-
-    return adapters
-
-
-# ---------------------------------------------------------------------------
-# Mixtral (ProtGPT3) injection — via forward hooks
-# ---------------------------------------------------------------------------
-def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
+def _mixtral_inject(model, every: int, mem_dim: int,
                     cross_attn_mode: str = "head") -> List[CrossAttentionAdapter]:
-    """Inject cross-attention adapters (via hooks) + LoRA into a Mixtral model.
+    """Inject cross-attention adapters (via hooks) into a Mixtral model.
 
-    ProtGPT3 is a Mixtral-architecture sparse MoE. Its decoder layers return a
-    bare hidden-state tensor, so the same forward-hook injection as Jamba works;
-    hooks also keep the adapters inside the layer `__call__`, which is what makes
-    them recompute correctly under gradient checkpointing.
-
-    LoRA targets the self-attention projections only. The MoE feed-forward stores
-    its experts as fused Parameter tensors (`experts.gate_up_proj` [E, 2*d_ff, d],
-    `experts.down_proj` [E, d, d_ff]) rather than nn.Linear, so there is nothing
-    for `_replace_linear_with_lora` to wrap; those stay frozen, as do the router
-    weights (perturbing routing on a frozen backbone destabilizes the prior).
+    ProtGPT3 is a Mixtral-architecture sparse MoE whose decoder layers return a
+    bare hidden-state tensor. The router weights and the fused MoE expert
+    Parameters stay frozen.
     """
     base = model.model                                   # MixtralModel
     dec_hidden = model.config.hidden_size
@@ -599,13 +434,6 @@ def _mixtral_inject(model, every: int, mem_dim: int, lora_cfg: LoRACfg,
     # see the adapter params. The hooks hold the same module objects, so
     # set_cross_memory() reaches them.
     model.cross_attn_adapters = nn.ModuleList(adapters)
-
-    if lora_cfg.target_self_attn:
-        for layer in base.layers:
-            for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                _replace_linear_with_lora(layer.self_attn, attr, lora_cfg.rank,
-                                          lora_cfg.alpha, lora_cfg.dropout)
-
     return adapters
 
 
@@ -682,17 +510,16 @@ def load_decoder_with_cross_attn(
     path: str,
     cross_attn_every: int,
     mem_dim: int,
-    lora_cfg: LoRACfg,
     device: torch.device,
     cross_attn_mode: str = "head",
 ) -> Tuple[nn.Module, object, List[CrossAttentionAdapter]]:
-    """Load the appropriate decoder, freeze it, inject adapters + LoRA.
+    """Load the appropriate decoder, freeze it, inject cross-attention adapters.
 
     Dispatch is by architecture (read from the checkpoint's config) first, then
     by `direction`. This lets a direction be re-pointed at a different model
-    (e.g. text2protein: ProGen2 -> Dayhoff/Jamba -> ProtGPT3/Mixtral) without
-    code changes. `cross_attn_mode` ("head" | "aligned") selects the adapter
-    scoring space (see CrossAttentionAdapter); "aligned" requires aligned memory.
+    (e.g. text2protein: ProGen2 -> ProtGPT3/Mixtral) without code changes.
+    `cross_attn_mode` ("head" | "aligned") selects the adapter scoring space (see
+    CrossAttentionAdapter); "aligned" requires aligned memory.
     """
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -707,21 +534,7 @@ def load_decoder_with_cross_attn(
             path, output_router_logits=False, dtype=torch.bfloat16)
         tokenizer = AutoTokenizer.from_pretrained(path)
         _freeze(model)
-        adapters = _mixtral_inject(model, cross_attn_every, mem_dim, lora_cfg,
-                                   cross_attn_mode)
-    elif model_type == "jamba":
-        # Dayhoff-3b: native Jamba (hybrid Mamba/attention MoE), no remote
-        # modeling code. Force the pure-PyTorch SSM path — the fused
-        # mamba-ssm/causal-conv1d CUDA kernels aren't available on Mac/XPU — and
-        # drop router-logits output (we compute CE from logits and never use the
-        # MoE load-balancing aux loss).
-        model = AutoModelForCausalLM.from_pretrained(
-            path, use_mamba_kernels=False, output_router_logits=False,
-            dtype=torch.bfloat16)
-        tokenizer = _load_protein_tokenizer(path)
-        _freeze(model)
-        adapters = _jamba_inject(model, cross_attn_every, mem_dim, lora_cfg,
-                                 cross_attn_mode)
+        adapters = _mixtral_inject(model, cross_attn_every, mem_dim, cross_attn_mode)
     elif direction == "text2protein":
         # ProGen2 — custom code via auto_map
         model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)
@@ -749,14 +562,12 @@ def load_decoder_with_cross_attn(
                 torch.tensor(head_dim, dtype=torch.float32)
             ).to(torch.get_default_dtype())
         _freeze(model)
-        adapters = _progen_inject(model, cross_attn_every, mem_dim, lora_cfg,
-                                  cross_attn_mode)
+        adapters = _progen_inject(model, cross_attn_every, mem_dim, cross_attn_mode)
     elif direction == "protein2text":
         model = AutoModelForCausalLM.from_pretrained(path)
         tokenizer = AutoTokenizer.from_pretrained(path)
         _freeze(model)
-        adapters = _biogpt_inject(model, cross_attn_every, mem_dim, lora_cfg,
-                                  cross_attn_mode)
+        adapters = _biogpt_inject(model, cross_attn_every, mem_dim, cross_attn_mode)
     else:
         raise ValueError(f"Unknown direction: {direction}")
 
@@ -786,7 +597,7 @@ def set_retain_attn(adapters: List[CrossAttentionAdapter], on: bool) -> int:
     """Make aligned-mode adapters keep `last_attn` attached to the autograd graph.
 
     Required before `coverage_penalty` can produce gradients. Returns the number
-    of adapters switched (aligned-mode only; `_forward_standard` never populates
+    of adapters switched (aligned-mode only; the "head" forward never populates
     `last_attn`).
     """
     n = 0
@@ -829,10 +640,6 @@ def coverage_penalty(
     path, whose forward is 2B rows with the wrong (rolled) memory in the back half.
 
     Returns (penalty, mean_coverage). mean_coverage is detached, for logging.
-
-    Note: with `--use-cvae` the injected latent memory tokens carry an all-True
-    mask, so they count as positions requiring coverage. That is intentional (an
-    ignored latent is a collapsed latent) but it does mean tau applies to them too.
     """
     pens, covs = [], []
     for cov, mem_mask in _coverage_maps(adapters, decoder_valid, rows):

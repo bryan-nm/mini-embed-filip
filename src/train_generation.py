@@ -2,12 +2,12 @@
 
 Reads a trained retrieval checkpoint (projection + expansion heads), runs the
 appropriate encoder→project→expand front-end to produce per-token cross-
-attention memory, then trains the decoder's cross-attention adapters + LoRA
-on cross-entropy of the target sequence.
+attention memory, then trains the decoder's cross-attention adapters on
+cross-entropy of the target sequence.
 
 What's frozen vs trainable:
   frozen:   encoder, projection head, expansion head, decoder backbone
-  trains:   cross-attention adapter layers + LoRA on decoder self-attn / FFN
+  trains:   cross-attention adapter layers (+ any explicitly unfrozen blocks)
 
 Directions:
   text2protein:  text -> BioLinkBERT -> proj -> expand -> ProtGPT3-112M -> protein
@@ -37,10 +37,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import default_cfg, Cfg, TEXT_DECODER_PATH
+from config import default_cfg, TEXT_DECODER_PATH
 from src.data import (
     PackedPerTokenCache,
-    Pair,
     build_or_load_splits,
     group_ids_from_accessions,
     group_ids_from_texts,
@@ -49,16 +48,12 @@ from src.data import (
     load_row_protein_idx,
     load_splits,
 )
-from src.dist import (
-    init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
-)
+from src.dist import init_distributed, barrier, cleanup
 from src.decoder_adapters import (
-    LoRACfg,
     clear_cross_memory,
     count_trainable,
     coverage_penalty,
     coverage_profile,
-    decode_target,
     load_decoder_with_cross_attn,
     reverse_prefix_ids,
     set_cross_memory,
@@ -67,13 +62,15 @@ from src.decoder_adapters import (
     unfreeze_decoder_blocks,
     warm_start_q_align,
 )
-from src.cvae import build_cvae, beta_at
 from src.encoders import (
     encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
 )
-from src.losses import masked_mean
-from src.model import MiniEmbedFilip
-from src.roundtrip_eval import rng_restore, rng_snapshot, score_roundtrip_records
+from src.gen_ckpt import GenMeta
+from src.model import load_retrieval
+from src.roundtrip_eval import (
+    gather_roundtrip_payloads, generate_roundtrip_records, rng_restore, rng_snapshot,
+    score_roundtrip_records,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +99,9 @@ class GenerationDataset(Dataset):
        inputs from protein cache, targets are raw text annotations.
 
     Protein-side access always goes through `row_protein_idx` (CSV row -> unique
-    protein row), because the protein cache is deduplicated. When `need_target` is
-    set (CVAE training), the opposite modality's per-token hidden states are also
-    returned so the posterior q(w|source,target) can pool the target embedding.
+    protein row), because the protein cache is deduplicated. `need_target` also
+    returns the opposite modality's per-token hidden states — the round-trip eval
+    uses them for its ceiling row.
     """
 
     def __init__(self, direction: str, cache_dir: str, pairs, indices,
@@ -141,7 +138,7 @@ class GenerationDataset(Dataset):
             target = self.pairs[idx].text
         item = {"h": h, "m": m, "target": target, "idx": idx}
         if self.need_target:
-            # Opposite modality (the generated side) for the CVAE posterior.
+            # Opposite modality (the generated side).
             h_t, m_t = (self._protein(idx) if self.direction == "text2protein"
                         else self._text(idx))
             item["h_tgt"] = h_t
@@ -239,8 +236,8 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
 
     # We add BOS/EOS explicitly rather than relying on the tokenizer's
     # `add_special_tokens`: the protein decoders' char tokenizers never add them
-    # (Dayhoff's build_inputs_with_special_tokens is a no-op; ProtGPT3 ships with
-    # add_bos_token=False), which would leave the model with no EOS to learn
+    # (ProtGPT3 ships with add_bos_token=False), which would leave the model with
+    # no EOS to learn
     # termination and a BOS-mismatch vs inference (which seeds generation with
     # BOS). Doing it here is uniform across decoders. `prefix_ids` carries any
     # decoder control tokens that sit between BOS and the body — for ProtGPT3,
@@ -326,8 +323,7 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
             "n_truncated": torch.tensor(n_trunc, dtype=torch.long),
         }
 
-        # Optional target-side per-token hidden states (CVAE posterior). Padded
-        # to the batch max; pooled through the frozen target projection later.
+        # Optional target-side per-token hidden states, padded to the batch max.
         if "h_tgt" in batch[0]:
             L_t = max(b["h_tgt"].size(0) for b in batch)
             d_t = batch[0]["h_tgt"].size(-1)
@@ -343,49 +339,6 @@ def make_collate(target_tokenizer, max_target_tokens: int, prefix_ids=(),
         return out
 
     return collate
-
-
-# ---------------------------------------------------------------------------
-def load_retrieval_model(ckpt_path: str, device: torch.device,
-                         with_maps: bool = False) -> MiniEmbedFilip:
-    """Load a frozen retrieval model. With `with_maps`, also build the memory maps
-    and require the checkpoint to carry trained map weights (from train_memory_map).
-
-    The load is strict=False so a map-augmented checkpoint can be read by a
-    map-less run (extra map keys ignored) and vice versa; only NON-map missing /
-    unexpected keys are a real mismatch. When `with_maps` is set, all-map-keys-
-    missing means the checkpoint predates the map phase — fail loudly.
-    """
-    cfg = default_cfg()
-    m = MiniEmbedFilip(
-        text_hidden=cfg.model.text_hidden,
-        protein_hidden=cfg.model.protein_hidden,
-        proj_d_hidden=cfg.model.proj_d_hidden,
-        proj_d_mid=cfg.model.proj_d_mid,
-        embed_dim=cfg.model.embed_dim,
-        proj_dropout=cfg.model.proj_dropout,
-        expand_d_mid=cfg.model.expand_d_mid,
-        expand_d_hidden=cfg.model.expand_d_hidden,
-        expand_dropout=cfg.model.expand_dropout,
-        init_temperature=cfg.retrieval.init_temperature,
-        max_temperature=cfg.retrieval.max_temperature,
-        with_maps=with_maps,
-        map_hidden=cfg.model.map_hidden,
-    )
-    state = torch.load(ckpt_path, map_location="cpu")
-    missing, unexpected = m.load_state_dict(state["model_state"], strict=False)
-    is_map = lambda k: k.startswith("text_map.") or k.startswith("protein_map.")
-    bad = [k for k in missing if not is_map(k)] + [k for k in unexpected if not is_map(k)]
-    if bad:
-        raise RuntimeError(f"retrieval load mismatch (non-map keys): {bad}")
-    if with_maps and any(is_map(k) for k in missing):
-        raise RuntimeError(
-            f"--memory-map set but retrieval checkpoint {ckpt_path} has no trained "
-            f"memory map (run train_memory_map first)")
-    m.eval().to(device)
-    for p in m.parameters():
-        p.requires_grad_(False)
-    return m
 
 
 def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
@@ -436,7 +389,7 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=cfg.generation.lr)
     ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every)
     ap.add_argument("--unfreeze-top", type=int, default=0,
-                    help="fully fine-tune N decoder blocks (0 = adapters/LoRA only); "
+                    help="fully fine-tune N decoder blocks (0 = cross-attn adapters only); "
                          "which N blocks is set by --unfreeze-where")
     ap.add_argument("--unfreeze-where", choices=["top", "bottom"], default="top",
                     help="which end of the decoder stack --unfreeze-top selects: 'top' = the "
@@ -444,7 +397,7 @@ def main() -> None:
                          "(nearest embeddings, lets conditioning become receptive early)")
     ap.add_argument("--unfreeze-lr", type=float, default=None,
                     help="separate (typically lower) LR for the unfrozen decoder blocks; "
-                         "defaults to --lr. The adapters/LoRA/CVAE heads always use --lr. "
+                         "defaults to --lr. The cross-attn adapters always use --lr. "
                          "Keep this well below --lr to avoid wrecking the pretrained prior")
     ap.add_argument("--warm-start-qalign", action="store_true",
                     help="initialize the aligned-mode cross-attn query MLP (q_align) from the "
@@ -452,10 +405,8 @@ def main() -> None:
                          "side query lands in the shared space from step 0 instead of cold-"
                          "starting a random map. Requires --cross-attn-mode aligned")
     ap.add_argument("--grad-checkpointing", action="store_true",
-                    help="recompute layer activations in backward to fit large decoders "
-                         "(e.g. the 3B Dayhoff/Jamba); ~30%% slower, much less memory. "
-                         "NOTE: incompatible with the Jamba MoE on XPU — routing isn't "
-                         "bit-reproducible on recompute, so non-reentrant checkpoint aborts")
+                    help="recompute layer activations in backward to fit a large decoder; "
+                         "~30%% slower, much less memory")
     ap.add_argument("--max-target-tokens", type=int, default=cfg.generation.max_target_tokens,
                     help="cap on the generated/teacher-forced target length; lower it to "
                          "cut decoder activation memory (truncates long targets)")
@@ -463,16 +414,12 @@ def main() -> None:
                     default=cfg.generation.memory_space,
                     help="conditioning memory: 'expanded' cross-attends over "
                          "expand(project(h)) in encoder-hidden space (768/960-d, original); "
-                         "'aligned' cross-attends over project(h) directly (64-d shared "
-                         "retrieval space, no expansion head)")
-    ap.add_argument("--memory-map", action="store_true", default=cfg.generation.memory_map,
-                    help="apply the retrieval memory map g to the aligned source projection "
-                         "before it becomes cross-attn memory (Medium). Requires "
-                         "--memory-space aligned and a map-augmented retrieval ckpt")
+                         "'aligned' cross-attends over project(h) directly (the shared "
+                         "retrieval space, embed_dim wide, no expansion head)")
     ap.add_argument("--cross-attn-mode", choices=["head", "aligned"],
                     default=cfg.generation.cross_attn_mode,
                     help="cross-attn scoring space (Strong): 'head' learned multi-head "
-                         "(original); 'aligned' single-head cosine max-sim in the 64-d shared "
+                         "(original); 'aligned' single-head cosine max-sim in the shared "
                          "space (attention weights = FILIP array). Requires --memory-space aligned")
     ap.add_argument("--direction-augment", action="store_true",
                     default=cfg.generation.direction_augment,
@@ -480,11 +427,6 @@ def main() -> None:
                          "('2', residues reversed) per example (ProtGPT3 only). Free augmentation "
                          "+ regularizes conditioning toward direction-invariant signal. Val stays "
                          "forward-only")
-    ap.add_argument("--no-lora", action="store_true",
-                    help="disable LoRA on the frozen decoder self-attn/FFN — train ONLY the "
-                         "cross-attention adapters. LoRA is caption-blind (unconditional domain "
-                         "adaptation); dropping it removes that shortcut so gains must come from "
-                         "conditioning. Use to A/B whether LoRA helps or suppresses conditioning")
     ap.add_argument("--target-input-dropout", type=float, default=0.0,
                     help="text2protein: corrupt this fraction of the target protein's INPUT "
                          "residues (the teacher-forcing context) with random amino acids, in "
@@ -574,51 +516,32 @@ def main() -> None:
                          "in the first minute instead of at the end of epoch 0")
     ap.add_argument("--no-rt-at-start", dest="rt_at_start", action="store_false")
     ap.set_defaults(rt_at_start=True)
-    # Generation-side CVAE (Feature 1).
-    ap.add_argument("--use-cvae", action="store_true", default=cfg.generation.use_cvae,
-                    help="train a conditional VAE latent injected as extra cross-attn memory tokens")
-    ap.add_argument("--cvae-d-w", type=int, default=cfg.generation.cvae_d_w)
-    ap.add_argument("--cvae-n-latent-tokens", type=int,
-                    default=cfg.generation.cvae_n_latent_tokens)
-    ap.add_argument("--cvae-beta-max", type=float, default=cfg.generation.cvae_beta_max)
     args = ap.parse_args()
 
-    # Fold CVAE CLI overrides back into the config block build_cvae reads.
-    cfg.generation.use_cvae = args.use_cvae
-    cfg.generation.cvae_d_w = args.cvae_d_w
-    cfg.generation.cvae_n_latent_tokens = args.cvae_n_latent_tokens
-    cfg.generation.cvae_beta_max = args.cvae_beta_max
     cfg.generation.max_target_tokens = args.max_target_tokens
     cfg.generation.memory_space = args.memory_space
-    cfg.generation.memory_map = args.memory_map
     cfg.generation.cross_attn_mode = args.cross_attn_mode
     cfg.generation.direction_augment = args.direction_augment
-    # --no-lora zeroes both LoRA targets; the LoRACfg below reads these, so the
-    # injectors then skip LoRA entirely (adapters-only training).
-    if args.no_lora:
-        cfg.generation.lora_targets_self_attn = False
-        cfg.generation.lora_targets_ffn = False
 
-    # "aligned" cross-attn and the memory map both live in the 64-d shared space,
-    # so they require aligned memory (the map is a 64->64 residual; aligned scoring
-    # keys ARE the aligned vectors). Fail loudly rather than silently mis-condition.
-    if args.memory_space != "aligned" and (args.memory_map or args.cross_attn_mode == "aligned"):
-        raise SystemExit(
-            "--memory-map / --cross-attn-mode aligned require --memory-space aligned")
+    # The architecture header this run trains under. It is validated once here,
+    # compared against the checkpoint's on --resume, and written back into every
+    # saved checkpoint — so the flags a run used and the flags a consumer rebuilds
+    # from can never disagree.
+    meta = GenMeta.from_args(args)
+    try:
+        meta.validate()
+    except ValueError as e:
+        raise SystemExit(str(e))
     if args.target_input_dropout > 0.0 and args.direction != "text2protein":
         raise SystemExit(
             "--target-input-dropout is a text2protein feature (it corrupts protein-residue "
             "targets with random amino acids); leave it 0 for protein2text")
     if not (0.0 <= args.target_input_dropout <= 1.0):
         raise SystemExit("--target-input-dropout must be in [0, 1] (1.0 = full no-prefix)")
-    if args.warm_start_qalign and args.cross_attn_mode != "aligned":
-        raise SystemExit(
-            "--warm-start-qalign requires --cross-attn-mode aligned (q_align exists only "
-            "in aligned mode)")
     if args.coverage_lambda > 0.0:
-        if args.cross_attn_mode != "aligned":
+        if meta.cross_attn_mode != "aligned":
             raise SystemExit(
-                "--coverage-lambda requires --cross-attn-mode aligned: only _forward_aligned "
+                "--coverage-lambda requires --cross-attn-mode aligned: only the aligned forward "
                 "populates last_attn, which the coverage aux reads")
         if args.grad_checkpointing:
             # Under checkpointing the first forward runs in no_grad and the recompute
@@ -640,10 +563,10 @@ def main() -> None:
         print(f"[gen] direction={args.direction} world_size={env.world_size} device={device}")
 
     # 1) Retrieval model (frozen) — provides projection + expansion (+ maps).
-    retrieval = load_retrieval_model(args.retrieval_ckpt, device, with_maps=args.memory_map)
+    retrieval = load_retrieval(args.retrieval_ckpt, device, cfg)
     if env.is_main:
         print(f"[gen] loaded retrieval model from {args.retrieval_ckpt} "
-              f"(memory_map={args.memory_map}, cross_attn_mode={args.cross_attn_mode})")
+              f"(cross_attn_mode={meta.cross_attn_mode})")
 
     # 2) Decoder + adapters
     decoder_path = (
@@ -653,35 +576,14 @@ def main() -> None:
     )
     # Memory dim depends on the conditioning space. "expanded": the encoder hidden
     # dim of the INPUT modality (what the expansion head outputs) — text2protein is
-    # text -> text_expand -> 768-d. "aligned": the 64-d shared projection space
-    # (project(h)), so the adapter k/v are 64->512 and no expansion head is used.
-    aligned_mem = args.memory_space == "aligned"
-    if aligned_mem:
-        mem_dim = cfg.model.embed_dim
-    else:
-        mem_dim = cfg.model.text_hidden if args.direction == "text2protein" else cfg.model.protein_hidden
+    # text -> text_expand -> 768-d. "aligned": the shared projection space
+    # (project(h)), so the adapter k/v are embed_dim->dec_hidden and no expansion
+    # head is used.
+    aligned_mem = meta.aligned_memory
+    mem_dim = meta.mem_dim(cfg, args.direction)
     if env.is_main:
-        print(f"[gen] memory_space={args.memory_space} mem_dim={mem_dim}")
+        print(f"[gen] architecture: {meta.describe()} mem_dim={mem_dim}")
 
-    # Gradient checkpointing recomputes the forward during backward, but dropout
-    # RNG is not reliably preserved across recomputation on XPU. A non-zero LoRA
-    # dropout then makes the recomputed hidden states differ from the original,
-    # which — through Jamba's MoE router — changes per-expert token counts and
-    # trips the non-reentrant checkpoint metadata check. Zero it for checkpointed
-    # runs (negligible regularization on a frozen-backbone finetune); the
-    # cross-attn adapter dropout is already 0.
-    if args.grad_checkpointing and cfg.generation.lora_dropout > 0:
-        if env.is_main:
-            print(f"[gen] grad-checkpointing: forcing LoRA dropout "
-                  f"{cfg.generation.lora_dropout} -> 0 (dropout RNG not preserved on recompute)")
-        cfg.generation.lora_dropout = 0.0
-
-    lora_cfg = LoRACfg(
-        rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
-        dropout=cfg.generation.lora_dropout,
-        target_self_attn=cfg.generation.lora_targets_self_attn,
-        target_ffn=cfg.generation.lora_targets_ffn,
-    )
     # trust_remote_code (ProGen2) compiles the custom modeling file into a
     # *shared* transformers_modules cache. If all ranks do this at once they
     # race on the write and some import a half-defined module ("has no attribute
@@ -689,8 +591,8 @@ def main() -> None:
     # releases the others to import it read-only (concurrent reads are safe).
     def _load_decoder():
         return load_decoder_with_cross_attn(
-            args.direction, decoder_path, args.cross_attn_every, mem_dim, lora_cfg, device,
-            cross_attn_mode=args.cross_attn_mode,
+            args.direction, decoder_path, meta.cross_attn_every, mem_dim, device,
+            cross_attn_mode=meta.cross_attn_mode,
         )
 
     decoder = target_tok = adapters = None
@@ -703,9 +605,9 @@ def main() -> None:
 
     # Optional partial unfreeze of the top decoder blocks (all ranks, identically,
     # before DDP captures requires_grad state).
-    n_unfrozen = unfreeze_decoder_blocks(decoder, args.unfreeze_top, where=args.unfreeze_where)
-    if env.is_main and args.unfreeze_top > 0:
-        print(f"[gen] unfroze {args.unfreeze_where} {args.unfreeze_top} decoder blocks "
+    n_unfrozen = unfreeze_decoder_blocks(decoder, meta.unfreeze_top, where=meta.unfreeze_where)
+    if env.is_main and meta.unfreeze_top > 0:
+        print(f"[gen] unfroze {meta.unfreeze_where} {meta.unfreeze_top} decoder blocks "
               f"({n_unfrozen:,} params now trainable)")
     # The decoder is loaded in bf16 for frozen-backbone inference (fine when only
     # the fp32 adapters train). Training bf16 *master* weights is broken: an AdamW
@@ -720,13 +622,10 @@ def main() -> None:
     if n_unfrozen > 0:
         decoder.float()
         if env.is_main:
-            print(f"[gen] upcast decoder to fp32 for stable fine-tuning of the "
-                  f"unfrozen blocks (bf16 master weights don't train)")
+            print("[gen] upcast decoder to fp32 for stable fine-tuning of the "
+                  "unfrozen blocks (bf16 master weights don't train)")
     if env.is_main:
-        n_train = count_trainable(decoder)
-        lora_on = cfg.generation.lora_targets_self_attn or cfg.generation.lora_targets_ffn
-        print(f"[gen] decoder trainable params (cross-attn"
-              f"{' + LoRA' if lora_on else ', LoRA OFF'}): {n_train:,}")
+        print(f"[gen] decoder trainable params: {count_trainable(decoder):,}")
         print(f"[gen] num cross-attention adapters: {len(adapters)}")
 
     # Coverage aux: keep the attention weights attached to the graph so the
@@ -742,15 +641,13 @@ def main() -> None:
                   f"tau={args.coverage_tau} over {n_retained} adapters")
 
     # Gradient checkpointing: recompute layer activations in backward instead of
-    # storing them across the deep stack. Essential for the 3B Jamba decoder,
-    # whose pure-PyTorch Mamba scan materializes large fp32 [B, d_inner, L,
-    # d_state] tensors per layer that otherwise OOM the tile.
-    #   - use_reentrant=False is REQUIRED: the backbone is frozen (only adapters/
-    #     LoRA train), and reentrant checkpointing demands an input that requires
-    #     grad, which a frozen layer input doesn't have.
-    #   - Incompatible with the KV/SSM cache, so disable use_cache for training.
-    # Applied before the DDP wrap so `decoder` is still the raw model. For the
-    # Jamba path the cross-attn adapters are forward hooks inside the layer
+    # storing them across the deep stack.
+    #   - use_reentrant=False is REQUIRED: the backbone is frozen (only the
+    #     adapters train), and reentrant checkpointing demands an input that
+    #     requires grad, which a frozen layer input doesn't have.
+    #   - Incompatible with the KV cache, so disable use_cache for training.
+    # Applied before the DDP wrap so `decoder` is still the raw model. On the
+    # Mixtral path the cross-attn adapters are forward hooks inside the layer
     # __call__, so they fall inside the checkpointed region and recompute
     # correctly; the ProGen2/BioGPT paths replace the block module (those decoders
     # are small and don't need this).
@@ -767,7 +664,8 @@ def main() -> None:
                   "skipping (--grad-checkpointing had no effect)")
 
     # Direction-specific frozen retrieval handles: source side (project+expand for
-    # the cross-attn memory) and target projection (for the CVAE posterior).
+    # the cross-attn memory) and the target-modality projection (used by the
+    # aligned warm-start and the round-trip eval).
     if args.direction == "text2protein":
         src_proj, src_expand, tgt_proj = (
             retrieval.text_proj, retrieval.text_expand, retrieval.protein_proj)
@@ -780,7 +678,7 @@ def main() -> None:
     # the DDP wrap so DDP's init-time broadcast syncs the copied weights across
     # ranks, and before the optimizer/resume so param shapes are final. The copy is
     # deterministic from the (identical, frozen) retrieval head on every rank.
-    if args.warm_start_qalign:
+    if meta.warm_start_qalign:
         n_ws = warm_start_q_align(adapters, tgt_proj)
         if env.is_main:
             head = "protein_proj" if args.direction == "text2protein" else "text_proj"
@@ -789,28 +687,11 @@ def main() -> None:
 
     def build_memory(z):
         """Aligned projection -> cross-attn memory. "expanded" lifts z back to
-        encoder-hidden space; "aligned" uses z directly, optionally passed through
-        the frozen cross-modal map (--memory-map). All frozen; call under no_grad."""
-        if not aligned_mem:
-            return src_expand(z)
-        return retrieval.map_source(z, args.direction) if args.memory_map else z
+        encoder-hidden space; "aligned" uses z directly. Frozen; call under
+        no_grad."""
+        return z if aligned_mem else src_expand(z)
 
-    # 2b) Generation-side CVAE heads (Feature 1). Trained alongside the adapters;
-    # injected as extra cross-attention memory tokens.
-    cvae = None
-    n_latent = 0
-    if args.use_cvae:
-        cvae = build_cvae(cfg.generation, mem_dim, cfg.model.embed_dim).to(device)
-        n_latent = cvae.cfg.n_latent_tokens
-        if env.distributed:
-            broadcast_parameters(cvae)            # all ranks start from rank-0 weights
-        if env.is_main:
-            n_cvae = sum(p.numel() for p in cvae.parameters())
-            print(f"[gen] CVAE enabled: d_w={cvae.cfg.d_w} "
-                  f"latent_tokens={n_latent} beta_max={cvae.cfg.beta_max} "
-                  f"({n_cvae:,} params)")
-
-    # 2c) Target-modality encoder — ONLY for the per-epoch round-trip eval, which
+    # 2b) Target-modality encoder — ONLY for the per-epoch round-trip eval, which
     # has to re-encode text the model just generated (nothing in the cache covers a
     # sequence that didn't exist yet). This is the one genuinely new resident cost of
     # the eval: AMPLIFY-350M (~1.4 GB fp32) for text2protein, BioLinkBERT-base for
@@ -884,12 +765,10 @@ def main() -> None:
     if args.val_subset and args.val_subset > 0:
         val_indices = val_indices[:args.val_subset]
 
-    # Only train needs the target side (CVAE posterior); val conditions on the
-    # prior mean, so it never loads the target modality.
     train_ds = GenerationDataset(args.direction, args.cache_dir, pairs,
                                  splits["train"],
                                  cfg.model.protein_hidden, cfg.model.text_hidden,
-                                 need_target=args.use_cvae)
+                                 need_target=False)
     val_ds = GenerationDataset(args.direction, args.cache_dir, pairs,
                                val_indices,
                                cfg.model.protein_hidden, cfg.model.text_hidden,
@@ -901,7 +780,7 @@ def main() -> None:
     # the "2" (C-to-N) marker per training example; reverse_prefix_ids raises for a
     # decoder without a reverse marker, so a bad --direction-augment fails loudly.
     prefix_ids = target_prefix_ids(decoder, target_tok)
-    rev_prefix_ids = reverse_prefix_ids(decoder, target_tok) if args.direction_augment else None
+    rev_prefix_ids = reverse_prefix_ids(decoder, target_tok) if meta.direction_augment else None
     if env.is_main and prefix_ids:
         print(f"[gen] decoder target prefix ids: {prefix_ids}"
               + (f" | direction-augment reverse ids: {rev_prefix_ids}" if rev_prefix_ids else ""))
@@ -909,7 +788,7 @@ def main() -> None:
     # Train collate augments direction (if enabled); val stays forward-only so its
     # CE is comparable across runs and reflects the deployment (N-to-C) path.
     train_collate = make_collate(target_tok, cfg.generation.max_target_tokens, prefix_ids,
-                                 rev_prefix_ids, direction_augment=args.direction_augment,
+                                 rev_prefix_ids, direction_augment=meta.direction_augment,
                                  target_input_dropout=args.target_input_dropout,
                                  dropout_mean_span=args.dropout_mean_span)
     # Val is never corrupted, so its CE / the ablation stay comparable across runs.
@@ -978,9 +857,9 @@ def main() -> None:
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=True)
     core = decoder.module if env.distributed else decoder
 
-    # 4) Optim — two LR groups: the adapters/LoRA/CVAE "heads" at --lr, and any
-    # unfrozen decoder blocks at --unfreeze-lr (defaults to --lr). The frozen
-    # backbone contributes no params. Each group carries its own base_lr; the
+    # 4) Optim — two LR groups: the cross-attn adapters at --lr, and any unfrozen
+    # decoder blocks at --unfreeze-lr (defaults to --lr). The frozen backbone
+    # contributes no params. Each group carries its own base_lr; the
     # cosine schedule scales both by the same factor each step (see train loop).
     # With no unfreeze (or --unfreeze-lr unset) this reduces exactly to one LR.
     adapter_param_ids = {id(p) for a in adapters for p in a.parameters()}
@@ -988,12 +867,10 @@ def main() -> None:
     for name, p in core.named_parameters():
         if not p.requires_grad:
             continue
-        if id(p) in adapter_param_ids or "lora_" in name or "cross_attn" in name:
-            head_params.append(p)          # cross-attn adapters + LoRA
+        if id(p) in adapter_param_ids or "cross_attn" in name:
+            head_params.append(p)          # cross-attn adapters
         else:
             backbone_params.append(p)      # fully-unfrozen decoder blocks
-    if cvae is not None:
-        head_params += list(cvae.parameters())
 
     backbone_lr = args.unfreeze_lr if args.unfreeze_lr is not None else args.lr
     param_groups = [{"params": head_params, "base_lr": args.lr, "lr": args.lr}]
@@ -1029,8 +906,8 @@ def main() -> None:
     # in hand, so it can improve while free-running generation ignores the
     # conditioning entirely. This is the prefix-free counterpart — generate the pool
     # free-running, re-encode each output, and ask whether it retrieves its own source
-    # against the whole pool (accession-grouped, so a protein's sibling captions count
-    # as positives). Same generation path, same FILIP scorer and same
+    # against the whole pool (accession-grouped, so any other row of the same protein
+    # counts as a positive). Same generation path, same FILIP scorer and same
     # `score_roundtrip_records` as `python -m src.roundtrip_eval`, so the per-epoch
     # curve and the offline number agree on an identical pool.
     #
@@ -1075,8 +952,6 @@ def main() -> None:
         t_rt = time.time()
         was_training = decoder.training
         core.eval()
-        if cvae is not None:
-            cvae.eval()
         need_ceiling = not rt_state["done"]
         # Seed the eval's own stream so the sampling noise is the same every epoch
         # (the curve then moves because the model moved), and restore the training
@@ -1084,74 +959,43 @@ def main() -> None:
         rng = rng_snapshot(device)
         torch.manual_seed(args.rt_seed + env.rank)
         recs, gen_lens, true_lens, failed = [], [], [], ""
-        try:
+
+        def rt_batches():
+            """Cached source rows -> the batch dicts generate_roundtrip_records wants.
+
+            The ceiling row's z_true comes from the TRUE target's cached per-token
+            features (need_target=True on this dataset), through the same frozen
+            projection — no encoder pass, and exactly what retrieval itself scores
+            on these rows. `true_lens` is collected here because only this caller
+            has the collated teacher-forcing tensors to measure it from.
+            """
             cursor = 0
             for batch in rt_loader:
                 h = batch["h"].to(device).float()
                 mask = batch["m"].to(device)
                 B = h.size(0)
                 z = src_proj(h)                     # aligned source tokens (scored below)
-                mem = build_memory(z)               # cross-attn memory (expanded or aligned)
-                k_mask = mask
-                if cvae is not None:
-                    # Prior MEAN, matching the val-CE path: with one candidate per
-                    # source, sampling the latent would only add variance to the curve.
-                    pmu, _ = cvae.prior_params(masked_mean(z, mask))
-                    mem = torch.cat([mem, cvae.latent_tokens(pmu)], dim=1)
-                    k_mask = torch.cat(
-                        [mask, torch.ones(B, n_latent, dtype=torch.bool, device=device)],
-                        dim=1)
-
-                set_cross_memory(adapters, mem, k_mask)
-                input_ids = torch.tensor([rt_prompt] * B, device=device, dtype=torch.long)
-                # use_cache=True explicitly: --grad-checkpointing sets
-                # config.use_cache=False for training, and generating 1k tokens with
-                # no KV cache would cost more than the epoch it is measuring.
-                gen = core.generate(
-                    input_ids, max_new_tokens=args.rt_max_new_tokens,
-                    do_sample=args.rt_temperature > 0,
-                    temperature=max(args.rt_temperature, 1e-6),
-                    top_p=args.rt_top_p, pad_token_id=rt_pad_id, use_cache=True)
-                clear_cross_memory(adapters)
-
-                gen_strs = [decode_target(core, target_tok, row) for row in gen]
-                h_gen, m_gen = encode_generated(
-                    [g if g.strip() else rt_empty for g in gen_strs])
-                z_gen = tgt_proj(h_gen.float())
-                # Ceiling row: the TRUE target's per-token features straight from the
-                # cache (need_target=True), through the same frozen projection. No
-                # encoder pass, and exactly what retrieval itself scores on these rows.
+                out = {"z_src": z, "mem": build_memory(z), "mask_src": mask,
+                       "uids": rt_uids[cursor:cursor + B]}
                 if need_ceiling:
-                    z_true = tgt_proj(batch["h_tgt"].to(device).float())
-                    m_true = batch["m_tgt"].to(device)
-
-                # Length diagnostics, in decoder tokens, body only (no prompt, no EOS):
-                # a free-running length distribution that collapses onto the cap is
-                # invisible in CE but obvious here.
-                tail = gen[:, len(rt_prompt):]
-                is_eos = tail == rt_eos_id
-                hit = is_eos.any(dim=1)
-                first_eos = torch.where(
-                    hit, is_eos.float().argmax(dim=1).long(),
-                    torch.full((tail.size(0),), tail.size(1), device=tail.device,
-                               dtype=torch.long))
-                gen_lens.extend(first_eos.cpu().tolist())
+                    out["z_true"] = tgt_proj(batch["h_tgt"].to(device).float())
+                    out["mask_true"] = batch["m_tgt"].to(device)
                 am = batch["attn_mask"]
                 last = (am.sum(1) - 1).clamp(min=0)
                 last_tok = batch["input_ids"].gather(1, last[:, None]).squeeze(1)
                 true_lens.extend(
                     (am.sum(1) - len(rt_prompt) - (last_tok == rt_eos_id).long())
                     .clamp(min=0).tolist())
-
-                # fp16 on the wire: every rank receives the whole pool below.
-                for b in range(B):
-                    rec = {"uid": rt_uids[cursor + b],
-                           "z_gen": z_gen[b][m_gen[b]].half().cpu(),
-                           "z_src": z[b][mask[b]].half().cpu()}
-                    if need_ceiling:
-                        rec["z_true"] = z_true[b][m_true[b]].half().cpu()
-                    recs.append(rec)
                 cursor += B
+                yield out
+
+        try:
+            recs, gen_lens = generate_roundtrip_records(
+                core, target_tok, adapters, rt_batches(),
+                prompt=rt_prompt, pad_id=rt_pad_id, eos_id=rt_eos_id,
+                tgt_proj=tgt_proj, encode_generated=encode_generated,
+                empty_target=rt_empty, max_new_tokens=args.rt_max_new_tokens,
+                temperature=args.rt_temperature, top_p=args.rt_top_p)
         except Exception:
             # A metric must not take down a multi-hour training job — but it also
             # must not deadlock it. Bailing out here would leave the other ranks
@@ -1167,14 +1011,9 @@ def main() -> None:
             rng_restore(device, rng)
             if was_training:
                 decoder.train()
-                if cvae is not None:
-                    cvae.train()
 
-        payload = {"recs": recs, "gen": gen_lens, "true": true_lens, "failed": failed}
-        parts = [payload]
-        if env.distributed and torch.distributed.is_initialized():
-            parts = [None] * env.world_size
-            torch.distributed.all_gather_object(parts, payload)
+        parts = gather_roundtrip_payloads(
+            {"recs": recs, "gen": gen_lens, "true": true_lens, "failed": failed}, env)
         bad = [i for i, p in enumerate(parts) if p["failed"]]
         if bad:
             rt_state["disabled"] = True
@@ -1229,62 +1068,30 @@ def main() -> None:
     log = []
     start_epoch = 0
 
-    # Resume: restore the trainable adapter/LoRA weights (+ any unfrozen blocks),
-    # the CVAE heads, the optimizer, and the step counter, then continue after the
-    # saved epoch. Every rank loads the same file (shared FS) so states stay in
-    # sync. adapter_state is a partial state_dict (trainable tensors only), so it
-    # loads with strict=False against the full decoder.
+    # Resume: restore the trainable adapter weights (+ any unfrozen blocks), the
+    # optimizer, and the step counter, then continue after the saved epoch. Every
+    # rank loads the same file (shared FS) so states stay in sync. adapter_state is
+    # a partial state_dict (trainable tensors only), so it loads with strict=False
+    # against the full decoder.
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume, ckpt_dir)
         ckpt = torch.load(resume_path, map_location=device)
-        # memory_space/memory_map/cross_attn_mode/lora_targets_* default to the
-        # pre-flag values ("expanded"/False/"head"/True) for older checkpoints.
-        if ckpt.get("cross_attn_every") != args.cross_attn_every or \
-           ckpt.get("unfreeze_top") != args.unfreeze_top or \
-           ckpt.get("unfreeze_where", "top") != args.unfreeze_where or \
-           ckpt.get("warm_start_qalign", False) != args.warm_start_qalign or \
-           ckpt.get("memory_space", "expanded") != args.memory_space or \
-           ckpt.get("memory_map", False) != args.memory_map or \
-           ckpt.get("cross_attn_mode", "head") != args.cross_attn_mode or \
-           ckpt.get("lora_targets_self_attn", True) != cfg.generation.lora_targets_self_attn or \
-           ckpt.get("lora_targets_ffn", True) != cfg.generation.lora_targets_ffn:
-            raise RuntimeError(
-                f"--resume checkpoint architecture mismatch: "
-                f"cross_attn_every={ckpt.get('cross_attn_every')} unfreeze_top={ckpt.get('unfreeze_top')} "
-                f"unfreeze_where={ckpt.get('unfreeze_where', 'top')} "
-                f"warm_start_qalign={ckpt.get('warm_start_qalign', False)} "
-                f"memory_space={ckpt.get('memory_space', 'expanded')} "
-                f"memory_map={ckpt.get('memory_map', False)} "
-                f"cross_attn_mode={ckpt.get('cross_attn_mode', 'head')} "
-                f"lora_self_attn={ckpt.get('lora_targets_self_attn', True)} "
-                f"lora_ffn={ckpt.get('lora_targets_ffn', True)} "
-                f"vs args cross_attn_every={args.cross_attn_every} unfreeze_top={args.unfreeze_top} "
-                f"unfreeze_where={args.unfreeze_where} warm_start_qalign={args.warm_start_qalign} "
-                f"memory_space={args.memory_space} memory_map={args.memory_map} "
-                f"cross_attn_mode={args.cross_attn_mode} "
-                f"lora_self_attn={cfg.generation.lora_targets_self_attn} "
-                f"lora_ffn={cfg.generation.lora_targets_ffn}")
+        # Pre-flag checkpoints read back as the behaviour they actually had
+        # (GenMeta's defaults), so an old checkpoint resumes rather than tripping
+        # a spurious mismatch.
+        GenMeta.from_ckpt(ckpt).assert_matches(meta, f"--resume {resume_path}")
         # `missing` keys are expected (the frozen backbone isn't in adapter_state);
         # only unexpected keys signal a real mismatch.
         _, unexpected = core.load_state_dict(ckpt["adapter_state"], strict=False)
         if unexpected:
             raise RuntimeError(f"--resume unexpected keys in adapter_state: {unexpected}")
-        if cvae is not None:
-            if "cvae_state" not in ckpt:
-                raise RuntimeError(
-                    "--resume: --use-cvae set but checkpoint has no cvae_state")
-            cvae.load_state_dict(ckpt["cvae_state"])
-        elif "cvae_state" in ckpt and env.is_main:
-            print("[resume] checkpoint has cvae_state but --use-cvae not set; ignoring it")
         if "optimizer_state" in ckpt:
             optim.load_state_dict(ckpt["optimizer_state"])
-            # Restore base_lr, which load_state_dict just dropped for any
-            # checkpoint written before that key existed (KeyError 'base_lr' at
-            # the first LR update otherwise — hit on a p2t epoch-19 checkpoint,
-            # job 8723416, while newer t2p checkpoints happened to carry it).
-            # Re-injected from THIS invocation's --lr / --unfreeze-lr, so a resume
-            # with a different LR does what you'd expect rather than silently
-            # inheriting the old one.
+            # Restore base_lr, which load_state_dict drops for any checkpoint
+            # written before that key existed (KeyError 'base_lr' at the first LR
+            # update otherwise). Re-injected from THIS invocation's --lr /
+            # --unfreeze-lr, so a resume with a different LR does what you'd expect
+            # rather than silently inheriting the old one.
             for g, blr in zip(optim.param_groups, base_lrs):
                 g["base_lr"] = blr
         elif env.is_main:
@@ -1293,10 +1100,8 @@ def main() -> None:
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt.get("global_step", start_epoch * len(train_loader))
         if start_epoch >= args.epochs:
-            # Report start_epoch, not ckpt['epoch'] — the old message compared the
-            # two but printed the third ("epoch 6 already at/past --epochs 7"),
-            # which is false on its face and sends you to --epochs 7 when the
-            # loop range(start_epoch, epochs) needs 8 to run even one epoch.
+            # Report start_epoch, not ckpt['epoch']: the loop is
+            # range(start_epoch, epochs), so --epochs must exceed start_epoch.
             raise RuntimeError(
                 f"--resume checkpoint finished epoch {ckpt['epoch']}, so training would "
                 f"start at epoch {start_epoch}, but --epochs is {args.epochs} and the "
@@ -1338,25 +1143,6 @@ def main() -> None:
                 z = src_proj(h)
                 mem = build_memory(z)
 
-            kl = torch.zeros((), device=device)
-            if cvae is not None:
-                # Posterior sees pooled source + target (both frozen embeddings);
-                # sampled latent -> extra cross-attn memory tokens. KL pulls the
-                # posterior toward the learned conditional prior p(w|source).
-                with torch.no_grad():
-                    z_src_pool = masked_mean(z, mask)
-                    h_tgt = batch["h_tgt"].to(device).float()
-                    m_tgt = batch["m_tgt"].to(device)
-                    z_tgt_pool = masked_mean(tgt_proj(h_tgt), m_tgt)
-                qmu, qlv = cvae.posterior_params(z_src_pool, z_tgt_pool)
-                pmu, plv = cvae.prior_params(z_src_pool)
-                w = cvae.reparam(qmu, qlv)
-                w_tok = cvae.latent_tokens(w)                # [B, k, mem_dim], carries grad
-                mem = torch.cat([mem, w_tok], dim=1)
-                k_mask = torch.ones(mem.size(0), n_latent, dtype=torch.bool, device=device)
-                mask = torch.cat([mask, k_mask], dim=1)
-                kl = cvae.kl(qmu, qlv, pmu, plv)
-
             contrast_on = args.contrast_lambda > 0.0 and input_ids.size(0) >= 2
             if contrast_on:
                 # Negative memory: pair each row with another example's memory (a
@@ -1386,8 +1172,7 @@ def main() -> None:
             ).view(shift_labels.shape)
             ce = tok_pos.sum() / valid.sum().clamp(min=1)
 
-            beta = beta_at(global_step, total_steps, cvae.cfg) if cvae is not None else 0.0
-            loss = ce + beta * kl
+            loss = ce
 
             cov_pen, cov_mean = None, None
             if args.coverage_lambda > 0.0:
@@ -1419,10 +1204,6 @@ def main() -> None:
             # (Harmless without checkpointing — next step's set_cross_memory
             # overwrites it.)
             clear_cross_memory(adapters)
-            # DDP syncs the decoder grads; the CVAE heads live outside its forward,
-            # so average their grads manually (mirrors the retrieval trainer).
-            if cvae is not None:
-                average_gradients(cvae)
             total_norm = torch.nn.utils.clip_grad_norm_(train_params, cfg.generation.grad_clip)
             # Skip the step on a non-finite grad norm instead of letting it poison
             # every weight: clip_grad_norm_ rescales all grads by clip/total_norm, so
@@ -1444,8 +1225,6 @@ def main() -> None:
                        f"lr={lr:.2e} ce={ce.item():.4f} ppl={ppl:.2f} "
                        f"trunc={int(batch['n_truncated'])}/{input_ids.size(0)} "
                        f"L={input_ids.size(1)}")
-                if cvae is not None:
-                    msg += f" kl={kl.item():.4f} beta={beta:.3f}"
                 if gap is not None:
                     msg += f" gap={gap.item():+.4f}"   # train-time content gain (ce_neg-ce_pos)
                 if cov_pen is not None:
@@ -1468,8 +1247,6 @@ def main() -> None:
             core.eval()
             val_losses = []
             val_cov, val_covpen, cov_profile = [], [], None
-            if cvae is not None:
-                cvae.eval()
             with torch.no_grad():
                 for batch in val_loader:
                     h = batch["h"].to(device).float()
@@ -1479,19 +1256,13 @@ def main() -> None:
                     labels = batch["labels"].to(device)
                     z = src_proj(h)
                     mem = build_memory(z)
-                    # Inference-time conditioning: prior mean (no target available).
-                    if cvae is not None:
-                        pmu, _ = cvae.prior_params(masked_mean(z, mask))
-                        mem = torch.cat([mem, cvae.latent_tokens(pmu)], dim=1)
-                        k_mask = torch.ones(mem.size(0), n_latent, dtype=torch.bool, device=device)
-                        mask = torch.cat([mask, k_mask], dim=1)
                     set_cross_memory(adapters, mem, mask)
                     out = core(input_ids=input_ids, attention_mask=attn_mask)
                     # Read coverage BEFORE clearing — clear_cross_memory drops
                     # last_attn. Reported whenever the attention is available, not
                     # just when the aux is on: with --coverage-lambda 0 this is the
                     # baseline measurement that tells you where to put --coverage-tau.
-                    if args.cross_attn_mode == "aligned":
+                    if meta.cross_attn_mode == "aligned":
                         vp, vc = coverage_penalty(adapters, attn_mask.bool(),
                                                   tau=args.coverage_tau)
                         val_cov.append(vc.item())
@@ -1511,8 +1282,6 @@ def main() -> None:
                         ignore_index=-100,
                     )
                     val_losses.append(loss.item())
-            if cvae is not None:
-                cvae.train()
             val_ce = sum(val_losses) / max(len(val_losses), 1)
             rec = {"epoch": epoch, "val_ce": val_ce, "val_ppl": math.exp(val_ce)}
             if rt_metrics is not None:
@@ -1536,7 +1305,7 @@ def main() -> None:
                       f"(n={cov_profile['n']})")
             log.append(rec)
 
-            # Save every trainable tensor (cross-attn + LoRA + any unfrozen
+            # Save every trainable tensor (cross-attn adapters + any unfrozen
             # blocks), keyed by requires_grad so partial-unfreeze weights persist.
             trainable = {n for n, p in core.named_parameters() if p.requires_grad}
             adapter_state = {k: v for k, v in core.state_dict().items() if k in trainable}
@@ -1544,28 +1313,16 @@ def main() -> None:
                        "adapter_state": adapter_state,
                        "optimizer_state": optim.state_dict(),
                        "train_log": log,
-                       "cross_attn_every": args.cross_attn_every,
-                       "unfreeze_top": args.unfreeze_top,
-                       "unfreeze_where": args.unfreeze_where,
+                       # Training-recipe fields; the architecture header follows.
                        "target_input_dropout": args.target_input_dropout,
                        "dropout_mean_span": args.dropout_mean_span,
                        "contrast_lambda": args.contrast_lambda,
                        "contrast_margin": args.contrast_margin,
+                       "coverage_lambda": args.coverage_lambda,
+                       "coverage_tau": args.coverage_tau,
+                       "lr": args.lr,
                        "unfreeze_lr": args.unfreeze_lr,
-                       "warm_start_qalign": args.warm_start_qalign,
-                       "memory_space": args.memory_space,
-                       "memory_map": args.memory_map,
-                       "cross_attn_mode": args.cross_attn_mode,
-                       "direction_augment": args.direction_augment,
-                       "lora_targets_self_attn": cfg.generation.lora_targets_self_attn,
-                       "lora_targets_ffn": cfg.generation.lora_targets_ffn}
-            # CVAE heads (Feature 1); absent => downstream loads run without a latent.
-            if cvae is not None:
-                payload["cvae_state"] = cvae.state_dict()
-                payload["cvae_cfg"] = {
-                    "d_w": cvae.cfg.d_w, "n_latent_tokens": cvae.cfg.n_latent_tokens,
-                    "hidden": cvae.cfg.hidden, "mem_dim": cvae.cfg.mem_dim,
-                }
+                       **meta.to_payload()}
             path = ckpt_dir / f"epoch{epoch:02d}.pt"
             torch.save(payload, path)
             print(f"[ckpt] saved {path}")

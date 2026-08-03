@@ -10,68 +10,66 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
-
 # ---------------------------------------------------------------------------
 # Generate a set of proteins for a list of accessions (text -> protein).
 #
-# Reads protein_ids.txt (one primary_Accession per line, same format as
-# inspect.pbs), pulls each accession's caption + true protein from the SwissProt
-# CSV, and emits NUM_OUTPUTS sequences per accession. Each sequence is the winner
-# of an independent best-of-N round: N candidates sampled at TEMP/TOP_P,
+# Reads ID_FILE (one primary_Accession per line, same format as inspect.pbs),
+# pulls each accession's caption + true protein from the corpus, and emits
+# NUM_OUTPUTS sequences per accession. Each sequence is the winner of an
+# independent best-of-N round: N candidates sampled at TEMPERATURE/TOP_P,
 # re-encoded, and scored by contrastive round-trip margin against the source
 # caption (negatives from a panel of other captions).
 #
-# No CVAE — candidate diversity is sampling-driven, and a decoder checkpoint
-# carrying cvae_state is rejected by the script rather than silently mis-conditioned.
-#
 # Single process on one tile: best-of-N already batches its N candidates, and the
 # work is a handful of accessions, not a corpus sweep.
+#
+# Model and dataset locations are NOT set here — config.py owns them.
 # ---------------------------------------------------------------------------
 
-# --- edit these ---
-RCKPT=checkpoints/retrieval/epoch50.pt                        # retrieval weights
-DCKPT=checkpoints/generation/text2protein_rl/step003800.pt    # text->protein decoder adapters
-IDS=protein_ids.txt                                           # one primary_Accession per line
-OUT=generated_out/generated_proteins.csv                      # accession, prompt, true protein, generated
-N=64                                                          # best-of-N candidates per output
-NUM_OUTPUTS=5                                                 # sequences kept per accession
-SELECTION=margin                                              # margin | pos
-PANEL=256                                                     # reference captions for the margin
-TEMP=1.0
+source ./pbs_common.sh
+
+# ===========================================================================
+# Checkpoints and I/O
+# ===========================================================================
+RETRIEVAL_CKPT=checkpoints/retrieval/epoch50.pt
+DECODER_CKPT=checkpoints/generation/text2protein_rl/step003800.pt
+ID_FILE=protein_ids.txt                            # one primary_Accession per line
+OUT=generated_out/generated_proteins.csv
+
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# WALL TIME BASIS: NUM_CANDIDATES x NUM_OUTPUTS x MAX_NEW_TOKENS per accession,
+# single process. Halving the token cap halves it; 1h on the debug queue covers
+# a worklist of tens of accessions at these settings.
+NUM_CANDIDATES=64      # best-of-N candidates per emitted sequence
+NUM_OUTPUTS=5          # sequences kept per accession
+SELECTION=margin       # margin | pos
+PANEL_SIZE=256         # reference captions the margin subtracts against
+TEMPERATURE=1.0
 TOP_P=0.95
-MAX_NEW_TOKENS=1024
-CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
-MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
+# The corpus is filtered to <=500 residues, so 512 covers every target. Wall time
+# is linear in this, and best-of-N multiplies it by NUM_CANDIDATES.
+MAX_NEW_TOKENS=512
 
-# config.py defaults to dev (Mac) model paths; point it at the cluster models.
-export FILIP_MODELS_DIR="$MODELS_DIR"
-export FILIP_PROTEIN_DECODER=${MODELS_DIR}/ProtGPT3-112M-dpo
-export FILIP_DATA_CSV="$CSV"
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export OMP_NUM_THREADS=8
+# ===========================================================================
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "text2protein generation set (src.generate_set)" \
+    RETRIEVAL_CKPT DECODER_CKPT ID_FILE OUT \
+    NUM_CANDIDATES NUM_OUTPUTS SELECTION PANEL_SIZE \
+    TEMPERATURE TOP_P MAX_NEW_TOKENS
+require_files RETRIEVAL_CKPT DECODER_CKPT ID_FILE
 
-mkdir -p "$(dirname "$OUT")"
-echo "generating ${NUM_OUTPUTS} x best-of-${N} for $(wc -l < "$IDS") accessions -> ${OUT}"
-
-python -m src.generate_set \
-    --retrieval-ckpt "$RCKPT" \
-    --decoder-ckpt "$DCKPT" \
-    --csv "$CSV" \
-    --id-file "$IDS" \
-    --out "$OUT" \
-    --num-candidates "$N" \
-    --num-outputs "$NUM_OUTPUTS" \
-    --selection "$SELECTION" \
-    --panel-size "$PANEL" \
-    --temperature "$TEMP" \
-    --top-p "$TOP_P" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --device xpu
-
+mkdir -p "$(dirname "${OUT}")"
+python -m src.generate_set --device xpu \
+    --retrieval-ckpt "${RETRIEVAL_CKPT}" \
+    --decoder-ckpt "${DECODER_CKPT}" \
+    --id-file "${ID_FILE}" --out "${OUT}" \
+    --num-candidates "${NUM_CANDIDATES}" --num-outputs "${NUM_OUTPUTS}" \
+    --selection "${SELECTION}" --panel-size "${PANEL_SIZE}" \
+    --temperature "${TEMPERATURE}" --top-p "${TOP_P}" \
+    --max-new-tokens "${MAX_NEW_TOKENS}"
 rc=$?
-echo "done (exit ${rc}); csv at ${OUT}"
-exit $rc
+
+echo "csv at ${OUT}"
+finish $rc

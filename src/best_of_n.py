@@ -20,8 +20,13 @@ import torch
 from src.losses import filip_score_matrix_chunked
 
 
-def pad_stack(seqs: List[torch.Tensor], dim: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """List of [l_i, dim] per-token tensors -> ([N, Lmax, dim], bool mask [N, Lmax])."""
+def pad_stack(seqs: List[torch.Tensor], dim: int,
+              device=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """List of [l_i, dim] per-token tensors -> ([N, Lmax, dim], bool mask [N, Lmax]).
+
+    `device=None` keeps the result on CPU — the offline scorer merges shards that
+    are already there and only moves the padded block once.
+    """
     n = len(seqs)
     lmax = max(max((t.size(0) for t in seqs), default=1), 1)
     out = torch.zeros(n, lmax, dim, device=device)
@@ -29,7 +34,7 @@ def pad_stack(seqs: List[torch.Tensor], dim: int, device) -> Tuple[torch.Tensor,
     for i, t in enumerate(seqs):
         l = t.size(0)
         if l:
-            out[i, :l] = t.to(device)
+            out[i, :l] = t if device is None else t.to(device)
             mask[i, :l] = True
     return out, mask
 

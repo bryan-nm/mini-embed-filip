@@ -29,8 +29,10 @@ deliberately torch-free so `python -m src.decoys --selftest` runs anywhere.
 Donor rejection rules (all enforced in `build_decoy_plan`):
   * different value — a byte-identical replacement would leave the decoy equal to
     the truth, i.e. a false negative the loss must never see;
-  * different protein — the corpus carries ~8.87 captions per accession, and a
-    sibling caption's FUNCTION is usually *also* true of this protein;
+  * different protein — on a multi-caption corpus a sibling caption's FUNCTION
+    is usually *also* true of this protein. Inert at one caption per accession
+    (the donor is a different caption, hence a different protein), kept so the
+    rule still holds if a multi-caption corpus comes back;
   * same split — a donor from val/test would leak held-out caption text into
     training (it is only a fragment, but it is free to avoid).
 """
@@ -276,7 +278,7 @@ def build_decoy_plan(
             pool = np.flatnonzero(is_l & (span_split == s))
             if pool.size:
                 pools[(lid, s)] = pool
-    log(f"[decoy-plan] donor pools: " + ", ".join(
+    log("[decoy-plan] donor pools: " + ", ".join(
         f"{labels[l]}[{s}]={pools[(l, s)].size}" for (l, s) in sorted(pools)))
 
     rng = np.random.default_rng(seed)
@@ -556,7 +558,6 @@ def _selftest() -> int:
 
 if __name__ == "__main__":
     import argparse
-    import sys
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true",

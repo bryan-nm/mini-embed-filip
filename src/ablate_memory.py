@@ -1,23 +1,20 @@
 """Conditioning ablation: how much is the cross-attention memory worth, and why?
 
 Runs the generation validation cross-entropy over the *same* val batches under
-four conditions, so the total trained gain can be decomposed:
+three conditions, so the total trained gain can be decomposed:
 
-  conditioned      — the trained encoder->project->expand memory (+ CVAE prior
-                     mean) set on the adapters, exactly as in training. LoRA on.
+  conditioned      — the trained encoder->project->expand memory set on the
+                     adapters, exactly as in training.
   shuffled-memory  — same, but each target is paired with a DIFFERENT row's source
                      memory (batch roll). Memory is present but its CONTENT is
-                     wrong. LoRA on.
+                     wrong.
   memory-off       — no memory set, so every adapter takes its pass-through branch
                      (`CrossAttentionAdapter.forward` returns the hidden state
-                     unchanged when `self.memory is None`). LoRA on.
-  base             — memory off AND LoRA disabled (every LoRALinear scaling -> 0):
-                     the pristine frozen ProtGPT3, conditioning on the target prefix
-                     alone. This is the true unconditional baseline.
+                     unchanged when `self.memory is None`). With the backbone
+                     frozen this is the pristine decoder conditioning on the
+                     target prefix alone — the unconditional baseline.
 
 Decomposition (in CE nats; lower is better):
-  lora gain      = base        - memory_off   how much LoRA domain-adaptation alone
-                                              explains (text-independent).
   presence gain  = memory_off  - shuffled     benefit from memory merely being
                                               present, regardless of content.
   content gain   = shuffled    - conditioned  the ACTUAL conditioning signal: does
@@ -25,12 +22,16 @@ Decomposition (in CE nats; lower is better):
 
 Reading it:
   * content gain ~ 0  => the decoder ignores which caption it is given; whatever
-    val improvement happened was LoRA (and/or a degenerate memory-presence effect),
-    not conditioning. This is the failure mode we suspect.
+    val improvement happened was a degenerate memory-presence effect, not
+    conditioning. This is the failure mode we suspect.
   * content gain > 0, presence gain ~ 0 => healthy: the model uses memory content.
   * presence gain > 0 while content gain ~ 0 => suspicious: the model exploits
     memory being present but not its content (check source<->target alignment and
     the bf16 residual cast in the adapter).
+
+Note: with --unfreeze-top > 0 the SFT run also moved backbone blocks, so
+"memory-off" is that adapted backbone rather than the pretrained one; the
+decomposition then measures conditioning on top of it.
 
 Single process — the val split is small, so this needs no MPI launch; point
 --device at one GPU (or cpu). Use a larger --val-subset than training's default
@@ -38,14 +39,13 @@ Single process — the val split is small, so this needs no MPI launch; point
 
 Usage:
   python -m src.ablate_memory --direction text2protein \\
-      --retrieval-ckpt checkpoints/reconstruction/epoch09.pt \\
+      --retrieval-ckpt checkpoints/retrieval/epoch50.pt \\
       --decoder-ckpt checkpoints/generation/text2protein/epoch11.pt \\
       --device xpu --val-subset 2000
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
 import math
 import sys
 from pathlib import Path
@@ -57,7 +57,6 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
-from src.cvae import load_cvae
 from src.data import (
     build_or_load_splits,
     group_ids_from_accessions,
@@ -67,44 +66,18 @@ from src.data import (
     load_splits,
 )
 from src.decoder_adapters import (
-    LoRACfg,
-    LoRALinear,
     clear_cross_memory,
     load_decoder_with_cross_attn,
     set_cross_memory,
     target_prefix_ids,
 )
-from src.losses import masked_mean
-from src.train_generation import (
-    GenerationDataset,
-    make_collate,
-    load_retrieval_model,
-    pick_device,
-)
-
-
-@contextlib.contextmanager
-def _lora_disabled(model, enabled: bool):
-    """When `enabled` is False, temporarily zero every LoRALinear's scaling so the
-    low-rank update contributes nothing, restoring it on exit. Lets a single loaded
-    model produce both the with-LoRA and pristine-backbone perplexities."""
-    if enabled:
-        yield
-        return
-    saved = []
-    for m in model.modules():
-        if isinstance(m, LoRALinear):
-            saved.append((m, m.scaling))
-            m.scaling = 0.0
-    try:
-        yield
-    finally:
-        for m, s in saved:
-            m.scaling = s
+from src.gen_ckpt import load_generation_ckpt
+from src.model import load_retrieval
+from src.train_generation import GenerationDataset, make_collate, pick_device
 
 
 def _run_val(decoder, adapters, val_loader, device, *, memory_mode,
-             src_proj, build_mem, cvae, n_latent):
+             src_proj, build_mem):
     """One full pass over val_loader. Returns (tw_ppl, mm_ppl, tw_ce, mm_ce).
 
     memory_mode:
@@ -112,8 +85,8 @@ def _run_val(decoder, adapters, val_loader, device, *, memory_mode,
       "shuffled"    — set another row's memory (batch roll): present but wrong.
       "off"         — never set memory; adapters pass through.
 
-    build_mem: maps the source projection z to the cross-attn memory (expand /
-    aligned z / aligned+map), matching how the checkpoint was trained.
+    build_mem: maps the source projection z to the cross-attn memory (expanded or
+    aligned), matching how the checkpoint was trained.
 
     token-weighted (tw) is the correct estimate; mean-of-means (mm) mirrors the
     training-time [val] print so the conditioned number is directly comparable to
@@ -135,23 +108,11 @@ def _run_val(decoder, adapters, val_loader, device, *, memory_mode,
                 clear_cross_memory(adapters)   # adapters -> pass-through
             else:
                 if memory_mode == "shuffled" and h.size(0) > 1:
-                    # Pair each target with the previous row's source conditioning.
-                    # Rolling h+mask *before* project/expand means the deterministic
-                    # memory AND the CVAE prior latent both come from the wrong row,
+                    # Pair each target with the previous row's source conditioning,
                     # while input_ids/labels (the target) stay put.
                     h = torch.roll(h, shifts=1, dims=0)
                     mask = torch.roll(mask, shifts=1, dims=0)
-                z = src_proj(h)
-                mem = build_mem(z)
-                if cvae is not None:
-                    # Inference-time conditioning = prior mean (no target available),
-                    # exactly as the training val loop does it.
-                    pmu, _ = cvae.prior_params(masked_mean(z, mask))
-                    mem = torch.cat([mem, cvae.latent_tokens(pmu)], dim=1)
-                    k_mask = torch.ones(mem.size(0), n_latent, dtype=torch.bool,
-                                        device=device)
-                    mask = torch.cat([mask, k_mask], dim=1)
-                set_cross_memory(adapters, mem, mask)
+                set_cross_memory(adapters, build_mem(src_proj(h)), mask)
 
             out = decoder(input_ids=input_ids, attention_mask=attn_mask)
             clear_cross_memory(adapters)
@@ -196,62 +157,36 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"[ablate] direction={args.direction} device={device}")
 
-    # 1) Read the generation ckpt's architecture flags first (they drive both the
-    # retrieval build — maps or not — and the adapter build). All default to the
-    # pre-flag values for older checkpoints.
-    ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
-    cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
-    memory_space = ckpt.get("memory_space", "expanded")
-    memory_map = ckpt.get("memory_map", False)
-    cross_attn_mode = ckpt.get("cross_attn_mode", "head")
-    aligned_mem = memory_space == "aligned"
+    # 1) The generation ckpt's architecture header drives the adapter rebuild.
+    ckpt, meta = load_generation_ckpt(args.decoder_ckpt)
 
-    # 2) Frozen retrieval front-end (projection + expansion + optional maps).
-    retrieval = load_retrieval_model(args.retrieval_ckpt, device, with_maps=memory_map)
+    # 2) Frozen retrieval front-end (projection + expansion heads).
+    retrieval = load_retrieval(args.retrieval_ckpt, device, cfg)
     if args.direction == "text2protein":
         src_proj, src_expand = retrieval.text_proj, retrieval.text_expand
         decoder_path = cfg.generation.decoder_path
-        hidden_mem_dim = cfg.model.text_hidden
     else:
         src_proj, src_expand = retrieval.protein_proj, retrieval.protein_expand
         decoder_path = TEXT_DECODER_PATH
-        hidden_mem_dim = cfg.model.protein_hidden
 
     # build_mem: aligned projection -> cross-attn memory, matching training.
     def build_mem(z):
-        if not aligned_mem:
-            return src_expand(z)
-        return retrieval.map_source(z, args.direction) if memory_map else z
+        return z if meta.aligned_memory else src_expand(z)
 
-    # 3) Decoder + adapters, restored from the generation checkpoint. cross_attn_every,
-    # memory_space AND cross_attn_mode must match what the ckpt was trained with
-    # (all stored in it) so adapter counts, k/v input dims, and scoring space line
-    # up; adapter_state loads strict=False against the frozen backbone.
-    mem_dim = cfg.model.embed_dim if aligned_mem else hidden_mem_dim
-    # LoRA targeting must match training (--no-lora ckpts have no LoRA modules), so
-    # the rebuilt decoder has the same structure the adapter_state was saved from.
-    lora_cfg = LoRACfg(
-        rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
-        dropout=cfg.generation.lora_dropout,
-        target_self_attn=ckpt.get("lora_targets_self_attn", True),
-        target_ffn=ckpt.get("lora_targets_ffn", True),
-    )
+    # 3) Decoder + adapters, rebuilt from the checkpoint's own header so adapter
+    # counts, k/v input dims and scoring space line up; adapter_state loads
+    # strict=False against the frozen backbone.
+    mem_dim = meta.mem_dim(cfg, args.direction)
     decoder, target_tok, adapters = load_decoder_with_cross_attn(
-        args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
-        cross_attn_mode=cross_attn_mode)
-    missing, unexpected = decoder.load_state_dict(ckpt["adapter_state"], strict=False)
+        args.direction, decoder_path, meta.cross_attn_every, mem_dim, device,
+        cross_attn_mode=meta.cross_attn_mode)
+    _, unexpected = decoder.load_state_dict(ckpt["adapter_state"], strict=False)
     if unexpected:
         raise RuntimeError(f"unexpected keys in adapter_state: {unexpected}")
     decoder.eval()
-    print(f"[ablate] loaded decoder ckpt {args.decoder_ckpt} "
-          f"(cross_attn_every={cae}, memory_space={memory_space}, mem_dim={mem_dim}, "
-          f"memory_map={memory_map}, cross_attn_mode={cross_attn_mode}, "
-          f"{len(adapters)} adapters)")
-
-    # CVAE heads (frozen) if the checkpoint carries them, mirroring generation.
-    cvae = load_cvae(ckpt, cfg.model.embed_dim, device)
-    n_latent = cvae.cfg.n_latent_tokens if cvae is not None else 0
-    print(f"[ablate] CVAE: {'on (prior mean)' if cvae is not None else 'off'}")
+    print(f"[ablate] loaded decoder ckpt {args.decoder_ckpt}\n"
+          f"[ablate]   architecture: {meta.describe()} mem_dim={mem_dim} "
+          f"({len(adapters)} adapters)")
 
     # 3) Val data — the SAME group-aware split the trainer used (read splits.json
     # from the cache; build it if somehow absent).
@@ -284,45 +219,40 @@ def main() -> None:
     print(f"[ablate] val pairs evaluated: {len(val_indices)} "
           f"({len(val_loader)} batches)")
 
-    # 4) Four passes over the identical batches (val_loader is shuffle=False, so
+    # 4) Three passes over the identical batches (val_loader is shuffle=False, so
     # every pass sees the same batches in the same order — comparisons are exact).
-    def run(memory_mode, lora_on, label):
-        with _lora_disabled(decoder, lora_on):
-            tw, mm, tw_ce, _ = _run_val(
-                decoder, adapters, val_loader, device, memory_mode=memory_mode,
-                src_proj=src_proj, build_mem=build_mem,
-                cvae=cvae, n_latent=n_latent)
+    def run(memory_mode, label):
+        tw, mm, tw_ce, _ = _run_val(
+            decoder, adapters, val_loader, device, memory_mode=memory_mode,
+            src_proj=src_proj, build_mem=build_mem)
         print(f"  {label:<24} ce={tw_ce:.4f}  ppl={tw:.3f}", flush=True)
         return mm, tw_ce
 
     print("\n[ablate] running passes...")
-    cond_mm, cond_ce = run("conditioned", True, "conditioned")
-    _, shuf_ce = run("shuffled", True, "shuffled-memory")
-    _, off_ce = run("off", True, "memory-off (LoRA on)")
-    _, base_ce = run("off", False, "base (LoRA off)")
+    cond_mm, cond_ce = run("conditioned", "conditioned")
+    _, shuf_ce = run("shuffled", "shuffled-memory")
+    _, off_ce = run("off", "memory-off (baseline)")
 
-    # Decompose the total base->conditioned improvement into its sources. CE is in
-    # nats and additive, so the three gains sum to (base_ce - cond_ce).
-    lora_gain = base_ce - off_ce        # unconditional LoRA domain adaptation
+    # Decompose the total off->conditioned improvement into its sources. CE is in
+    # nats and additive, so the two gains sum to (off_ce - cond_ce).
     presence_gain = off_ce - shuf_ce    # memory present at all (content-independent)
     content_gain = shuf_ce - cond_ce    # the RIGHT caption vs a wrong one — real conditioning
-    total = base_ce - cond_ce
+    total = off_ce - cond_ce
 
     print("\n[ablate] ===== decomposition (CE nats, positive = improvement) =====")
     print(f"  conditioned mean-of-means ppl = {cond_mm:.3f}   (compare to training [val] print)")
-    print(f"  lora gain      (base    -> off)      = {lora_gain:+.4f}")
     print(f"  presence gain  (off     -> shuffled) = {presence_gain:+.4f}")
     print(f"  content gain   (shuffled-> cond)     = {content_gain:+.4f}   <-- the conditioning signal")
-    print(f"  total          (base    -> cond)     = {total:+.4f}")
+    print(f"  total          (off     -> cond)     = {total:+.4f}")
     if total > 1e-6:
-        print(f"                 shares: lora={100*lora_gain/total:.0f}%  "
-              f"presence={100*presence_gain/total:.0f}%  content={100*content_gain/total:.0f}%")
+        print(f"                 shares: presence={100*presence_gain/total:.0f}%  "
+              f"content={100*content_gain/total:.0f}%")
 
     print("\n[ablate] ===== verdict =====")
     if content_gain < 0.02:
         print("  content gain ~ 0: the decoder IGNORES which caption it is given. Any")
-        print("  val improvement is LoRA domain-adaptation (and/or a content-free memory-")
-        print("  presence effect), NOT conditioning.")
+        print("  val improvement is a content-free memory-presence effect, NOT")
+        print("  conditioning.")
         if presence_gain > 0.05:
             print("  presence gain is non-trivial while content gain is ~0 => the model")
             print("  exploits memory being present but not its content. Suspicious: check")

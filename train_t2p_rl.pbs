@@ -10,128 +10,175 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m abe
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
-
+# ---------------------------------------------------------------------------
 # GRPO-style RL fine-tune of text->protein generation, optimizing the round-trip
 # FILIP reward directly (the honest, prefix-free objective). Separate track from
-# train_generation.py; writes to checkpoints/generation/text2protein_rl/.
-: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
-: "${INIT_CKPT:?set -v INIT_CKPT=path/to/sft/text2protein/epochNN.pt (cleanest-LM ckpt)}"
+# train_generation.py; writes to <CKPT_DIR>.
+#
+# Model and dataset locations are NOT set here — config.py owns them.
+# ---------------------------------------------------------------------------
 
-# Rollout budget. 256 capped rollouts BELOW the median SwissProt protein (~330
-# residues), which broke the reward: the FILIP score compares a truncated rollout
-# against the WHOLE caption, so caption tokens describing anything past residue
-# 256 could only be satisfied by cramming that content into the visible window.
-# For a two-domain prompt that rewards chimeras over correct domain order. 1024
-# covers essentially the whole corpus, so the reward scores a finished protein.
+MASTER_PORT=29504
+source ./pbs_common.sh
+
+# ===========================================================================
+# Checkpoints
+# ===========================================================================
+RETRIEVAL_CKPT=checkpoints/retrieval/epoch50.pt
+CKPT_DIR=checkpoints/generation/text2protein_rl
+
+# Initial policy. Two supported modes:
 #
-# Overridable from qsub (-v PPR=...): at 1024 the policy's forward-with-grad over
-# B*G sequences is 4x the 256 footprint and train_rl has no gradient
-# checkpointing. Sized for ProtGPT3-112M; for the 1.3B decoder (~4x per-token
-# activations) drop PPR first — keep --group-size 8, since group-relative
+#   WARM START — set INIT_CKPT to an SFT checkpoint (the cleanest-LM one, NOT
+#   the contrastive one whose no-memory behaviour is damaged). The policy
+#   continues that model and the architecture comes from its stored header, so
+#   the CROSS_ATTN_* / UNFREEZE_* settings below are ignored. KL anchors to the
+#   SFT policy.
+#
+#   COLD START — leave INIT_CKPT empty. The adapters are freshly initialized on
+#   the frozen decoder and RL is the only thing that ever shapes the
+#   conditioning; the architecture comes from the settings below and KL anchors
+#   to the decoder's unconditional prior. o_proj is zero-initialized, so step 0
+#   IS that prior and the reward gradient opens the adapter from there. Legal
+#   and useful as a no-SFT control, but expect a much longer flat stretch before
+#   the round-trip curve moves — WARM_START_QALIGN matters most in this mode,
+#   since it is the only thing putting the decoder-side query in the right region
+#   of the shared space before any gradient arrives.
+INIT_CKPT=checkpoints/generation/text2protein/epoch09.pt
+#INIT_CKPT=                                  # <- uncomment for a cold start
+
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# WALL TIME BASIS: RL is step-budgeted, not row-budgeted, so wall time is
+# STEPS x per-step. Rollout generation is the floor and is linear in
+# MAX_NEW_TOKENS (halved), while PROMPTS_PER_RANK doubled — so per-step wall is
+# roughly unchanged at twice the GRPO batch. 12h stands.
+STEPS=2000                  # TOTAL budget; --resume auto continues toward it
+PROMPTS_PER_RANK=16         # B: distinct captions per rank per step
+GROUP_SIZE=8                # G: rollouts per caption. Rollout = B*G per rank
+LR=1e-5
+UNFREEZE_LR=2e-6            # only bites if the policy has unfrozen blocks
+KL_COEF=0.05
+LOG_EVERY=10
+SAVE_EVERY=200
+
+# Rollout budget. This has to cover the whole target, not part of it: the FILIP
+# reward compares a truncated rollout against the WHOLE caption, so caption
+# tokens describing anything past the cap can only be satisfied by cramming that
+# content into the visible window — which, for a two-domain prompt, rewards
+# chimeras over correct domain order. The corpus is filtered to <=500 residues,
+# so 512 covers every protein and the reward always scores a finished sequence.
+# (This was 1024 for the unfiltered corpus, and 256 before that, which sat below
+# the median protein and did exactly the damage described above.)
+#
+# PROMPTS_PER_RANK doubled with the halved rollout: the policy's
+# forward-with-grad over B*G sequences scales as B*G*T on the linear term and
+# B*G*T^2 on attention, so halving T pays for twice the prompts outright.
+# train_rl has no gradient checkpointing — for a larger decoder drop
+# PROMPTS_PER_RANK first, and keep GROUP_SIZE at 8, since group-relative
 # advantage degrades fast with a small group.
-MAXNEW=${MAXNEW:-1024}
-PPR=${PPR:-8}
-# Length band on the reward, now ON. It was off pending evidence: the SFT-side
-# fixes (no synthetic EOS on truncated targets, 1024 cap, bidirectional
-# factorization) were expected to settle the length distribution by themselves,
-# and the stated condition for reaching for this was "watch lenratio (median
-# L_gen/L_true; 1.0 is on target)". That condition is now met by measurement —
-# debug jobs 8722544 and 8722785 (epoch-6 SFT policy, MAXNEW=1024) both ran
-# lenratio 1.57-2.21, median ~1.7. Generations are consistently ~70% too long.
-# 0.4 is the sizing rule applied to the measured rstd: 4.5 * 0.09, where rstd
-# came out 0.05-0.12 under BOTH the raw and contrastive rewards, so the same
-# value holds either way. Set LEN_LAMBDA=0 to reproduce the old behaviour.
-LEN_LAMBDA=${LEN_LAMBDA:-0.4}
-# Contrastive reward, now ON: reward = FILIP(gen, own caption) - beta * max_j
-# FILIP(gen, other caption in batch), instead of the raw positive score. The raw
-# score is absolute and negative-free, so it can be raised by a "hub" output that
-# scores well against EVERY caption; GRPO's standardizer cannot see that (it
-# removes a per-prompt constant, and hubness is a property of the sample).
+MAX_NEW_TOKENS=512
+TEMPERATURE=1.0
+TOP_P=0.95
+
+# Length band on the reward. RE-MEASURE BEFORE TRUSTING THIS NUMBER: 0.4 was
+# derived on the UNFILTERED corpus at MAX_NEW_TOKENS=1024 (epoch-6 SFT policy,
+# lenratio 1.57-2.21 median ~1.7, i.e. generations ~70% too long; rstd 0.05-0.12
+# under both rewards, and 4.5 * 0.09 ~ 0.4 is the sizing rule). Both inputs to
+# that calculation have changed — the corpus is now capped at 500 residues, so
+# the target length distribution is different, and the rollout cap moved with it.
 #
-# Job 8722785 showed margin -0.09 to -0.16 every step while the raw score looked
+# The sizing rule itself still holds: only within-group spread survives GRPO's
+# standardizer, so LENGTH_LAMBDA ~ 4.5 * rstd. Read `rstd` and `lenratio` off the
+# first LOG_EVERY lines of this run and set it from those. 0.4 is a starting
+# point carried over, not a measurement on this corpus. Set to 0 for no band.
+LENGTH_LAMBDA=0.4
+LENGTH_TOLERANCE=0.25
+
+# Contrastive reward: FILIP(gen, own caption) - beta * max_j FILIP(gen, other
+# caption in batch), instead of the raw positive score. The raw score is absolute
+# and negative-free, so it can be raised by a "hub" output that scores well
+# against EVERY caption; GRPO's standardizer cannot see that (it removes a
+# per-prompt constant, and hubness is a property of the sample).
+#
+# Prior runs showed margin -0.09 to -0.16 every step while the raw score looked
 # healthy at ~0.7 — the hubness signature. That is SUGGESTIVE, NOT ESTABLISHED:
 # the negative term is a MAX over B-1 draws and is upward-biased against a single
 # positive draw, so a negative margin is partly a property of the statistic.
-# --log-margin-ceiling is enabled below and settles it in this run's own log:
-#   cmargin is the identical statistic on GROUND-TRUTH pairs. If margin tracks
-#   cmargin, the negative number was the max-statistic and means nothing. If
-#   cmargin sits well above margin, the generations really are generic and this
-#   reward is doing the job. Read it in the first few step lines.
-# Watch eval R@K/mAP the same way as always — the reward changed scale, so reward
-# curves are NOT comparable to earlier runs, but R@K still is.
-# REWARD_CONTRASTIVE=0 reverts to the raw positive score.
-REWARD_CONTRASTIVE=${REWARD_CONTRASTIVE:-1}
-MARGIN_BETA=${MARGIN_BETA:-1.0}
+# LOG_MARGIN_CEILING settles it in this run's own log: cmargin is the identical
+# statistic on GROUND-TRUTH pairs. If margin tracks cmargin, the negative number
+# was the max-statistic and means nothing. If cmargin sits well above margin, the
+# generations really are generic and this reward is doing its job. Read it in the
+# first few step lines. The reward changed scale, so reward curves are NOT
+# comparable to earlier runs — R@K/mAP still are.
+REWARD_CONTRASTIVE=1
+MARGIN_BETA=1.0
+LOG_MARGIN_CEILING=1
 
-NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))
-# RL rollouts are embarrassingly parallel: each rank draws its own prompts, so the
-# effective GRPO batch scales with NRANKS (more nodes -> larger, lower-variance
-# batch, better cold-start exploration). Wall time per step is floored by the
-# serial generation latency, not node count.
-
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
-export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-# text2protein decoder: ProtGPT3-112M-dpo (Mixtral MoE). Both encoders are also
-# loaded (text source memory + protein reward re-encode), staged under MODELS_DIR.
-export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
-export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
-export MASTER_PORT=29504
-export OMP_NUM_THREADS=8
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-# Route the rank/KVS exchange over MPI (PMIx), not oneCCL's internal TCP KVS —
-# the internal single-rendezvous KVS overruns at O(1000s) of ranks. See
-# train_generation.pbs for the full rationale.
-export CCL_KVS_MODE=mpi
-export CCL_KVS_CONNECTION_TIMEOUT=600
-export FI_PROVIDER=cxi
-export CCL_ZE_IPC_EXCHANGE=pidfd
-
-source ~/bin/slack_notify.sh
-slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
-
-# The policy inherits its architecture (cross_attn_every, unfreeze, warm-start,
-# LoRA targets) from INIT_CKPT's metadata, so we don't repeat those flags here.
-# --unfreeze-lr only bites if INIT_CKPT had unfrozen blocks (then the decoder is
-# upcast to fp32 for stable updates). max-new-tokens 256 fits protein targets;
-# B=8 prompts x G=8 group = 64 rollouts/rank (halve --prompts-per-rank if OOM,
-# since the policy is fp32 and a fp32 KL reference is also resident).
-# --resume auto continues from the latest checkpoint in the output dir (fresh
-# start on the first run), so re-queuing this job after a wall-time kill picks up
-# where it left off. --steps is the TOTAL budget; INIT_CKPT stays the fixed KL
-# anchor across restarts.
-# --eval-every 200 runs the held-out round-trip metric (fixed 1000 val rows,
-# sharded across ranks) alongside each checkpoint -> checkpoints/.../rl_roundtrip.jsonl.
+# Held-out round-trip eval alongside each checkpoint -> <CKPT_DIR>/rl_roundtrip.jsonl.
 # The reward alone can't distinguish real conditioning from drift toward one
 # generic high-scoring output; the pooled R@K/mAP can. ~1 rollout of extra
 # generation per eval, so <1% of wall time at this cadence.
+EVAL_EVERY=200
+EVAL_SAMPLES=1000
+EVAL_MAX_NEW=${MAX_NEW_TOKENS}
+
+# Cold-start architecture. IGNORED when INIT_CKPT is set — a continued run takes
+# its architecture from the checkpoint's own header, so it cannot be reshaped.
+CROSS_ATTN_EVERY=1
+CROSS_ATTN_MODE=aligned
+UNFREEZE_TOP=2
+UNFREEZE_WHERE=top
+WARM_START_QALIGN=1
+
+# ===========================================================================
 REWARD_EXTRA=""
-[ "${REWARD_CONTRASTIVE}" = 1 ] && REWARD_EXTRA="--reward-contrastive \
-    --reward-margin-beta ${MARGIN_BETA} --log-margin-ceiling"
-
-echo "t2p RL: len_lambda=${LEN_LAMBDA} contrastive=${REWARD_CONTRASTIVE} \
-beta=${MARGIN_BETA} maxnew=${MAXNEW} ppr=${PPR}"
-
-mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
-    python -m src.train_rl --direction text2protein \
-    --retrieval-ckpt "${RCKPT}" --init-ckpt "${INIT_CKPT}" --device xpu \
-    --resume auto --steps 2000 --prompts-per-rank "${PPR}" --group-size 8 \
-    --max-new-tokens "${MAXNEW}" --temperature 1.0 --top-p 0.95 \
-    --lr 1e-5 --unfreeze-lr 2e-6 --kl-coef 0.05 \
-    --length-lambda "${LEN_LAMBDA}" --length-tolerance 0.25 \
-    --log-every 10 --save-every 200 ${REWARD_EXTRA} \
-    --eval-every 200 --eval-samples 1000 --eval-max-new-tokens "${MAXNEW}"
-
-rc=$?
-if [ $rc -eq 0 ]; then
-    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
-else
-    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
+if [ "${REWARD_CONTRASTIVE}" = 1 ]; then
+    REWARD_EXTRA="--reward-contrastive --reward-margin-beta ${MARGIN_BETA}"
+    [ "${LOG_MARGIN_CEILING}" = 1 ] && REWARD_EXTRA="${REWARD_EXTRA} --log-margin-ceiling"
 fi
-exit $rc
+
+# Warm vs cold start. --resume auto continues from the latest checkpoint in
+# CKPT_DIR (fresh start on the first run) either way, so re-queuing after a
+# wall-time kill picks up where it left off; INIT_CKPT stays the fixed KL anchor
+# across restarts.
+if [ -n "${INIT_CKPT}" ]; then
+    INIT_ARGS="--init-ckpt ${INIT_CKPT}"
+    START_MODE="warm (continuing SFT)"
+else
+    INIT_ARGS="--cross-attn-every ${CROSS_ATTN_EVERY} --cross-attn-mode ${CROSS_ATTN_MODE}"
+    INIT_ARGS="${INIT_ARGS} --unfreeze-top ${UNFREEZE_TOP} --unfreeze-where ${UNFREEZE_WHERE}"
+    [ "${WARM_START_QALIGN}" = 1 ] && INIT_ARGS="${INIT_ARGS} --warm-start-qalign"
+    START_MODE="COLD (no SFT checkpoint)"
+fi
+
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "text2protein RL (src.train_rl)" \
+    RETRIEVAL_CKPT INIT_CKPT CKPT_DIR START_MODE \
+    STEPS PROMPTS_PER_RANK GROUP_SIZE LR UNFREEZE_LR KL_COEF \
+    MAX_NEW_TOKENS TEMPERATURE TOP_P \
+    LENGTH_LAMBDA LENGTH_TOLERANCE \
+    REWARD_CONTRASTIVE MARGIN_BETA LOG_MARGIN_CEILING \
+    EVAL_EVERY EVAL_SAMPLES EVAL_MAX_NEW SAVE_EVERY LOG_EVERY \
+    CROSS_ATTN_EVERY CROSS_ATTN_MODE UNFREEZE_TOP UNFREEZE_WHERE WARM_START_QALIGN
+require_files RETRIEVAL_CKPT INIT_CKPT
+
+# RL rollouts are embarrassingly parallel: each rank draws its own prompts, so
+# the effective GRPO batch scales with NRANKS (more nodes -> larger,
+# lower-variance batch, better cold-start exploration). Wall time per step is
+# floored by the serial generation latency, not node count.
+"${MPI_LAUNCH[@]}" \
+    python -m src.train_rl --direction text2protein --device xpu \
+    --retrieval-ckpt "${RETRIEVAL_CKPT}" --ckpt-dir "${CKPT_DIR}" ${INIT_ARGS} \
+    --resume auto --steps "${STEPS}" \
+    --prompts-per-rank "${PROMPTS_PER_RANK}" --group-size "${GROUP_SIZE}" \
+    --max-new-tokens "${MAX_NEW_TOKENS}" \
+    --temperature "${TEMPERATURE}" --top-p "${TOP_P}" \
+    --lr "${LR}" --unfreeze-lr "${UNFREEZE_LR}" --kl-coef "${KL_COEF}" \
+    --length-lambda "${LENGTH_LAMBDA}" --length-tolerance "${LENGTH_TOLERANCE}" \
+    --log-every "${LOG_EVERY}" --save-every "${SAVE_EVERY}" ${REWARD_EXTRA} \
+    --eval-every "${EVAL_EVERY}" --eval-samples "${EVAL_SAMPLES}" \
+    --eval-max-new-tokens "${EVAL_MAX_NEW}"
+
+finish $?

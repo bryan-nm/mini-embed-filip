@@ -2,15 +2,18 @@
 
 Both heads are position-wise (no token mixing inside the head). The encoder
 already did the contextualization; the heads' job is to map between encoder
-hidden space and the 64-d shared space.
+hidden space and the shared space, whose width is `ModelCfg.embed_dim`.
 
 Projection head:
-    d_in (768 or 960) -> d_hidden -> d_mid -> d_out (64)
+    d_in (768 or 960) -> d_hidden -> d_mid -> d_out (embed_dim)
     Linear, LayerNorm, GELU, Dropout. Output L2-normalized along the last dim.
 
 Expansion head:
-    d_out (64) -> d_mid -> d_hidden -> d_in (768 or 960)
+    embed_dim -> d_mid -> d_hidden -> d_in (768 or 960)
     Mirrored architecture; separate weights. Output NOT normalized.
+
+No dimension is defaulted here: every caller passes the config's values, so a
+sweep over embed_dim cannot silently pick up a stale constant.
 
 The reconstruction loop expand(project(h)) ~= h ties them together via an
 auxiliary MSE term during retrieval training; see losses.py.
@@ -33,10 +36,10 @@ class ProjectionHead(nn.Module):
     def __init__(
         self,
         d_in: int,
-        d_hidden: int = 512,
-        d_mid: int = 256,
-        d_out: int = 32,
-        dropout: float = 0.1,
+        d_hidden: int,
+        d_mid: int,
+        d_out: int,
+        dropout: float,
     ):
         super().__init__()
         self.fc1 = nn.Linear(d_in, d_hidden)
@@ -68,7 +71,7 @@ class ProjectionHead(nn.Module):
 
 
 class ExpansionHead(nn.Module):
-    """d_in (32) -> d_mid -> d_hidden -> d_out, mirroring ProjectionHead.
+    """d_in (embed_dim) -> d_mid -> d_hidden -> d_out, mirroring ProjectionHead.
 
     Separate weights from the corresponding projection (not weight-tied).
     Output not normalized; the consumer (decoder cross-attention) operates in
@@ -77,11 +80,11 @@ class ExpansionHead(nn.Module):
 
     def __init__(
         self,
-        d_in: int = 32,
-        d_mid: int = 256,
-        d_hidden: int = 512,
-        d_out: int = 768,
-        dropout: float = 0.1,
+        d_in: int,
+        d_mid: int,
+        d_hidden: int,
+        d_out: int,
+        dropout: float,
     ):
         super().__init__()
         self.fc1 = nn.Linear(d_in, d_mid)
@@ -104,45 +107,8 @@ class ExpansionHead(nn.Module):
         return x
 
 
-class MemoryMap(nn.Module):
-    """Cross-modal residual map g: embed_dim -> embed_dim in the shared space.
-
-    Nudges a source token's aligned projection toward the *target* modality's
-    region of the shared space (text->protein for text2protein), so the decoder
-    conditions on a protein-ward object instead of a text-ward one. Applied
-    per-token; the L_t token structure (and thus the interpretable FILIP array) is
-    preserved.
-
-    The final layer is zero-initialized and the input is unit-norm, so at init
-    g(z) = normalize(z) = z — an exact identity. Training (the frozen map phase)
-    moves it off identity. Output is re-normalized so it stays a citizen of the
-    unit-sphere aligned space (matching ProjectionHead's normalized output), which
-    both the FILIP-contrastive aux and the aligned-mode cross-attention rely on.
-    """
-
-    def __init__(self, dim: int, hidden: int, dropout: float = 0.0):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, hidden)
-        self.norm = nn.LayerNorm(hidden)
-        self.fc2 = nn.Linear(hidden, dim)
-        self.drop = nn.Dropout(dropout)
-        self.act = nn.GELU()
-        nn.init.zeros_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        d = self.fc2(self.drop(self.norm(self.act(self.fc1(z)))))
-        return F.normalize(z + d, p=2, dim=-1)
-
-
 class MiniEmbedFilip(nn.Module):
-    """Full trainable retrieval model: projection + expansion heads + temperature.
-
-    When `with_maps` is set it also holds the two cross-modal memory maps
-    (text_map, protein_map). They are absent by default so retrieval /
-    reconstruction checkpoints are byte-identical to before; the map phase and the
-    generation paths that use --memory-map opt in.
-    """
+    """Full trainable retrieval model: projection + expansion heads + temperature."""
 
     def __init__(
         self,
@@ -157,8 +123,6 @@ class MiniEmbedFilip(nn.Module):
         expand_dropout: float,
         init_temperature: float,
         max_temperature: float,
-        with_maps: bool = False,
-        map_hidden: int = 128,
     ):
         super().__init__()
         self.text_proj = ProjectionHead(
@@ -174,28 +138,9 @@ class MiniEmbedFilip(nn.Module):
             embed_dim, expand_d_mid, expand_d_hidden, protein_hidden, expand_dropout
         )
 
-        self.with_maps = with_maps
-        if with_maps:
-            self.text_map = MemoryMap(embed_dim, map_hidden, proj_dropout)
-            self.protein_map = MemoryMap(embed_dim, map_hidden, proj_dropout)
-
         init_logit_scale = math.log(1.0 / init_temperature)
         self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale, dtype=torch.float32))
         self.max_logit_scale = math.log(max_temperature)
-
-    def map_source(self, z: torch.Tensor, direction: str) -> torch.Tensor:
-        """Apply the cross-modal map for a generation direction's SOURCE side.
-
-        text2protein conditions on text -> text_map (text->protein-ward);
-        protein2text conditions on protein -> protein_map. Raises if the maps were
-        not built (with_maps=False), so a --memory-map run fails loudly against a
-        map-less checkpoint rather than silently conditioning on the raw z.
-        """
-        if not self.with_maps:
-            raise RuntimeError(
-                "map_source called but this model was built with_maps=False "
-                "(no trained memory map in the checkpoint; run train_memory_map)")
-        return self.text_map(z) if direction == "text2protein" else self.protein_map(z)
 
     @torch.no_grad()
     def set_feature_means(self, mean_p: torch.Tensor | None = None,
@@ -237,3 +182,50 @@ class MiniEmbedFilip(nn.Module):
     def clamp_temperature(self) -> None:
         with torch.no_grad():
             self.logit_scale.clamp_(max=self.max_logit_scale)
+
+
+# ---------------------------------------------------------------------------
+# Construction / checkpoint loading
+# ---------------------------------------------------------------------------
+# Every phase needs the same model built from the same eleven config fields, and
+# most of them need it loaded frozen from a checkpoint. These two are the single
+# place that knows how — a shape or a field added to MiniEmbedFilip is a one-line
+# change here rather than a seven-file sweep.
+def build_retrieval(cfg=None) -> "MiniEmbedFilip":
+    """Build an untrained retrieval model from a `Cfg` (default: `default_cfg()`)."""
+    if cfg is None:
+        from config import default_cfg
+        cfg = default_cfg()
+    return MiniEmbedFilip(
+        text_hidden=cfg.model.text_hidden,
+        protein_hidden=cfg.model.protein_hidden,
+        proj_d_hidden=cfg.model.proj_d_hidden,
+        proj_d_mid=cfg.model.proj_d_mid,
+        embed_dim=cfg.model.embed_dim,
+        proj_dropout=cfg.model.proj_dropout,
+        expand_d_mid=cfg.model.expand_d_mid,
+        expand_d_hidden=cfg.model.expand_d_hidden,
+        expand_dropout=cfg.model.expand_dropout,
+        init_temperature=cfg.retrieval.init_temperature,
+        max_temperature=cfg.retrieval.max_temperature,
+    )
+
+
+def load_retrieval(ckpt_path: str, device, cfg=None,
+                   *, freeze: bool = True) -> "MiniEmbedFilip":
+    """Load a `train_retrieval`-format checkpoint ({"epoch", "model_state", ...}).
+
+    `freeze` (the default) also puts the model in eval mode and clears
+    requires_grad — what every downstream consumer wants, since generation,
+    inference and the round-trip eval all treat the retrieval heads as fixed.
+    Pass `freeze=False` to keep training it (the hard-negative phase).
+    """
+    m = build_retrieval(cfg)
+    state = torch.load(ckpt_path, map_location="cpu")
+    m.load_state_dict(state["model_state"])
+    m.to(device)
+    if freeze:
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+    return m

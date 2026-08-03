@@ -6,9 +6,7 @@ generates `--num-outputs` protein sequences per accession. Each output is the
 winner of an independent best-of-`--num-candidates` round: sample N candidates
 from the decoder, re-encode them with the protein encoder, and keep the one with
 the best contrastive round-trip margin against the source caption (see
-src/best_of_n.py). Candidate diversity comes purely from sampling temperature —
-no CVAE (a decoder checkpoint carrying `cvae_state` is rejected, since dropping
-its latent tokens would not match how it was trained).
+src/best_of_n.py). Candidate diversity comes purely from sampling temperature.
 
 Writes one CSV row per generated sequence: accession, prompt (the caption used),
 the true protein it was paired with, and the generated sequence. Rows are
@@ -40,15 +38,17 @@ from config import default_cfg
 from src.best_of_n import pad_stack, select_best_of_n
 from src.data import load_pairs
 from src.decoder_adapters import (
-    LoRACfg, decode_target, load_decoder_with_cross_attn,
+    decode_target, load_decoder_with_cross_attn,
     set_cross_memory, clear_cross_memory, target_prefix_ids,
 )
 from src.encoders import (
     encode_protein_batch, encode_text_batch,
     load_protein_encoder, load_text_encoder,
 )
-from src.generate import load_retrieval, pick_device
+from src.gen_ckpt import load_generation_ckpt
+from src.generate import pick_device
 from src.inspect import lookup_pairs_in_csv
+from src.model import load_retrieval
 
 
 def build_panel(cfg, args, enc_text, text_proj, device, exclude: set):
@@ -101,12 +101,16 @@ def main() -> None:
                     help="reference captions sampled from --panel-csv for margin selection")
     ap.add_argument("--panel-csv", default=None,
                     help="defaults to --csv")
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                    help="default: cfg.data.max_protein_tokens (this script is "
+                         "text2protein only), so a bare run never truncates")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
     args = ap.parse_args()
+    if args.max_new_tokens is None:
+        args.max_new_tokens = cfg.data.max_protein_tokens
     if args.panel_csv is None:
         args.panel_csv = args.csv
     N = max(args.num_candidates, 1)
@@ -130,18 +134,10 @@ def main() -> None:
           f"(selection={args.selection}) on {device}", flush=True)
 
     # --- models: decoder architecture flags come from the ckpt, as elsewhere ---
-    ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
-    if "cvae_state" in ckpt:
-        raise SystemExit(
-            f"{args.decoder_ckpt} was trained with a CVAE (cvae_state present); "
-            "this script conditions without latent tokens. Use src.generate / "
-            "src.roundtrip_eval for CVAE checkpoints.")
-    cae = ckpt.get("cross_attn_every", cfg.generation.cross_attn_every)
-    aligned_mem = ckpt.get("memory_space", "expanded") == "aligned"
-    memory_map = ckpt.get("memory_map", False)
-    cross_attn_mode = ckpt.get("cross_attn_mode", "head")
+    ckpt, meta = load_generation_ckpt(args.decoder_ckpt)
+    print(f"[gen-set] decoder ckpt architecture: {meta.describe()}", flush=True)
 
-    retrieval = load_retrieval(args.retrieval_ckpt, device, with_maps=memory_map)
+    retrieval = load_retrieval(args.retrieval_ckpt, device, cfg)
     text_model, text_tok = load_text_encoder(
         cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
     prot_model, prot_tok = load_protein_encoder(cfg.model.protein_encoder_path, device)
@@ -154,16 +150,10 @@ def main() -> None:
         return encode_protein_batch(prot_model, prot_tok, strs, device,
                                     cfg.data.max_protein_tokens)
 
-    lora_cfg = LoRACfg(
-        rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
-        dropout=cfg.generation.lora_dropout,
-        target_self_attn=ckpt.get("lora_targets_self_attn", True),
-        target_ffn=ckpt.get("lora_targets_ffn", True),
-    )
-    mem_dim = cfg.model.embed_dim if aligned_mem else cfg.model.text_hidden
     decoder, dtok, adapters = load_decoder_with_cross_attn(
-        "text2protein", cfg.generation.decoder_path, cae, mem_dim, lora_cfg,
-        device, cross_attn_mode=cross_attn_mode,
+        "text2protein", cfg.generation.decoder_path, meta.cross_attn_every,
+        meta.mem_dim(cfg, "text2protein"), device,
+        cross_attn_mode=meta.cross_attn_mode,
     )
     decoder.load_state_dict(ckpt["adapter_state"], strict=False)
     decoder.eval()
@@ -188,15 +178,10 @@ def main() -> None:
         for k, (acc, true_prot, caption) in enumerate(worklist):
             # Caption -> embed_dim -> cross-attn memory, matching the ckpt's
             # memory_space ("expanded" lifts back to encoder-hidden space;
-            # "aligned" conditions on the projection, optionally memory-mapped).
+            # "aligned" conditions on the projection directly).
             h_src, m_src = enc_text([caption])
-            z_src = retrieval.text_proj(h_src.float())          # [1, L, 32]
-            if not aligned_mem:
-                mem = retrieval.text_expand(z_src)
-            elif memory_map:
-                mem = retrieval.map_source(z_src, "text2protein")
-            else:
-                mem = z_src
+            z_src = retrieval.text_proj(h_src.float())          # [1, L, embed_dim]
+            mem = z_src if meta.aligned_memory else retrieval.text_expand(z_src)
             mem_b = mem.expand(N, -1, -1).contiguous()
             mask_b = m_src.expand(N, -1).contiguous()
             zs, ms = pad_stack([z_src[0][m_src[0]].float().cpu()],

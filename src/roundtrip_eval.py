@@ -50,10 +50,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
 from src.best_of_n import pad_stack, select_best_of_n
-from src.cvae import load_cvae
 from src.data import group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
-    LoRACfg, decode_target, load_decoder_with_cross_attn, set_cross_memory,
+    decode_target, load_decoder_with_cross_attn, set_cross_memory,
     clear_cross_memory, target_prefix_ids,
 )
 from src.dist import init_distributed, barrier, cleanup
@@ -62,8 +61,9 @@ from src.encoders import (
     load_protein_encoder, load_text_encoder,
 )
 from src.evaluate import average_precision
-from src.losses import filip_score_matrix_chunked, masked_mean
-from src.model import MiniEmbedFilip
+from src.gen_ckpt import load_generation_ckpt
+from src.losses import filip_score_matrix_chunked
+from src.model import load_retrieval
 
 
 _AA_ONLY = re.compile(r"[^A-Z]")
@@ -77,34 +77,6 @@ def _shard_range(n: int, rank: int, world: int) -> tuple[int, int]:
 
 def _target_is_protein(direction: str) -> bool:
     return direction == "text2protein"
-
-
-def load_retrieval(ckpt_path: str, device, with_maps: bool = False) -> MiniEmbedFilip:
-    cfg = default_cfg()
-    m = MiniEmbedFilip(
-        text_hidden=cfg.model.text_hidden, protein_hidden=cfg.model.protein_hidden,
-        proj_d_hidden=cfg.model.proj_d_hidden, proj_d_mid=cfg.model.proj_d_mid,
-        embed_dim=cfg.model.embed_dim, proj_dropout=cfg.model.proj_dropout,
-        expand_d_mid=cfg.model.expand_d_mid, expand_d_hidden=cfg.model.expand_d_hidden,
-        expand_dropout=cfg.model.expand_dropout,
-        init_temperature=cfg.retrieval.init_temperature,
-        max_temperature=cfg.retrieval.max_temperature,
-        with_maps=with_maps, map_hidden=cfg.model.map_hidden,
-    )
-    state = torch.load(ckpt_path, map_location="cpu")
-    missing, unexpected = m.load_state_dict(state["model_state"], strict=False)
-    is_map = lambda k: k.startswith("text_map.") or k.startswith("protein_map.")
-    bad = [k for k in missing if not is_map(k)] + [k for k in unexpected if not is_map(k)]
-    if bad:
-        raise RuntimeError(f"retrieval load mismatch (non-map keys): {bad}")
-    if with_maps and any(is_map(k) for k in missing):
-        raise RuntimeError(
-            f"--memory-map decoder ckpt but retrieval ckpt {ckpt_path} has no trained "
-            f"memory map (run train_memory_map)")
-    m.eval().to(device)
-    for p in m.parameters():
-        p.requires_grad_(False)
-    return m
 
 
 # ---------------------------------------------------------------------------
@@ -123,48 +95,29 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
               f"direction={args.direction}", flush=True)
     print(f"[rt][rank {env.rank}] generating {len(my)} outputs on {device}", flush=True)
 
-    # Decoder identity depends on direction (no models needed yet). hidden_mem_dim
-    # is the "expanded" memory width; the actual mem_dim also depends on the ckpt's
-    # memory_space and is resolved once the ckpt is loaded below.
-    if _target_is_protein(args.direction):
-        decoder_path, hidden_mem_dim = cfg.generation.decoder_path, cfg.model.text_hidden
-    else:
-        decoder_path, hidden_mem_dim = TEXT_DECODER_PATH, cfg.model.protein_hidden
+    decoder_path = (cfg.generation.decoder_path if _target_is_protein(args.direction)
+                    else TEXT_DECODER_PATH)
 
     # Rank-0-first model load (trust_remote_code module-cache race for ProGen2).
+    # The decoder is rebuilt from the checkpoint's own GenMeta header, so adapter
+    # counts, k/v dims and scoring space line up with what it was trained as.
     def _load_models():
-        # Build the decoder with the SAME cross_attn_every, memory_space, memory_map
-        # AND cross_attn_mode the ckpt was trained with (all stored in it), so adapter
-        # counts, k/v dims, retrieval maps, and scoring space line up. All default to
-        # the pre-flag values for older checkpoints.
-        ck = torch.load(args.decoder_ckpt, map_location="cpu")
-        cae = ck.get("cross_attn_every", args.cross_attn_every)
-        aligned = ck.get("memory_space", "expanded") == "aligned"
-        memory_map = ck.get("memory_map", False)
-        cross_attn_mode = ck.get("cross_attn_mode", "head")
-        retr = load_retrieval(args.retrieval_ckpt, device, with_maps=memory_map)
+        ck, meta = load_generation_ckpt(args.decoder_ckpt)
+        retr = load_retrieval(args.retrieval_ckpt, device)
         tmodel, ttok = load_text_encoder(
             cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         pmodel, ptok = load_protein_encoder(cfg.model.protein_encoder_path, device)
-        # LoRA targeting must match training (--no-lora ckpts have no LoRA modules).
-        lora_cfg = LoRACfg(
-            rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
-            dropout=cfg.generation.lora_dropout,
-            target_self_attn=ck.get("lora_targets_self_attn", True),
-            target_ffn=ck.get("lora_targets_ffn", True),
-        )
-        mem_dim = cfg.model.embed_dim if aligned else hidden_mem_dim
         dec, dtok, adapters = load_decoder_with_cross_attn(
-            args.direction, decoder_path, cae, mem_dim, lora_cfg, device,
-            cross_attn_mode=cross_attn_mode,
+            args.direction, decoder_path, meta.cross_attn_every,
+            meta.mem_dim(cfg, args.direction), device,
+            cross_attn_mode=meta.cross_attn_mode,
         )
         dec.load_state_dict(ck["adapter_state"], strict=False)
         dec.eval()
-        cvae = load_cvae(ck, cfg.model.embed_dim, device)   # None if pre-CVAE ckpt
         if dtok.pad_token is None:
             dtok.pad_token = dtok.eos_token
         dtok.padding_side = "left"   # correct for batched decoder generation
-        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, cvae, aligned, memory_map
+        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, meta
 
     if env.is_main:
         models = _load_models()
@@ -172,10 +125,9 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
     if not env.is_main:
         models = _load_models()
     (retrieval, text_model, text_tok, prot_model, prot_tok, decoder, dtok,
-     adapters, cvae, aligned_mem, memory_map) = models
-    if env.is_main and cvae is not None:
-        print(f"[rt] CVAE conditioning enabled (latent_tokens={cvae.cfg.n_latent_tokens})",
-              flush=True)
+     adapters, meta) = models
+    if env.is_main:
+        print(f"[rt] decoder ckpt architecture: {meta.describe()}", flush=True)
 
     # Direction-specific encode/project handles (source = conditioning input,
     # target = generated modality).
@@ -230,29 +182,16 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         B = len(chunk)
 
         # Source -> embed_dim retrieval candidate + cross-attn memory. "aligned"
-        # conditions on the projection directly (optionally through the frozen
-        # memory map); "expanded" lifts it back to encoder-hidden space.
+        # conditions on the projection directly; "expanded" lifts it back to
+        # encoder-hidden space.
         h_src, mask_src = enc_src(srcs)
         z_src = src_proj(h_src.float())
-        if not aligned_mem:
-            mem = src_expand(z_src)
-        elif memory_map:
-            mem = retrieval.map_source(z_src, args.direction)
-        else:
-            mem = z_src
+        mem = z_src if meta.aligned_memory else src_expand(z_src)
 
-        # N candidates per source: replicate the memory, add N latent samples
-        # (CVAE) for structured diversity; temperature supplies the rest.
+        # N candidates per source: replicate the memory; temperature supplies the
+        # diversity.
         mem_b = mem.repeat_interleave(N, dim=0)
         mask_b = mask_src.repeat_interleave(N, dim=0)
-        if cvae is not None:
-            z_src_pool = masked_mean(z_src, mask_src)
-            w = cvae.sample_prior(z_src_pool.repeat_interleave(N, dim=0))
-            mem_b = torch.cat([mem_b, cvae.latent_tokens(w)], dim=1)
-            kmask = torch.ones(mem_b.size(0), cvae.cfg.n_latent_tokens,
-                               dtype=torch.bool, device=device)
-            mask_b = torch.cat([mask_b, kmask], dim=1)
-
         set_cross_memory(adapters, mem_b, mask_b)
         input_ids = torch.tensor([prompt] * (B * N), device=device, dtype=torch.long)
         gen = decoder.generate(
@@ -305,20 +244,6 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
 # ---------------------------------------------------------------------------
 # Scoring phase (one rank): merge shards -> FILIP retrieval -> outputs
 # ---------------------------------------------------------------------------
-def _pad_stack(seqs, dim):
-    """List of [l, dim] -> ([N, Lmax, dim], bool mask [N, Lmax])."""
-    n = len(seqs)
-    lmax = max(max((t.size(0) for t in seqs), default=1), 1)
-    out = torch.zeros(n, lmax, dim)
-    mask = torch.zeros(n, lmax, dtype=torch.bool)
-    for i, t in enumerate(seqs):
-        l = t.size(0)
-        if l:
-            out[i, :l] = t
-            mask[i, :l] = True
-    return out, mask
-
-
 def rng_snapshot(device):
     """Save CPU + accelerator RNG so an in-loop eval's sampling doesn't perturb
     the training stream. Without this, turning the eval on (or changing its
@@ -355,11 +280,10 @@ def grouped_recall(S: torch.Tensor, groups: torch.Tensor, ks):
 
     S [Nq, Nc] with query i and candidate i index-aligned. `groups` [N] holds
     each row's accession id; EVERY candidate sharing the query's accession is a
-    positive. With the augmented corpus a protein has ~8.87 captions, so a
-    generated protein that re-embeds onto a *sibling* caption of its own source
-    protein must count as a hit, not a miss (and duplicate proteins on the
-    protein2text source side likewise). Reports the rank of the best-scoring
-    positive. When every accession is unique this reduces to diagonal recall.
+    positive, so a generated output re-embedding onto another row of its own
+    source protein counts as a hit rather than a miss. At one caption per
+    accession this reduces to diagonal recall; it stays multi-positive so a
+    multi-caption corpus is scored correctly without a code change.
 
     mAP reuses `src.evaluate.average_precision` — the same ProTrek AP definition
     retrieval training reports — over the same multi-positive relevance set used
@@ -377,6 +301,91 @@ def grouped_recall(S: torch.Tensor, groups: torch.Tensor, ks):
     out["median_rank"] = float(ranks.median().item())
     out["mean_pos_score"] = float(best_pos.mean().item())
     return out, ranks
+
+
+# ---------------------------------------------------------------------------
+# In-loop round-trip: the generate -> re-encode -> record half
+# ---------------------------------------------------------------------------
+# `train_generation` and `train_rl` both run this metric inside their training
+# loop, and they used to carry a copy each. The copies drifted (one guarded a
+# missing R@10, the other crashed on it), so the shared piece lives here next to
+# the scorer it feeds. The two callers still differ in where the SOURCE comes
+# from — a packed-cache DataLoader for SFT, live encoder calls for RL — so that
+# stays theirs: they hand this an iterable of already-projected source batches.
+@torch.no_grad()
+def generate_roundtrip_records(
+    core, tokenizer, adapters, batches, *,
+    prompt, pad_id, eos_id, tgt_proj, encode_generated, empty_target,
+    max_new_tokens: int, temperature: float, top_p: float,
+):
+    """Generate free-running from each batch's memory and build round-trip records.
+
+    `batches` yields dicts with:
+        z_src      [B, L, D] aligned source projection (also the retrieval query)
+        mem        [B, L, D] cross-attention memory (aligned z, or expanded)
+        mask_src   [B, L] bool
+        uids       list[str] of length B
+        z_true     [B, Lt, D] optional — the true target's projection (ceiling row)
+        mask_true  [B, Lt] bool, required when z_true is given
+
+    Returns (records, gen_body_lens). Each record holds the fp16 CPU per-token
+    embeddings the scorer needs; `gen_body_lens` is the generated body length in
+    decoder tokens (prompt and EOS excluded), which catches a length distribution
+    collapsing onto the cap — invisible in CE, obvious here.
+    """
+    recs, gen_lens = [], []
+    for batch in batches:
+        z_src, mem, mask_src = batch["z_src"], batch["mem"], batch["mask_src"]
+        B = z_src.size(0)
+
+        set_cross_memory(adapters, mem, batch.get("mem_mask", mask_src))
+        input_ids = torch.tensor([prompt] * B, device=z_src.device, dtype=torch.long)
+        # use_cache=True explicitly: a checkpointed trainer sets config.use_cache
+        # False, and generating without a KV cache costs more than the epoch this
+        # is measuring.
+        gen = core.generate(
+            input_ids, max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0, temperature=max(temperature, 1e-6),
+            top_p=top_p, pad_token_id=pad_id, use_cache=True)
+        clear_cross_memory(adapters)
+
+        gen_strs = [decode_target(core, tokenizer, row) for row in gen]
+        h_gen, m_gen = encode_generated(
+            [g if g.strip() else empty_target for g in gen_strs])
+        z_gen = tgt_proj(h_gen.float())
+
+        # Body length: tokens before the first EOS, or the whole tail if none.
+        tail = gen[:, len(prompt):]
+        is_eos = tail == eos_id
+        hit = is_eos.any(dim=1)
+        first_eos = torch.where(
+            hit, is_eos.float().argmax(dim=1).long(),
+            torch.full((tail.size(0),), tail.size(1), device=tail.device,
+                       dtype=torch.long))
+        gen_lens.extend(first_eos.cpu().tolist())
+
+        # fp16 on the wire: every rank receives the whole pool in the gather.
+        for b in range(B):
+            rec = {"uid": batch["uids"][b],
+                   "z_gen": z_gen[b][m_gen[b]].half().cpu(),
+                   "z_src": z_src[b][mask_src[b]].half().cpu()}
+            if batch.get("z_true") is not None:
+                rec["z_true"] = batch["z_true"][b][batch["mask_true"][b]].half().cpu()
+            recs.append(rec)
+    return recs, gen_lens
+
+
+def gather_roundtrip_payloads(payload: dict, env) -> list:
+    """All-gather one rank's eval payload; returns the per-rank list.
+
+    Every rank receives every payload, so callers can agree on a decision (e.g.
+    "some rank failed, disable the eval") without a second collective.
+    """
+    if env.distributed and torch.distributed.is_initialized():
+        parts = [None] * env.world_size
+        torch.distributed.all_gather_object(parts, payload)
+        return parts
+    return [payload]
 
 
 @torch.no_grad()
@@ -428,8 +437,8 @@ def score_and_write(args, device) -> None:
     n = len(recs)
     print(f"[rt][score] merged {n} records from {len(shards)} shards", flush=True)
 
-    Z_gen, mask_gen = _pad_stack([r["z_gen"] for r in recs], embed_dim)
-    Z_src, mask_src = _pad_stack([r["z_src"] for r in recs], embed_dim)
+    Z_gen, mask_gen = pad_stack([r["z_gen"] for r in recs], embed_dim)
+    Z_src, mask_src = pad_stack([r["z_src"] for r in recs], embed_dim)
     Z_gen, mask_gen = Z_gen.to(device), mask_gen.to(device)
     Z_src, mask_src = Z_src.to(device), mask_src.to(device)
 
@@ -448,7 +457,7 @@ def score_and_write(args, device) -> None:
     src2gen, _ = grouped_recall(S.t().contiguous(), groups, ks)   # source -> its generated target
 
     # Ceiling: true targets -> sources, same scorer/candidate set.
-    Z_true, mask_true = _pad_stack([r["z_true"] for r in recs], embed_dim)
+    Z_true, mask_true = pad_stack([r["z_true"] for r in recs], embed_dim)
     S_true = filip_score_matrix_chunked(Z_true.to(device), Z_src, mask_true.to(device),
                                         mask_src, chunk_rows=args.filip_chunk_rows)
     ceiling, _ = grouped_recall(S_true, groups, ks)
@@ -509,14 +518,16 @@ def main() -> None:
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--shards-dir", default=None)
     ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every)
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                    help="default: the config cap for the GENERATED modality, so the "
+                         "round-trip never scores a truncated output against a whole source")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--filip-chunk-rows", type=int, default=8)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=cfg.data.seed)
-    # Best-of-N (Feature 3): generate N per source, keep the best round-trip margin.
+    # Best-of-N: generate N per source, keep the best round-trip margin.
     ap.add_argument("--num-candidates", type=int, default=1)
     ap.add_argument("--selection", choices=["margin", "pos"], default="margin")
     ap.add_argument("--panel-size", type=int, default=256,
@@ -524,6 +535,10 @@ def main() -> None:
     ap.add_argument("--score-only", action="store_true",
                     help="skip generation; merge+score existing shards (single process)")
     args = ap.parse_args()
+    if args.max_new_tokens is None:
+        args.max_new_tokens = (cfg.data.max_protein_tokens
+                               if _target_is_protein(args.direction)
+                               else cfg.data.max_text_tokens)
     if args.out_dir is None:
         args.out_dir = str(Path(cfg.generation.ckpt_dir).parent.parent / "eval" / args.direction)
     if args.shards_dir is None:
@@ -547,10 +562,9 @@ def main() -> None:
     splits = load_splits(str(Path(args.cache_dir) / "splits.json"))
     sel = list(splits[args.split])
     if not _target_is_protein(args.direction):
-        # protein2text: the source (protein) is identical across a protein's
-        # ~8.87 captions, so generation would repeat per sibling. Keep one row
-        # per protein. (text2protein keeps all caption rows; siblings are scored
-        # as positives by the accession-grouped recall.)
+        # protein2text: the source is the protein, so on a multi-caption corpus
+        # generation would repeat once per caption of it. Keep one row per
+        # protein. A no-op at one caption per accession.
         seen, dedup = set(), []
         for i in sel:
             a = pairs[i].uid

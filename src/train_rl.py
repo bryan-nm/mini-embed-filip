@@ -57,18 +57,27 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import default_cfg, TEXT_DECODER_PATH
 from src.data import dense_group_ids, group_ids_from_accessions, load_pairs, load_splits
 from src.decoder_adapters import (
-    LoRACfg, clear_cross_memory, count_trainable, decode_target,
+    clear_cross_memory, count_trainable, decode_target,
     load_decoder_with_cross_attn, set_cross_memory, target_prefix_ids,
-    unfreeze_decoder_blocks,
+    unfreeze_decoder_blocks, warm_start_q_align,
 )
 from src.dist import barrier, cleanup, init_distributed
+from src.encoders import (
+    encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
+)
+from src.gen_ckpt import GenMeta
+from src.losses import filip_score_matrix_chunked
+from src.model import load_retrieval
+from src.roundtrip_eval import (
+    gather_roundtrip_payloads, generate_roundtrip_records, rng_restore, rng_snapshot,
+    score_roundtrip_records,
+)
 
 
 def _dev_sync(device) -> None:
@@ -79,13 +88,6 @@ def _dev_sync(device) -> None:
         torch.xpu.synchronize()
     elif device.type == "cuda":
         torch.cuda.synchronize()
-from src.encoders import (
-    encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
-)
-from src.losses import filip_score_matrix_chunked
-from src.roundtrip_eval import (
-    load_retrieval, rng_restore, rng_snapshot, score_roundtrip_records,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -141,40 +143,43 @@ def _token_logprobs(logits: torch.Tensor, seqs: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Model loading — mirror the SFT checkpoint's architecture so the policy IS the
-# SFT model, continued. Also builds a frozen reference copy for the KL penalty.
+# Policy construction — either continued from an SFT checkpoint or cold-started
 # ---------------------------------------------------------------------------
-def _build_decoder_from_ckpt(direction, decoder_path, ck, cfg, device):
-    """Construct a decoder+adapters matching the flags stored in the SFT ckpt and
-    load its adapter_state. Returns (decoder, tokenizer, adapters, meta)."""
-    meta = {
-        "cross_attn_every": ck.get("cross_attn_every", cfg.generation.cross_attn_every),
-        "memory_space": ck.get("memory_space", "expanded"),
-        "memory_map": ck.get("memory_map", False),
-        "cross_attn_mode": ck.get("cross_attn_mode", "head"),
-        "unfreeze_top": ck.get("unfreeze_top", 0),
-        "unfreeze_where": ck.get("unfreeze_where", "top"),
-        "warm_start_qalign": ck.get("warm_start_qalign", False),
-        "lora_targets_self_attn": ck.get("lora_targets_self_attn", True),
-        "lora_targets_ffn": ck.get("lora_targets_ffn", True),
-    }
-    if meta["memory_space"] != "aligned":
-        raise SystemExit("train_rl currently supports --memory-space aligned checkpoints only")
-    lora_cfg = LoRACfg(
-        rank=cfg.generation.lora_rank, alpha=cfg.generation.lora_alpha,
-        dropout=cfg.generation.lora_dropout,
-        target_self_attn=meta["lora_targets_self_attn"],
-        target_ffn=meta["lora_targets_ffn"],
-    )
-    mem_dim = cfg.model.embed_dim   # aligned
+def _build_policy(direction, decoder_path, meta: GenMeta, cfg, device,
+                  adapter_state=None, tgt_proj=None):
+    """Build the decoder + cross-attention adapters this RL run trains.
+
+    `adapter_state` (from an SFT checkpoint) continues supervised fine-tuning;
+    omitting it COLD-STARTS the policy — freshly-initialized adapters on the
+    frozen decoder, so RL is the only thing that ever shapes the conditioning.
+    That is a legitimate configuration, not a degenerate one: `o_proj` is
+    zero-initialized, so the policy simply starts as the decoder's unconditional
+    prior and the reward gradient opens the adapter from there. It just starts
+    much further back than a warm SFT policy, so expect a longer flat stretch
+    before the round-trip curve moves.
+
+    `tgt_proj` enables the aligned-mode q_align warm start (meta.warm_start_qalign),
+    which is worth much more on a cold start than on a warm one — it is the only
+    thing putting the decoder-side query in the right region of the shared space
+    before any gradient arrives.
+
+    Returns (decoder, tokenizer, adapters).
+    """
+    if not meta.aligned_memory:
+        raise SystemExit("train_rl supports memory_space='aligned' only")
     dec, dtok, adapters = load_decoder_with_cross_attn(
-        direction, decoder_path, meta["cross_attn_every"], mem_dim, lora_cfg, device,
-        cross_attn_mode=meta["cross_attn_mode"],
+        direction, decoder_path, meta.cross_attn_every, meta.mem_dim(cfg, direction),
+        device, cross_attn_mode=meta.cross_attn_mode,
     )
-    dec.load_state_dict(ck["adapter_state"], strict=False)
+    if adapter_state is not None:
+        _, unexpected = dec.load_state_dict(adapter_state, strict=False)
+        if unexpected:
+            raise RuntimeError(f"unexpected keys in adapter_state: {unexpected}")
+    elif meta.warm_start_qalign and tgt_proj is not None:
+        warm_start_q_align(adapters, tgt_proj)
     if dtok.pad_token is None:
         dtok.pad_token = dtok.eos_token
-    return dec, dtok, adapters, meta
+    return dec, dtok, adapters
 
 
 def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
@@ -188,9 +193,9 @@ def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
 # In-loop round-trip eval — the held-out version of the training reward
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def roundtrip_eval_inloop(core, dtok, adapters, retrieval, pairs, eval_idx, prompt,
-                          pad_id, enc_src, src_proj, enc_tgt, tgt_proj, get_src,
-                          get_tgt, empty_tgt, direction, memory_map, embed_dim,
+def roundtrip_eval_inloop(core, dtok, adapters, pairs, eval_idx, prompt,
+                          pad_id, eos_id, enc_src, src_proj, enc_tgt, tgt_proj, get_src,
+                          get_tgt, empty_tgt, embed_dim,
                           args, env, device, need_ceiling: bool):
     """Free-running round-trip retrieval over a FIXED val subset.
 
@@ -218,49 +223,35 @@ def roundtrip_eval_inloop(core, dtok, adapters, retrieval, pairs, eval_idx, prom
     """
     my = eval_idx[env.rank::env.world_size]
     ks = (1, 5, 10)
-    recs = []
     bs = max(args.eval_batch_size, 1)
-    for s in range(0, len(my), bs):
-        chunk = my[s:s + bs]
-        h_src, mask_src = enc_src([get_src(pairs[i]) for i in chunk])
-        z_src = src_proj(h_src.float())
-        mem = retrieval.map_source(z_src, direction) if memory_map else z_src
 
-        set_cross_memory(adapters, mem, mask_src)
-        input_ids = torch.tensor([prompt] * len(chunk), device=device, dtype=torch.long)
-        gen = core.generate(
-            input_ids, max_new_tokens=args.eval_max_new_tokens,
-            do_sample=args.eval_temperature > 0,
-            temperature=max(args.eval_temperature, 1e-6),
-            top_p=args.eval_top_p, pad_token_id=pad_id, use_cache=True)
-        clear_cross_memory(adapters)
-
-        gen_strs = [decode_target(core, dtok, row) for row in gen]
-        h_gen, mask_gen = enc_tgt([g if g.strip() else empty_tgt for g in gen_strs])
-        z_gen = tgt_proj(h_gen.float())
-        if need_ceiling:
-            h_true, mask_true = enc_tgt([get_tgt(pairs[i]) for i in chunk])
-            z_true = tgt_proj(h_true.float())
-
-        # Keep only the valid tokens, fp16 on CPU: the gather payload is ~200 KB
-        # per row at fp32, and every rank receives the whole eval set.
-        for b, i in enumerate(chunk):
-            rec = {"uid": pairs[i].uid,
-                   "z_gen": z_gen[b][mask_gen[b]].half().cpu(),
-                   "z_src": z_src[b][mask_src[b]].half().cpu()}
+    def batches():
+        """Live-encoded source rows, aligned memory == the projection itself."""
+        for s in range(0, len(my), bs):
+            chunk = my[s:s + bs]
+            h_src, mask_src = enc_src([get_src(pairs[i]) for i in chunk])
+            z_src = src_proj(h_src.float())
+            out = {"z_src": z_src, "mem": z_src, "mask_src": mask_src,
+                   "uids": [pairs[i].uid for i in chunk]}
             if need_ceiling:
-                rec["z_true"] = z_true[b][mask_true[b]].half().cpu()
-            recs.append(rec)
+                h_true, mask_true = enc_tgt([get_tgt(pairs[i]) for i in chunk])
+                out["z_true"] = tgt_proj(h_true.float())
+                out["mask_true"] = mask_true
+            yield out
 
-    if env.distributed and torch.distributed.is_initialized():
-        buf = [None] * env.world_size
-        torch.distributed.all_gather_object(buf, recs)
-        recs = [r for part in buf for r in part]
+    recs, _ = generate_roundtrip_records(
+        core, dtok, adapters, batches(),
+        prompt=prompt, pad_id=pad_id, eos_id=eos_id, tgt_proj=tgt_proj,
+        encode_generated=lambda strs: enc_tgt(strs), empty_target=empty_tgt,
+        max_new_tokens=args.eval_max_new_tokens, temperature=args.eval_temperature,
+        top_p=args.eval_top_p)
+
+    recs = [r for part in gather_roundtrip_payloads(recs, env) for r in part]
     if not env.is_main:
         return None, None
 
     # Scoring is shared with the offline tool and the SFT trainer (accession ids
-    # align rows/cols, so a protein's sibling captions count as positives).
+    # align rows/cols, so any other row of the same protein counts as a positive).
     return score_roundtrip_records(
         recs, embed_dim, device, chunk_rows=args.eval_filip_chunk_rows,
         ks=ks, need_ceiling=need_ceiling)
@@ -275,9 +266,32 @@ def main() -> None:
                     help="text2protein: condition on caption, generate protein, reward = "
                          "FILIP(gen protein, caption). protein2text: the mirror.")
     ap.add_argument("--retrieval-ckpt", required=True)
-    ap.add_argument("--init-ckpt", required=True,
-                    help="SFT text2protein checkpoint to start the policy from "
-                         "(use the cleanest-LM one, not the contrastive one)")
+    ap.add_argument("--init-ckpt", default=None,
+                    help="SFT checkpoint to start the policy from (use the cleanest-LM "
+                         "one, not the contrastive one). OMIT to COLD-START: freshly "
+                         "initialized adapters on the frozen decoder, with RL as the only "
+                         "thing that ever shapes the conditioning. The architecture then "
+                         "comes from the --cross-attn-* / --unfreeze-* flags below instead "
+                         "of from the checkpoint's header, and the KL reference anchors to "
+                         "the decoder's unconditional prior rather than to an SFT policy")
+    # --- cold-start architecture (ignored when --init-ckpt is given: the
+    #     checkpoint's own header wins, so a continued run cannot be reshaped) ---
+    ap.add_argument("--cross-attn-every", type=int, default=cfg.generation.cross_attn_every,
+                    help="cold start only: inject a cross-attention adapter every Nth block")
+    ap.add_argument("--cross-attn-mode", choices=["head", "aligned"], default="aligned",
+                    help="cold start only: adapter scoring space. 'aligned' (default here) "
+                         "cosine-matches decoder queries against the aligned memory")
+    ap.add_argument("--memory-space", choices=["aligned"], default="aligned",
+                    help="cold start only; RL supports aligned memory only")
+    ap.add_argument("--unfreeze-top", type=int, default=0,
+                    help="cold start only: also fully fine-tune N decoder blocks")
+    ap.add_argument("--unfreeze-where", choices=["top", "bottom"], default="top",
+                    help="cold start only: which end of the stack --unfreeze-top selects")
+    ap.add_argument("--warm-start-qalign", action="store_true",
+                    help="cold start only: initialize the aligned-mode query MLP from the "
+                         "retrieval projection head of the generated modality. Worth more "
+                         "here than after SFT — it is the only thing putting the decoder-side "
+                         "query in the right region of the shared space before any gradient")
     ap.add_argument("--device", default="xpu")
     ap.add_argument("--cache-dir", default=cfg.retrieval.cache_dir)
     ap.add_argument("--ckpt-dir", default=None,
@@ -294,7 +308,10 @@ def main() -> None:
                     help="B: distinct captions sampled per rank per step")
     ap.add_argument("--group-size", type=int, default=8,
                     help="G: proteins generated per caption (GRPO group). Rollout = B*G")
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                    help="rollout cap; default: the config cap for the generated "
+                         "modality. Must cover the whole target — the FILIP reward "
+                         "scores a truncated rollout against the WHOLE source")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     # ---- length band on the reward (see the rollout loop for the rationale) ----
@@ -396,6 +413,10 @@ def main() -> None:
     args = ap.parse_args()
     if args.group_size < 2:
         raise SystemExit("--group-size must be >= 2 (group-relative advantage needs a group)")
+    if args.max_new_tokens is None:
+        args.max_new_tokens = (cfg.data.max_protein_tokens
+                               if args.direction == "text2protein"
+                               else cfg.data.max_text_tokens)
     if args.eval_temperature is None:
         args.eval_temperature = args.temperature
     if args.eval_top_p is None:
@@ -420,7 +441,12 @@ def main() -> None:
 
     env = init_distributed(args.device, group_size=1)
     device = env.device
-    torch.manual_seed(args.seed + env.rank)   # per-rank RNG -> diverse rollouts
+    # Model construction runs under a RANK-INDEPENDENT seed: on a cold start the
+    # adapters are randomly initialized, and the KL reference is not DDP-wrapped,
+    # so per-rank inits would give each rank a different reference (and so a
+    # different KL). The per-rank stream is installed afterwards, which is what
+    # actually makes the rollouts diverse.
+    torch.manual_seed(args.seed)
 
     # ---- frozen reward-side models + policy/reference decoders (rank-0-first) ----
     # text2protein decodes with the protein LM (ProtGPT3); protein2text with the
@@ -428,42 +454,58 @@ def main() -> None:
     # re-encodes the generated target with the other).
     decoder_path = cfg.generation.decoder_path if direction == "text2protein" else TEXT_DECODER_PATH
 
+    # Where the policy's architecture comes from: an SFT checkpoint's own header
+    # when continuing one, otherwise this invocation's flags (cold start).
+    init_ck = torch.load(args.init_ckpt, map_location="cpu") if args.init_ckpt else None
+    meta = GenMeta.from_ckpt(init_ck) if init_ck is not None else GenMeta.from_args(args)
+    try:
+        meta.validate()
+    except ValueError as e:
+        raise SystemExit(str(e))
+
     def _load():
-        ck = torch.load(args.init_ckpt, map_location="cpu")
-        retr = load_retrieval(args.retrieval_ckpt, device,
-                              with_maps=ck.get("memory_map", False))
+        retr = load_retrieval(args.retrieval_ckpt, device, cfg)
         tmodel, ttok = load_text_encoder(
             cfg.model.text_encoder_path, device, cfg.data.caption_field_labels)
         pmodel, ptok = load_protein_encoder(cfg.model.protein_encoder_path, device)
-        dec, dtok, adapters, meta = _build_decoder_from_ckpt(
-            direction, decoder_path, ck, cfg, device)
+        tgt_head = (retr.protein_proj if direction == "text2protein" else retr.text_proj)
+        dec, dtok, adapters = _build_policy(
+            direction, decoder_path, meta, cfg, device,
+            adapter_state=(init_ck["adapter_state"] if init_ck is not None else None),
+            tgt_proj=tgt_head)
         ref = ref_adapters = None
         if args.kl_coef > 0:
-            ref, _, ref_adapters, _ = _build_decoder_from_ckpt(
-                direction, decoder_path, ck, cfg, device)
-        return ck, retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, meta, ref, ref_adapters
+            ref, _, ref_adapters = _build_policy(
+                direction, decoder_path, meta, cfg, device,
+                adapter_state=(init_ck["adapter_state"] if init_ck is not None else None),
+                tgt_proj=tgt_head)
+        return retr, tmodel, ttok, pmodel, ptok, dec, dtok, adapters, ref, ref_adapters
 
     if env.is_main:
         loaded = _load()
     barrier()
     if not env.is_main:
         loaded = _load()
-    (ck, retrieval, text_model, text_tok, prot_model, prot_tok,
-     decoder, dtok, adapters, meta, ref_decoder, ref_adapters) = loaded
+    (retrieval, text_model, text_tok, prot_model, prot_tok,
+     decoder, dtok, adapters, ref_decoder, ref_adapters) = loaded
+    torch.manual_seed(args.seed + env.rank)   # per-rank RNG -> diverse rollouts
 
-    # Unfreeze the SAME blocks the SFT run trained (so the RL policy has the same
-    # trainable set), and upcast to fp32 when doing so — bf16 master weights don't
-    # train (updates fall below the bf16 ULP) and destabilize AdamW; see
-    # train_generation for the full rationale.
-    n_unfrozen = unfreeze_decoder_blocks(decoder, meta["unfreeze_top"], where=meta["unfreeze_where"])
+    # Unfreeze the same blocks the architecture header names (matching the SFT run
+    # when continuing one), and upcast to fp32 when doing so — bf16 master weights
+    # don't train (updates fall below the bf16 ULP); see train_generation.
+    n_unfrozen = unfreeze_decoder_blocks(decoder, meta.unfreeze_top, where=meta.unfreeze_where)
     if n_unfrozen > 0:
         decoder.float()
     if ref_decoder is not None:
+        # Copy the policy's weights into the reference so KL(policy||ref) is
+        # EXACTLY 0 at step 0. Loading the same adapter_state already gives that,
+        # but a cold start random-inits each copy separately — the reference has to
+        # be the policy's own starting point, not a second draw.
+        ref_decoder.load_state_dict(decoder.state_dict())
         for p in ref_decoder.parameters():
             p.requires_grad_(False)
         ref_decoder.eval()
-        # Match the policy's dtype so KL(policy || ref) is ~0 at step 0 (same
-        # weights) rather than an artifact of fp32-vs-bf16 precision.
+        # Match the policy's dtype so the KL reflects the weights, not fp32-vs-bf16.
         if n_unfrozen > 0:
             ref_decoder.float()
 
@@ -481,8 +523,9 @@ def main() -> None:
             raise RuntimeError(f"--resume unexpected keys: {unexpected}")
         start_step = int(resume_ck.get("step", 0))
         if env.is_main:
+            anchor = args.init_ckpt or "the decoder's unconditional prior (cold start)"
             print(f"[rl] resumed policy from {resume_path} at step {start_step} "
-                  f"(KL reference stays anchored to {args.init_ckpt})", flush=True)
+                  f"(KL reference stays anchored to {anchor})", flush=True)
 
     # Frozen encode+project handles, per direction: the SOURCE builds the cross-attn
     # memory; the TARGET is what we generate and re-encode for the reward. The FILIP
@@ -513,7 +556,10 @@ def main() -> None:
     splits = load_splits(str(Path(args.cache_dir) / "splits.json"))
     train_idx = list(splits["train"])
     if env.is_main:
-        print(f"[rl] direction={direction} | {len(train_idx)} train rows | policy trainable="
+        init_desc = args.init_ckpt if args.init_ckpt else "COLD START (no SFT checkpoint)"
+        print(f"[rl] direction={direction} | init={init_desc}", flush=True)
+        print(f"[rl] policy architecture: {meta.describe()}", flush=True)
+        print(f"[rl] {len(train_idx)} train rows | policy trainable="
               f"{count_trainable(decoder):,} | unfrozen={n_unfrozen:,} | "
               f"fp32={n_unfrozen > 0} | KL={'on' if ref_decoder is not None else 'off'}",
               flush=True)
@@ -563,7 +609,7 @@ def main() -> None:
     for name, p in core.named_parameters():
         if not p.requires_grad:
             continue
-        if id(p) in adapter_ids or "lora_" in name or "cross_attn" in name:
+        if id(p) in adapter_ids or "cross_attn" in name:
             head_params.append(p)
         else:
             backbone_params.append(p)
@@ -579,12 +625,9 @@ def main() -> None:
     # (the param-group structure is identical, since unfreeze matches).
     if resume_ck is not None and "optimizer_state" in resume_ck:
         optim.load_state_dict(resume_ck["optimizer_state"])
-        # base_lr does NOT reliably survive load_state_dict, contrary to what this
-        # comment used to claim: torch replaces each param_group with the SAVED
-        # dict, so the key only survives if the checkpoint was written by code that
-        # already set it. A checkpoint predating it crashes at the first LR update
-        # (KeyError 'base_lr'), which is what train_generation hit on an old p2t
-        # checkpoint in job 8723416. Re-inject from this invocation's LRs.
+        # base_lr does NOT survive load_state_dict: torch replaces each param_group
+        # with the SAVED dict, so a checkpoint predating the key crashes at the first
+        # LR update. Re-inject from this invocation's LRs.
         for g, blr in zip(optim.param_groups, base_lrs):
             g["base_lr"] = blr
 
@@ -605,7 +648,9 @@ def main() -> None:
         adapter_state = {k: v for k, v in core.state_dict().items() if k in trainable}
         payload = {"step": step, "adapter_state": adapter_state,
                    "optimizer_state": optim.state_dict(),
-                   "rl": True, "direction": direction, "init_ckpt": args.init_ckpt,
+                   "rl": True, "direction": direction,
+                   # None => this policy was cold-started, not continued from SFT.
+                   "init_ckpt": args.init_ckpt,
                    "kl_coef": args.kl_coef, "lr": args.lr,
                    # Rollout budget + reward shaping this policy was trained under:
                    # a checkpoint's length behaviour is only interpretable against them.
@@ -618,7 +663,7 @@ def main() -> None:
                    "reward_contrastive": args.reward_contrastive,
                    "reward_margin_beta": (args.reward_margin_beta
                                           if args.reward_contrastive else None),
-                   **meta}
+                   **meta.to_payload()}
         path = ckpt_dir / f"step{step:06d}.pt"
         torch.save(payload, path)
         print(f"[rl][ckpt] saved {path}", flush=True)
@@ -639,9 +684,9 @@ def main() -> None:
         torch.manual_seed(args.eval_seed + env.rank)
         try:
             metrics, ceiling = roundtrip_eval_inloop(
-                core, dtok, adapters, retrieval, pairs, eval_idx, prompt, pad_id,
+                core, dtok, adapters, pairs, eval_idx, prompt, pad_id, eos_id,
                 enc_src, src_proj, enc_tgt, tgt_proj, get_src, get_tgt, empty_tgt,
-                direction, meta["memory_map"], cfg.model.embed_dim, args, env, device,
+                cfg.model.embed_dim, args, env, device,
                 need_ceiling=not eval_state["done"])
         finally:
             rng_restore(device, rng)
@@ -653,8 +698,11 @@ def main() -> None:
         if env.is_main:
             g2s, s2g = metrics["gen2src"], metrics["src2gen"]
             ceil = eval_state["ceiling"] or {}
+            # R@K is only reported for k <= pool size, so a tiny --eval-samples
+            # has no R@10.
             print(f"[rl][rt] step={step_id} n={metrics['n']} "
-                  f"gen->src R@1={g2s['R@1']:.4f} R@10={g2s['R@10']:.4f} "
+                  f"gen->src R@1={g2s['R@1']:.4f} "
+                  f"R@10={g2s.get('R@10', float('nan')):.4f} "
                   f"mAP={g2s['mAP']:.4f} medrank={g2s['median_rank']:.0f} | "
                   f"src->gen R@1={s2g['R@1']:.4f} mAP={s2g['mAP']:.4f} | "
                   f"ceiling R@1={ceil.get('R@1', float('nan')):.4f} "
@@ -687,16 +735,15 @@ def main() -> None:
             txt_g = torch.as_tensor(dense_group_ids(srcs), device=device)
 
         # Phase timers (gen / reward / policy). Cheap, and the only thing that
-        # localizes a stall: a step that never prints tells you nothing about
-        # WHICH phase hung, which cost a full debug-queue slot to learn once.
+        # localizes a stall — a step that never prints says nothing about which
+        # phase hung.
         t_step = time.time()
 
         # ---- build aligned source memory (frozen), replicate G times ----
         with torch.no_grad():
             h_src, mask_src = enc_src(srcs)
             z_src = src_proj(h_src.float())                       # [B, Lt, D] normalized
-            mem = retrieval.map_source(z_src, direction) if meta["memory_map"] else z_src
-            mem_g = mem.repeat_interleave(G, dim=0)               # [B*G, Lt, D]
+            mem_g = z_src.repeat_interleave(G, dim=0)             # [B*G, Lt, D]
             mask_g = mask_src.repeat_interleave(G, dim=0)
 
         # ---- ROLLOUT: sample B*G proteins (no grad) ----
@@ -738,13 +785,12 @@ def main() -> None:
                 own = torch.arange(B, device=device).repeat_interleave(G)   # [B*G]
                 filip_pos = S.gather(1, own[:, None]).squeeze(1)            # [B*G]
 
-                # False negatives: next_prompts draws captions independently and the
-                # augmented corpus carries ~8.87 captions per protein, so two prompts
-                # in one batch can be siblings of the same accession (or byte-identical
-                # generic captions). Penalizing a generation for matching its own
-                # protein's other caption is backwards — mask those columns, mirroring
-                # retrieval's mask_false_negatives. If every column of a row ends up
-                # blocked (tiny B, all siblings) the negative term is the constant
+                # False negatives: two prompts in one batch can carry
+                # byte-identical generic captions (and, on a multi-caption corpus,
+                # could be siblings of the same accession). Penalizing a generation
+                # for matching an equally-valid caption is backwards — mask those
+                # columns, mirroring retrieval's mask_false_negatives. If every
+                # column of a row ends up blocked the negative term is the constant
                 # -1.0, and a per-prompt constant is invisible to GRPO anyway.
                 same = ((acc_g[:, None] == acc_g[None, :])
                         | (txt_g[:, None] == txt_g[None, :]))               # [B, B]

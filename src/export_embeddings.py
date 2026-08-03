@@ -1,7 +1,7 @@
 """Export retrieval embeddings (z_p, z_t) from the cache — no generation.
 
 Runs the trained projection heads over the precomputed per-token encoder cache
-to produce the 32-d FILIP embeddings, keyed by primary accession, for one or
+to produce the FILIP embeddings (embed_dim wide), keyed by accession, for one or
 more splits. Read-from-cache only: no encoders, no decoders, nothing generative.
 
 Two output modes:
@@ -55,7 +55,7 @@ from src.data import (
     PackedPerTokenCache, dedup_proteins, load_pairs, load_row_protein_idx,
     load_splits,
 )
-from src.model import MiniEmbedFilip
+from src.model import load_retrieval
 
 
 def _device(name: str) -> torch.device:
@@ -77,25 +77,6 @@ def _device(name: str) -> torch.device:
             pass
         return torch.device("cpu")
     return torch.device(name)
-
-
-def load_retrieval(ckpt_path: str, device: torch.device) -> MiniEmbedFilip:
-    cfg = default_cfg()
-    m = MiniEmbedFilip(
-        text_hidden=cfg.model.text_hidden, protein_hidden=cfg.model.protein_hidden,
-        proj_d_hidden=cfg.model.proj_d_hidden, proj_d_mid=cfg.model.proj_d_mid,
-        embed_dim=cfg.model.embed_dim, proj_dropout=cfg.model.proj_dropout,
-        expand_d_mid=cfg.model.expand_d_mid, expand_d_hidden=cfg.model.expand_d_hidden,
-        expand_dropout=cfg.model.expand_dropout,
-        init_temperature=cfg.retrieval.init_temperature,
-        max_temperature=cfg.retrieval.max_temperature,
-    )
-    state = torch.load(ckpt_path, map_location="cpu")
-    m.load_state_dict(state["model_state"])
-    m.eval().to(device)
-    for p in m.parameters():
-        p.requires_grad_(False)
-    return m
 
 
 def _read_batch(cache: PackedPerTokenCache, idxs):
@@ -417,8 +398,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, help="trained retrieval checkpoint")
     ap.add_argument("--cache-dir", default=cfg.retrieval.cache_dir)
+    ap.add_argument("--live", action="store_true",
+                    help="encode the whole corpus live (no cache, no splits); distributed "
+                         "under mpiexec. Reads config.DataCfg.csv_path")
     ap.add_argument("--csv", default=None,
-                    help="encode this CSV live (no cache, no splits); distributed under mpiexec")
+                    help="explicit CSV path; implies --live and overrides the config one")
     ap.add_argument("--out-dir", default=str(Path(cfg.retrieval.cache_dir).parent / "embeddings"))
     ap.add_argument("--name", default="live",
                     help="output basename for live mode (e.g. <name>_pooled.npz)")
@@ -437,15 +421,21 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
+    # Resolve the live corpus from config unless an explicit --csv overrides it.
+    if args.csv is not None:
+        args.live = True
+    elif args.live:
+        args.csv = cfg.data.csv_path
+
     # Live runs the encoders (AMPLIFY attention is materialized full, ~[B,H,L,L],
     # by the non-fused XPU path), so it needs a small batch like precompute; the
     # cached path only feeds the tiny projection head and can go large.
     if args.batch_size is None:
-        args.batch_size = 64 if args.csv else 512
+        args.batch_size = 64 if args.live else 512
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.csv:
+    if args.live:
         run_live(args, cfg)
     else:
         run_cached(args, cfg)

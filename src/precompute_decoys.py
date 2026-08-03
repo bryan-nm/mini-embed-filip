@@ -156,8 +156,8 @@ def build_plan(args, cfg) -> None:
     split_of_row = None
     splits_path = Path(args.splits) if args.splits else Path(args.cache_dir) / "splits.json"
     if args.allow_cross_split_donors:
-        print(f"[decoy-plan] --allow-cross-split-donors: donor pool is the whole "
-              f"corpus (val/test caption fragments may appear in train decoys)")
+        print("[decoy-plan] --allow-cross-split-donors: donor pool is the whole "
+              "corpus (val/test caption fragments may appear in train decoys)")
     elif splits_path.exists():
         with open(splits_path) as f:
             sp = json.load(f)
@@ -433,7 +433,8 @@ def main() -> None:
     ap.add_argument("--allow-same-protein-donor", action="store_true",
                     default=cfg.hard_neg.donor_same_protein,
                     help="permit donors from another caption of the SAME protein "
-                         "(off by default: a sibling caption's field is often also "
+                         "(off by default: another caption of the same protein "
+                         "usually has a field that is also "
                          "true of this protein, making the decoy a false negative)")
     ap.add_argument("--allow-cross-split-donors", action="store_true",
                     default=cfg.hard_neg.donor_cross_split,

@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_retrieval
-#PBS -l walltime=16:00:00
+#PBS -l walltime=08:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fsx
@@ -10,42 +10,78 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+# ---------------------------------------------------------------------------
+# Two-phase FILIP retrieval training over the precomputed cache. Reads the token
+# cache + pair_ids.json only; the CSV is touched solely on the --no-cache path.
+#
+# Model and dataset locations are NOT set here — config.py owns them.
+# ---------------------------------------------------------------------------
 
-NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))           # 16*12 = 192 ranks, 12 groups of 16
+MASTER_PORT=29501
+source ./pbs_common.sh
 
-export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-# FILIP_DATA_CSV intentionally unset: --use-cache reads the precomputed token
-# cache + pair_ids.json only; the CSV is touched solely in the no-cache branch.
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE"); export MASTER_PORT=29501
-export OMP_NUM_THREADS=8
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export FI_PROVIDER=cxi
-export CCL_ZE_IPC_EXCHANGE=pidfd
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+# ===========================================================================
+# Inputs / outputs
+# ===========================================================================
+CACHE_DIR=cache
+CKPT_DIR=checkpoints/retrieval
 
-# push start notifications to slack
-source ~/bin/slack_notify.sh
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# 16 nodes x 12 ranks = 192 ranks, in 12 contrastive subgroups of 16. Global
+# negatives per anchor = GROUP_SIZE * BATCH_SIZE.
+#
+# BATCH_SIZE doubled from 16 with the 512-token protein cap. The binding
+# constraint is the chunked FILIP transient — chunk * (GROUP_SIZE*BATCH_SIZE) *
+# L_p * L_t * 4 bytes — which does NOT depend on embed_dim, since the einsum
+# contracts it away before materializing the [.,.,L_p,L_t] array. At the old
+# (B=16, L_p=1024) that was 4.0 GB; at (B=32, L_p=512) it is 4.0 GB again. Same
+# footprint, twice the negative pool.
+#
+# NOTE this is a deliberate objective change, not only a memory one: each anchor
+# now sees 512 negatives instead of 256, so retrieval numbers are not directly
+# comparable to pre-sweep runs. Hold it FIXED across the embed_dim sweep — that
+# is the comparison that matters. Set BATCH_SIZE=16 to reproduce the old pool.
+#
+# WALL TIME BASIS: per-step FILIP arithmetic is ~2x cheaper (L_p halves and D
+# drops 4x, but B and the column count both double), and steps/epoch fall with
+# both the doubled batch and the one-caption-per-accession row count. 8h is
+# generous against the old 16h even on a pessimistic row count; read s/step off
+# the first job.
+BATCH_SIZE=32
+GROUP_SIZE=16
+PHASE1_EPOCHS=1
+PHASE2_EPOCHS=20
+LR=2e-4
+# R1 token-spread weight; raise toward 0.3 if R1 collapses.
+PHASE1_UNIFORMITY_WEIGHT=0.3
+# Both off: the R2 contrastive objective carries the geometry on its own at this
+# scale. If they are changed, train_hard_negatives.pbs MUST match — "resume with
+# its existing objective" silently isn't otherwise.
+R2_UNIFORMITY_WEIGHT=0
+ALIGN_AUX_WEIGHT=0
+# Chunk the FILIP score matrix over the protein axis to cap the transient.
+FILIP_CHUNK_ROWS=8
+VAL_SUBSET=1000
+
+# ===========================================================================
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "retrieval training (src.train_retrieval)" \
+    CACHE_DIR CKPT_DIR \
+    BATCH_SIZE GROUP_SIZE PHASE1_EPOCHS PHASE2_EPOCHS LR \
+    PHASE1_UNIFORMITY_WEIGHT R2_UNIFORMITY_WEIGHT ALIGN_AUX_WEIGHT \
+    FILIP_CHUNK_ROWS VAL_SUBSET
 
-# 192 ranks -> ~168 steps/epoch. Saner epoch counts than the prod version.
-mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --cpu-bind depth -d 8 \
+"${MPI_LAUNCH[@]}" \
     python -m src.train_retrieval --use-cache --device xpu \
-        --batch-size 16 --group-size 16 \
-        --phase1-epochs 1 --phase2-epochs 20 --lr 2e-4 \
-        --phase1-uniformity-weight 0.3 --filip-chunk-rows 8 \
-        --align-aux-weight 0 --r2-uniformity-weight 0
+        --cache-dir "${CACHE_DIR}" --ckpt-dir "${CKPT_DIR}" \
+        --batch-size "${BATCH_SIZE}" --group-size "${GROUP_SIZE}" \
+        --phase1-epochs "${PHASE1_EPOCHS}" --phase2-epochs "${PHASE2_EPOCHS}" \
+        --lr "${LR}" \
+        --phase1-uniformity-weight "${PHASE1_UNIFORMITY_WEIGHT}" \
+        --r2-uniformity-weight "${R2_UNIFORMITY_WEIGHT}" \
+        --align-aux-weight "${ALIGN_AUX_WEIGHT}" \
+        --filip-chunk-rows "${FILIP_CHUNK_ROWS}" --val-subset "${VAL_SUBSET}"
 
-# push stop notifications to slack
-rc=$?
-if [ $rc -eq 0 ]; then
-    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
-else
-    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
-fi
-exit $rc
+finish $?

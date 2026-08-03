@@ -15,12 +15,12 @@ The four losses we compose:
                         to valid positions.
 
 phase_r1_loss and phase_r2_loss compose them as described in
-PLAN_late_interaction.md sections 3c.
+docs/PLAN_late_interaction_deprecated.md section 3c.
 """
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -160,10 +160,11 @@ def mask_false_negatives(
 ) -> torch.Tensor:
     """Mask same-protein or same-caption non-target columns out of the denominator.
 
-    The augmented corpus has ~8.87 captions per protein, so a contrastive batch
-    can contain several captions of the same protein; the corpus also repeats
-    byte-identical captions across different proteins. Both make a column a false
-    negative — an equally valid positive the loss must not push away. We mask
+    Two columns can be equally valid positives the loss must not push away: one
+    sharing the anchor's protein (only possible on a multi-caption corpus — the
+    current one is one caption per accession, so this arm is inert but kept), and
+    one repeating a byte-identical caption across a different protein, which does
+    still occur. We mask
     every column that shares a row's accession OR its caption (except that row's
     designated positive) by setting it to a large negative, removing it from
     softmax. Each relation is independently optional; a column matching either is
@@ -226,18 +227,6 @@ def reconstruction_loss(
     diff = diff.mean(dim=-1)                        # [B, L]
     valid = mask.to(diff.dtype)
     return (diff * valid).sum() / valid.sum().clamp_min(1.0)
-
-
-def masked_mean(z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Mean over valid tokens. z [B, L, D], mask [B, L] bool -> [B, D].
-
-    Used to pool a per-token sequence into a single vector (e.g. the source/target
-    conditioning vectors for the generation-side CVAE).
-    """
-    valid = mask.unsqueeze(-1).to(z.dtype)          # [B, L, 1]
-    summed = (z * valid).sum(dim=1)                 # [B, D]
-    count = valid.sum(dim=1).clamp_min(1.0)         # [B, 1]
-    return summed / count
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +395,7 @@ def phase_r2_loss_grouped(
     When `groups`/`groups_all` (accession) and/or `text_groups`/`text_groups_all`
     (caption identity) are supplied, columns sharing an anchor's protein or its
     caption (other than its own positive) are masked out of the denominator, so
-    neither the corpus's multiple captions per protein nor its repeated identical
-    captions act as false negatives.
+    repeated identical captions do not act as false negatives.
     """
     z_p, z_t = out["z_p"], out["z_t"]
     h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]
@@ -498,7 +486,8 @@ def phase_r2_loss(
 
     `groups` (per-pair accession ids) masks same-protein off-diagonal entries and
     `text_groups` (per-pair caption ids) masks same-caption entries as false
-    negatives; each is a no-op when omitted.
+    negatives; each is a no-op when omitted, and the accession arm is inert on a
+    one-caption-per-accession corpus.
     """
     z_p, z_t = out["z_p"], out["z_t"]
     h_p_hat, h_t_hat = out["h_p_hat"], out["h_t_hat"]

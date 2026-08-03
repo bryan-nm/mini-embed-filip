@@ -10,11 +10,12 @@ order is preserved) and writes per-rank shard files into `<cache>/shards/`.
 A single merge pass then concatenates the shards, in rank order, into the
 final single-file cache the trainers/readers expect.
 
-Protein dedup: the augmented corpus repeats each protein across ~8.87 caption
-rows. The protein modality is encoded + stored once per *unique* protein
-(keyed by accession), the text modality once per CSV row, and a row_protein_idx
-map joins them at read time. This avoids ~9x of the protein encoder pass (the
-precompute bottleneck) and ~1.5 TB of duplicated protein cache.
+Protein dedup: the protein modality is encoded + stored once per *unique*
+protein (keyed by accession), the text modality once per CSV row, and a
+row_protein_idx map joins them at read time. The current corpus has one caption
+per accession, so the two counts are equal and this saves nothing; it is kept
+because it costs one pass and is what makes a multi-caption corpus affordable
+(the protein encoder is the precompute bottleneck).
 
 Final output layout (under cache_dir):
   protein_h.bin       bf16, total_protein_tokens × 960   (UNIQUE proteins)

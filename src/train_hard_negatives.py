@@ -55,7 +55,7 @@ from src.losses import (
     filip_paired_scores, filip_paired_scores_chunked, hard_decoy_loss,
     phase_r2_loss_grouped,
 )
-from src.model import MiniEmbedFilip
+from src.model import MiniEmbedFilip, build_retrieval
 from src.train_retrieval import (
     autocast_ctx, build_loaders, cosine_warmup_lr, resolve_resume_path,
 )
@@ -84,25 +84,10 @@ def decoy_weight_at(step: int, total_steps: int, weight: float,
 def build_model(cfg, state: dict, device: torch.device) -> MiniEmbedFilip:
     """Rebuild the retrieval model matching a checkpoint's state dict.
 
-    `with_maps` is inferred from the keys so a map-augmented checkpoint
-    (train_memory_map) resumes here instead of failing on unexpected keys.
+    Stays trainable (this phase fine-tunes the projection heads), unlike
+    `model.load_retrieval`, which freezes.
     """
-    with_maps = any(k.startswith("text_map.") for k in state)
-    model = MiniEmbedFilip(
-        text_hidden=cfg.model.text_hidden,
-        protein_hidden=cfg.model.protein_hidden,
-        proj_d_hidden=cfg.model.proj_d_hidden,
-        proj_d_mid=cfg.model.proj_d_mid,
-        embed_dim=cfg.model.embed_dim,
-        proj_dropout=cfg.model.proj_dropout,
-        expand_d_mid=cfg.model.expand_d_mid,
-        expand_d_hidden=cfg.model.expand_d_hidden,
-        expand_dropout=cfg.model.expand_dropout,
-        init_temperature=cfg.retrieval.init_temperature,
-        max_temperature=cfg.retrieval.max_temperature,
-        with_maps=with_maps,
-        map_hidden=cfg.model.map_hidden,
-    )
+    model = build_retrieval(cfg)
     model.load_state_dict(state)
     return model.to(device)
 
@@ -373,8 +358,8 @@ def main() -> None:
                   "r2_uniformity_weight")
                  if k in prev and prev[k] != getattr(args, k)}
         if drift and env.is_main:
-            print(f"[hardneg] WARNING: these flags differ from the interrupted run; "
-                  f"the schedule will not match what it would have done:")
+            print("[hardneg] WARNING: these flags differ from the interrupted run; "
+                  "the schedule will not match what it would have done:")
             for k, (was, now) in drift.items():
                 print(f"[hardneg]   {k}: {was} -> {now}")
 

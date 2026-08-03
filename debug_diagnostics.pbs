@@ -10,9 +10,8 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m abe
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+MASTER_PORT=29509
+source ./pbs_common.sh
 
 # ---------------------------------------------------------------------------
 # Calibration run for --coverage-lambda / --coverage-tau (SFT) and
@@ -39,39 +38,39 @@ cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
 #   neither metric out of noise. Use this to pick starting values and to prove
 #   the code runs; then A/B at scale.
 #
-# Usage:
-#   qsub -v RCKPT=/path/retrieval/epochNN.pt,SFT_CKPT=/path/generation/text2protein/epochNN.pt \
-#        debug_diagnostics.pbs
-# Optional: -v PHASES=13 to run only phases 1 and 3, RL_STEPS=..., COV_LAMBDA=...
+# Usage:  qsub <this file>.  Edit the checkpoints and PHASES below first;
+# every setting is printed to the .o file by job_banner.
 # ---------------------------------------------------------------------------
 
-: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
-: "${SFT_CKPT:?set -v SFT_CKPT=path/to/generation/text2protein/epochNN.pt}"
+# Checkpoints under test. Written here rather than passed with -v so the
+# banner below is a complete record of what this calibration measured.
+RCKPT=checkpoints/retrieval/epoch50.pt
+SFT_CKPT=checkpoints/generation/text2protein/epoch09.pt
 
 # Default 123: phase 4 (raw-reward control) already ran clean on job 8722544 —
 # rstd 0.05-0.12, lenratio median ~1.7, ~49s/step, empty=0/64. Re-run it only to
-# re-baseline after a policy change (-v PHASES=1234).
-PHASES=${PHASES:-123}
-SUBSET=${SUBSET:-2000}         # tiny train subset: these phases measure, not train
-VAL_SUBSET=${VAL_SUBSET:-128}
-BS=${BS:-32}
-CAE=${CAE:-1}
-MAX_TGT=${MAX_TGT:-1024}
-COV_LAMBDA=${COV_LAMBDA:-0.5}  # phase-2 trial value; phase 1 tells you if it's sane
-COV_TAU=${COV_TAU:-0.025}        # phase-1 output replaces this for real runs
+# re-baseline after a policy change.
+PHASES=123
+SUBSET=2000         # tiny train subset: these phases measure, not train
+VAL_SUBSET=128
+BS=64
+CAE=1
+MAX_TGT=512      # matches train_t2p_SFT.pbs (corpus is <=500 residues)
+COV_LAMBDA=0.5  # phase-2 trial value; phase 1 tells you if it's sane
+COV_TAU=0.025        # phase-1 output replaces this for real runs
 # 5 steps is enough for an rstd/margin distribution — job 8722544's rstd bounced
 # 0.05-0.12 over 10 steps, so more steps buy spread, not precision. Fewer steps
 # also means a stalled phase 3 burns less of the hour before hitting its cap.
-RL_STEPS=${RL_STEPS:-5}
-MAXNEW=${MAXNEW:-1024}         # keep at production value: rstd scales with it,
-PPR=${PPR:-8}                  # and rstd is the number we came here to measure
-BETA=${BETA:-1.0}
+RL_STEPS=5
+MAXNEW=512          # keep at production value: rstd scales with it,
+PPR=8                  # and rstd is the number we came here to measure
+BETA=1.0
 # Reward-matrix row chunk. If phase 3 stalls again, this is the first knob:
 # it trades transient memory (chunk*B*L_gen*L_src floats) against the number
 # of sequential einsums. 8 matches the raw path's single-shot footprint.
-REW_CHUNK=${REW_CHUNK:-8}
+REW_CHUNK=8
 
-OUT=${OUT:-/flare/NLDesignProtein/bryan/FILIP-dev-space/debug_diag/${PBS_JOBID%%.*}}
+OUT=/flare/NLDesignProtein/bryan/FILIP-dev-space/debug_diag/${PBS_JOBID%%.*}
 mkdir -p "${OUT}"
 
 # train_generation counts epochs ABSOLUTELY, not as "how many more to run", and
@@ -106,7 +105,7 @@ echo "resume checkpoint finished epoch ${RESUME_EPOCH} -> starts at $(( RESUME_E
 # that same file, so a diagnostic run silently repartitions the real project.
 # Job 8722785's RL phase saw 1,829 train rows; job 8723205's saw 518,945 — the
 # pool these phases sample from was not stable across runs. Snapshot and restore.
-CACHE_DIR=${CACHE_DIR:-/flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip/cache}
+CACHE_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip/cache
 SPLITS="${CACHE_DIR}/splits.json"
 if [ -f "${SPLITS}" ]; then
     cp -p "${SPLITS}" "${OUT}/splits.json.bak"
@@ -123,32 +122,17 @@ else
     echo "         train-row count looks wrong." >&2
 fi
 
-NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))
-
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
-export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-export FILIP_PROTEIN_DECODER=${FILIP_MODELS_DIR}/ProtGPT3-112M-dpo
-export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
-export MASTER_PORT=29506
-export OMP_NUM_THREADS=8
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
-export CCL_KVS_CONNECTION_TIMEOUT=600
-export FI_PROVIDER=cxi
-export CCL_ZE_IPC_EXCHANGE=pidfd
-
-source ~/bin/slack_notify.sh
 slack ":microscope: START ${PBS_JOBID} ${PBS_JOBNAME} (${NNODES} nodes, calibration)"
+job_banner "text2protein calibration (coverage + RL reward)" \
+    RCKPT SFT_CKPT CACHE_DIR OUT PHASES SUBSET VAL_SUBSET BS CAE MAX_TGT \
+    COV_LAMBDA COV_TAU RL_STEPS MAXNEW PPR BETA REW_CHUNK EPOCHS
+require_files RCKPT SFT_CKPT CACHE_DIR
 
 MPI="mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8"
 COMMON_SFT="--direction text2protein --retrieval-ckpt ${RCKPT} --device xpu \
     --memory-space aligned --cross-attn-mode aligned --resume ${SFT_CKPT} \
     --batch-size ${BS} --epochs ${EPOCHS} --max-target-tokens ${MAX_TGT} --direction-augment \
-    --cross-attn-every ${CAE} --unfreeze-top 0 --no-lora \
+    --cross-attn-every ${CAE} --unfreeze-top 0 \
     --subset-size ${SUBSET} --val-subset ${VAL_SUBSET} \
     --no-rt-eval --no-rt-at-start"
 # --no-rt-eval / --no-rt-at-start: BOTH default ON (train_generation.py

@@ -10,96 +10,92 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m abe
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
-
 # ---------------------------------------------------------------------------
-# protein -> text SFT. Split from the old shared train_generation.pbs; see
-# train_t2p_SFT.pbs for the other half.
+# protein -> text SFT. See train_t2p_SFT.pbs for the other half.
 #
-# What is specific to THIS direction — and why it does NOT inherit the t2p fixes:
-#   --max-target-tokens 512    the target is a caption, and the text encoder caps
-#                              at 512 tokens anyway (DataCfg.max_text_tokens), so
-#                              512 already covers the corpus. The truncation
-#                              problem that forced t2p to 1024 is a protein-length
-#                              problem; raising it here would buy nothing.
-#   no --direction-augment     BioGPT has no C-to-N marker. reverse_prefix_ids()
-#                              raises for a non-Mixtral decoder by design, so
-#                              passing the flag here fails the job rather than
-#                              silently training a directionless decoder on
-#                              reversed text. Reversed captions are meaningless
-#                              anyway — the augmentation is a protein trick.
-#   BS=8, CAE=2                BioGPT is 24 layers; cross-attn every other layer,
-#                              smaller batch.
+# What is specific to THIS direction — and why it does NOT inherit the t2p
+# settings:
+#   MAX_TARGET_TOKENS=512   the target is a caption, and the text encoder caps
+#                           at 512 tokens anyway (DataCfg.max_text_tokens), so
+#                           512 already covers the corpus. This value has never
+#                           moved with the protein cap — it is a caption limit,
+#                           not a protein one.
+#   no direction augment    BioGPT has no C-to-N marker. reverse_prefix_ids()
+#                           raises for a non-Mixtral decoder by design, so
+#                           passing the flag here fails the job rather than
+#                           silently training a directionless decoder on
+#                           reversed text. Reversed captions are meaningless
+#                           anyway — the augmentation is a protein trick.
+#   BATCH_SIZE=8, CAE=2     BioGPT is 24 layers; cross-attn every other layer,
+#                           smaller batch.
 #
-# The EOS-on-truncation fix in make_collate applies to both directions: a caption
-# cut at the cap no longer gets a synthetic EOS. It is close to a no-op here
-# (few captions overflow) — the per-step trunc= counter will confirm that.
+# Model and dataset locations are NOT set here — config.py owns them.
 # ---------------------------------------------------------------------------
 
-: "${RCKPT:?set -v RCKPT=path/to/retrieval/epochNN.pt}"
+MASTER_PORT=29503
+source ./pbs_common.sh
 
-# Sizing knobs, overridable from the qsub environment (-v BS=...).
-BS=${BS:-8}
-CAE=${CAE:-2}
-MAX_TGT=${MAX_TGT:-512}
-EPOCHS=${EPOCHS:-20}
-LR=${LR:-1.5e-4}
-GRAD_CKPT=${GRAD_CKPT:-0}
-# Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart to
-# val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank here and
-# costs one generate + one N x N FILIP per epoch. RT_MAX_NEW is the real cost knob
-# (wall time is linear in it); RT_SAMPLES=0 turns the eval off.
-RT_SAMPLES=${RT_SAMPLES:-512}
-RT_MAX_NEW=${RT_MAX_NEW:-${MAX_TGT}}
-# Cross-attention coverage aux — see train_t2p_SFT.pbs for what it does and why.
+# ===========================================================================
+# Checkpoints
+# ===========================================================================
+RETRIEVAL_CKPT=checkpoints/retrieval/epoch50.pt
+CKPT_DIR=checkpoints/generation            # writes <CKPT_DIR>/protein2text/
+
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# BATCH_SIZE stays at 8 despite the shorter proteins. This direction's cost is
+# dominated by BioGPT's own forward over a 512-token CAPTION target, which the
+# corpus change does not touch; only the cross-attention memory axis (the
+# protein source) halved, and that is not the binding term. Raising the batch
+# here would be sizing against the wrong tensor.
 #
-# COV_TAU=0.007 is now MEASURED-VALIDATED, but not by the reasoning that produced
-# it. It was derived as 2.4 * an ASSUMED unif~0.003. Job 8723638 measured
-# unif=0.00490 — the assumption was 63% low, so the intended 2.4x multiple would
-# have been 0.012, not 0.007. Keeping 0.007 anyway, because the quantity that
-# actually matters is what fraction of source positions the penalty bites on, and
-# on the measured distribution 0.007 lands well:
+# WALL TIME BASIS: unchanged per step, so the only saving is fewer rows. Kept at
+# 16h for that reason — this is the slowest job in the repo per step and the one
+# least helped by the shorter proteins.
+BATCH_SIZE=8
+EPOCHS=20
+LR=1.5e-4
+GRAD_CKPT=0
+MAX_TARGET_TOKENS=512
+CROSS_ATTN_EVERY=2
+CROSS_ATTN_MODE=aligned
+MEMORY_SPACE=aligned
+UNFREEZE_TOP=0
+UNFREEZE_WHERE=top
+VAL_SUBSET=100
+
+# Cross-attention coverage aux — see train_t2p_SFT.pbs for what it does.
+#
+# COV_TAU=0.007 is MEASURED-VALIDATED, but not by the reasoning that produced
+# it. It was derived as 2.4 * an ASSUMED unif~0.003; the measured unif is
+# 0.00490, so the intended 2.4x multiple would have been 0.012. Keeping 0.007
+# anyway, because what matters is the fraction of source positions the penalty
+# bites on, and on the measured distribution 0.007 lands well:
 #
 #   p2t measured: unif=0.00490  p10=0.0030  p50=0.0098  p90=0.0741
 #   frac_below <0.001:0.001 <0.005:0.245 <0.01:0.506 <0.05:0.860  (n=42,984)
 #
 #   tau=0.007 penalizes ~37% of positions   (t2p's tau=0.025 penalizes ~49%)
-#   tau=0.012 would penalize ~55%           and needs LAMBDA ~0.13, not 0.5
+#   tau=0.012 would penalize ~55%           and needs COV_LAMBDA ~0.13, not 0.5
 #
-# And the loss scale is confirmed, not estimated: at tau=0.007 the measured covpen
-# is 0.031, so LAMBDA=0.5 contributes 0.0155 against val ce 1.119 — 1.4% of the
-# loss, in the intended band. Raising tau to 0.012 would push covpen to ~0.175
-# (~7.8% of ce at the same lambda), which is why the pair moves together.
+# The loss scale is confirmed, not estimated: at tau=0.007 the measured covpen
+# is 0.031, so COV_LAMBDA=0.5 contributes 0.0155 against val ce 1.119 — 1.4% of
+# the loss, in the intended band. The pair moves together.
 #
 # Structural note: ~25% of p2t source positions sit at or below uniform, against
 # ~20% for t2p. The starved tail is not a t2p quirk — both directions ignore a
 # comparable slice of the source.
-COV_LAMBDA=${COV_LAMBDA:-0.5}
-COV_TAU=${COV_TAU:-0.007}
+COV_LAMBDA=0.5
+COV_TAU=0.007
 
-NNODES=$(wc -l < "$PBS_NODEFILE"); RANKS_PER_NODE=12
-NRANKS=$(( NNODES * RANKS_PER_NODE ))
+# Per-epoch round-trip retrieval eval (free-running; the prefix-free counterpart
+# to val CE). The pool is sharded across ranks, so 512 rows is 2-3 rows/rank.
+# RT_MAX_NEW is the real cost knob; RT_SAMPLES=0 turns the eval off.
+RT_SAMPLES=512
+RT_MAX_NEW=${MAX_TARGET_TOKENS}
 
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
-export FILIP_MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models
-export FILIP_TEXT_DECODER=${FILIP_MODELS_DIR}/biogpt
-export FILIP_DATA_CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_20260722.csv
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
-export MASTER_PORT=29503
-export OMP_NUM_THREADS=8
-export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-# Route the rank/KVS exchange over MPI (PMIx), not oneCCL's internal TCP KVS —
-# the internal single-rendezvous KVS overruns at O(1000s) of ranks. See
-# train_t2p_SFT.pbs for the full rationale.
-export CCL_KVS_MODE=mpi
-export CCL_KVS_CONNECTION_TIMEOUT=600
-export FI_PROVIDER=cxi
-export CCL_ZE_IPC_EXCHANGE=pidfd
-
+# ===========================================================================
 EXTRA=""
 [ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
 if [ "$RT_SAMPLES" = 0 ]; then
@@ -116,30 +112,28 @@ if [ "$GRAD_CKPT" = 1 ] && [ "$COV_LAMBDA" != "0.0" ] && [ "$COV_LAMBDA" != "0" 
     exit 1
 fi
 
-source ~/bin/slack_notify.sh
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "protein2text SFT (src.train_generation)" \
+    RETRIEVAL_CKPT CKPT_DIR \
+    BATCH_SIZE EPOCHS LR GRAD_CKPT MAX_TARGET_TOKENS \
+    CROSS_ATTN_EVERY CROSS_ATTN_MODE MEMORY_SPACE UNFREEZE_TOP UNFREEZE_WHERE \
+    COV_LAMBDA COV_TAU RT_SAMPLES RT_MAX_NEW VAL_SUBSET
+require_files RETRIEVAL_CKPT
 
-echo "p2t SFT: bs=${BS} cae=${CAE} max_target=${MAX_TGT} grad_ckpt=${GRAD_CKPT}" \
-     "rt_samples=${RT_SAMPLES} rt_max_new=${RT_MAX_NEW}"
-
-# Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val pool
-# (generated caption -> its source protein, R@K/mAP, plus the ceiling from the true
-# captions) and the mean generated vs true caption length. Val CE is teacher-forced
-# and can improve while this sits at the floor; full history lands in
-# <ckpt_dir>/sft_roundtrip.jsonl.
-mpiexec -n ${NRANKS} -ppn ${RANKS_PER_NODE} --pmi=pmix --cpu-bind depth -d 8 \
-    python -m src.train_generation --direction protein2text \
-    --retrieval-ckpt "${RCKPT}" --device xpu \
-    --memory-space aligned --cross-attn-mode aligned \
-    --batch-size "${BS}" --epochs "${EPOCHS}" --lr "${LR}" \
-    --max-target-tokens "${MAX_TGT}" \
+# Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val
+# pool (generated caption -> its source protein, R@K/mAP, plus the ceiling from
+# the true captions) and the mean generated vs true caption length. Val CE is
+# teacher-forced and can improve while this sits at the floor; full history lands
+# in <CKPT_DIR>/protein2text/sft_roundtrip.jsonl.
+"${MPI_LAUNCH[@]}" \
+    python -m src.train_generation --direction protein2text --device xpu \
+    --retrieval-ckpt "${RETRIEVAL_CKPT}" --ckpt-dir "${CKPT_DIR}" \
+    --memory-space "${MEMORY_SPACE}" --cross-attn-mode "${CROSS_ATTN_MODE}" \
+    --cross-attn-every "${CROSS_ATTN_EVERY}" \
+    --unfreeze-top "${UNFREEZE_TOP}" --unfreeze-where "${UNFREEZE_WHERE}" \
+    --batch-size "${BATCH_SIZE}" --epochs "${EPOCHS}" --lr "${LR}" \
+    --max-target-tokens "${MAX_TARGET_TOKENS}" \
     --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
-    --cross-attn-every "${CAE}" --unfreeze-top 0 --no-lora --val-subset 100 ${EXTRA}
+    --val-subset "${VAL_SUBSET}" ${EXTRA}
 
-rc=$?
-if [ $rc -eq 0 ]; then
-    slack ":white_check_mark: DONE ${PBS_JOBID} ${PBS_JOBNAME}"
-else
-    slack ":x: FAILED (exit ${rc}) ${PBS_JOBID} ${PBS_JOBNAME}"
-fi
-exit $rc
+finish $?

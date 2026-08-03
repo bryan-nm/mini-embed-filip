@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_inspect
-#PBS -l walltime=00:20:00
+#PBS -l walltime=00:30:00
 #PBS -l select=1
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -10,41 +10,42 @@
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
 
-module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd /flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
-
 # ---------------------------------------------------------------------------
-# Live token x token inspection for a list of proteins, using run-1 retrieval
-# weights. Reads protein_ids.txt (one primary_Accession per line), pulls the
-# sequence + caption from the legacy SwissProt CSV, encodes each pair fresh
-# (no cache needed), and writes a heatmap per accession to $OUT.
+# Per-token FILIP alignment heatmaps for a handful of accessions. Pulls each
+# accession's sequence + caption from the corpus, encodes the pair fresh (no
+# cache needed), and writes a heatmap per accession to PLOT_DIR.
 #
-# Single process / single tile — inspection is light, no mpiexec needed.
-# Runs on CPU: robust, no XPU/IPEX setup, and fine for a handful of proteins.
+# Single process, on CPU: inspection is light, and CPU avoids any XPU/IPEX setup.
+#
+# Model and dataset locations are NOT set here — config.py owns them.
 # ---------------------------------------------------------------------------
 
-# --- edit these ---
-CKPT=checkpoints/retrieval/epoch50.pt   # run-1 retrieval checkpoint
-IDS=protein_ids.txt                     # one primary_Accession per line
-OUT=inspect_out                         # heatmaps written here as <accession>.png
-TOPK=5
-CSV=/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505.csv
-MODELS_DIR=/flare/NLDesignProtein/bryan/FILIP-dev-space/models 
+source ./pbs_common.sh
+export OMP_NUM_THREADS=32          # single process, so take the whole node
 
-# config.py defaults to dev (Mac) model paths; point it at the cluster models.
-export FILIP_MODELS_DIR="$MODELS_DIR"
-export OMP_NUM_THREADS=32
+# ===========================================================================
+# Checkpoints and I/O
+# ===========================================================================
+RETRIEVAL_CKPT=checkpoints/retrieval/epoch50.pt
+ID_FILE=protein_ids.txt            # one primary_Accession per line
+PLOT_DIR=inspect_out               # heatmaps written as <accession>.png
 
-echo "inspecting $(wc -l < "$IDS") accessions from ${CSV}"
-mkdir -p "$OUT"
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+TOP_K=5
 
-python -m src.inspect \
-    --ckpt "$CKPT" \
-    --csv "$CSV" \
-    --id-file "$IDS" \
-    --device cpu \
-    --top-k "$TOPK" \
-    --plot-dir "$OUT"
+# ===========================================================================
+slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "FILIP alignment heatmaps (src.inspect)" \
+    RETRIEVAL_CKPT ID_FILE PLOT_DIR TOP_K
+require_files RETRIEVAL_CKPT ID_FILE
 
-echo "done; heatmaps in ${OUT}/"
+mkdir -p "${PLOT_DIR}"
+python -m src.inspect --device cpu \
+    --ckpt "${RETRIEVAL_CKPT}" \
+    --id-file "${ID_FILE}" --top-k "${TOP_K}" --plot-dir "${PLOT_DIR}"
+rc=$?
+
+echo "heatmaps in ${PLOT_DIR}/"
+finish $rc

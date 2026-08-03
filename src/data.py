@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -101,9 +101,11 @@ def group_ids_from_accessions(accessions: Sequence[str]) -> np.ndarray:
     """Per-row accession strings -> dense int group ids in first-appearance order.
 
     Rows describing the same protein (same accession) get the same id, so a
-    group-aware split keeps every caption of a protein on one side of the
-    train/val/test boundary. The augmented SwissProt corpus has ~8.87 captions
-    per protein; a row-level split would leak proteins across splits.
+    group-aware split keeps every row of a protein on one side of the
+    train/val/test boundary. The current corpus carries one caption per
+    accession, which makes this the identity — it is kept because a
+    multi-caption corpus would otherwise leak proteins across splits, and
+    because the same ids drive false-negative masking (see `mask_false_negatives`).
     """
     return dense_group_ids(accessions)
 
@@ -111,11 +113,11 @@ def group_ids_from_accessions(accessions: Sequence[str]) -> np.ndarray:
 def group_ids_from_texts(texts: Sequence[str]) -> np.ndarray:
     """Per-row caption strings -> dense int group ids in first-appearance order.
 
-    Rows sharing an *identical* caption get the same id. With the augmented
-    corpus some proteins carry byte-identical captions (generic descriptions,
-    duplicated entries); this id is used two ways: to mask same-caption columns
-    out of the contrastive denominator (false negatives), and — folded into the
-    split grouping — to keep identical captions on one side of the split.
+    Rows sharing an *identical* caption get the same id. Byte-identical captions
+    still occur across different proteins (generic descriptions, duplicated
+    entries), so this id is used two ways: to mask same-caption columns out of
+    the contrastive denominator (false negatives), and — folded into the split
+    grouping — to keep identical captions on one side of the split.
     """
     return dense_group_ids(texts)
 
@@ -184,11 +186,11 @@ def dedup_proteins(pairs: List["Pair"]):
       unique_seqs     : list[str]          -- one sequence per unique protein
       unique_ids      : list[str]          -- accessions, unique-protein order
 
-    The augmented corpus repeats each protein across ~8.87 caption rows; encoding
-    and storing the protein once per unique accession (rather than per row) saves
-    ~9x of the protein encoder pass (the precompute bottleneck) and ~1.5 TB of
-    cache. Dedup key is the accession, which is also the split group key, so the
-    two stay consistent.
+    The current corpus carries one caption per accession, so this collapses
+    nothing — it is kept because it costs one pass and is what makes a
+    multi-caption corpus affordable (encoding each protein once rather than once
+    per caption row). Dedup key is the accession, which is also the split group
+    key, so the two stay consistent.
     """
     mapping: dict = {}
     row_protein_idx = np.empty(len(pairs), dtype=np.int64)
@@ -390,7 +392,7 @@ class PackedPerTokenDataset(Dataset):
     """
 
     def __init__(self, cache_dir: str, indices: Sequence[int],
-                 protein_dim: int = 640, text_dim: int = 768,
+                 protein_dim: int = 960, text_dim: int = 768,
                  row_protein_idx: Optional[torch.Tensor] = None):
         self.indices = list(indices)
         self.protein_cache = PackedPerTokenCache(cache_dir, "protein", protein_dim)

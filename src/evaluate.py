@@ -6,7 +6,6 @@ measure, in place of the pooled cosine used by the previous mini-embed code.
 """
 from __future__ import annotations
 
-import math
 from typing import Dict
 
 import torch
