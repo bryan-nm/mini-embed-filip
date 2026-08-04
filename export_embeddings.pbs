@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_export_emb
-#PBS -l walltime=03:00:00
-#PBS -l select=16
+#PBS -l walltime=01:00:00
+#PBS -l select=2
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
-#PBS -q capacity
+#PBS -q debug
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be

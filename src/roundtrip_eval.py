@@ -59,7 +59,7 @@ from src.dist import init_distributed, barrier, cleanup
 from src.shards import check_shard_world, reset_shard_dir
 from src.encoders import (
     encode_protein_batch, encode_text_batch,
-    load_protein_encoder, load_text_encoder,
+    load_protein_encoder, load_text_encoder, protein_pppl,
 )
 from src.evaluate import average_precision
 from src.gen_ckpt import load_generation_ckpt
@@ -162,6 +162,19 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
 
     # Reference panel for margin selection: source-modality embeddings of train
     # rows (disjoint from the scored set, so selection doesn't peek at the metric).
+    # PPPL is a protein-side estimator; the flag is rejected for protein2text.
+    if args.pppl_passes:
+        if not _target_is_protein(args.direction):
+            raise SystemExit("--pppl-passes is text2protein only")
+        if args.pppl_passes < 2:
+            raise SystemExit("--pppl-passes must be 0 (off) or >= 2")
+
+    def _pppl(strs):
+        return protein_pppl(prot_model, prot_tok, strs, device,
+                            cfg.data.max_protein_tokens, passes=args.pppl_passes)
+
+    pppl_fn = _pppl if args.pppl_passes else None
+
     z_panel = panel_mask = None
     if N > 1 and args.selection == "margin" and panel_indices:
         with torch.no_grad():
@@ -212,6 +225,8 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
         z_gen = tgt_proj(h_gen.float())
         h_true, mask_true = enc_tgt(true_tgts)
         z_true = tgt_proj(h_true.float())
+        pppl_cand = pppl_fn(enc_in) if pppl_fn is not None else None
+        pppl_true_b = pppl_fn(true_tgts) if pppl_fn is not None else None
 
         for b in range(B):
             # Select the best of this source's N candidates by round-trip margin.
@@ -225,7 +240,12 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
                     zc, mc, zs, ms, z_panel, panel_mask, mode=args.selection)
             else:
                 best_j = 0
+            rec_extra = {}
+            if pppl_fn is not None:
+                rec_extra["pppl_gen"] = float(pppl_cand[js[best_j]])
+                rec_extra["pppl_true"] = float(pppl_true_b[b])
             records.append({
+                **rec_extra,
                 "uid": uids[b], "true_target": true_tgts[b],
                 "gen_target": cand_tgts[js[best_j]],
                 "z_gen": cand_z[best_j],                          # selected candidate
@@ -322,6 +342,7 @@ def generate_roundtrip_records(
     core, tokenizer, adapters, batches, *,
     prompt, pad_id, eos_id, tgt_proj, encode_generated, empty_target,
     max_new_tokens: int, temperature: float, top_p: float,
+    pppl_fn=None,
 ):
     """Generate free-running from each batch's memory and build round-trip records.
 
@@ -332,6 +353,15 @@ def generate_roundtrip_records(
         uids       list[str] of length B
         z_true     [B, Lt, D] optional — the true target's projection (ceiling row)
         mask_true  [B, Lt] bool, required when z_true is given
+        true_strs  list[str] optional — the true target text, only needed for the
+                   PPPL ceiling (the projections above come from the cache, which
+                   holds no strings)
+
+    `pppl_fn` maps a list of target strings to a per-string pseudo-perplexity
+    (see encoders.protein_pppl). When given, each record carries `pppl_gen`, and
+    `pppl_true` for any batch supplying `true_strs`. It measures PLAUSIBILITY,
+    not faithfulness to the source — a generic well-formed output scores well and
+    retrieves nothing — so it is a second axis alongside R@K, never a substitute.
 
     Returns (records, gen_body_lens). Each record holds the fp16 CPU per-token
     embeddings the scorer needs; `gen_body_lens` is the generated body length in
@@ -355,9 +385,12 @@ def generate_roundtrip_records(
         clear_cross_memory(adapters)
 
         gen_strs = [decode_target(core, tokenizer, row) for row in gen]
-        h_gen, m_gen = encode_generated(
-            [g if g.strip() else empty_target for g in gen_strs])
+        enc_in = [g if g.strip() else empty_target for g in gen_strs]
+        h_gen, m_gen = encode_generated(enc_in)
         z_gen = tgt_proj(h_gen.float())
+        pppl_gen = pppl_fn(enc_in) if pppl_fn is not None else None
+        pppl_true = (pppl_fn(batch["true_strs"])
+                     if pppl_fn is not None and batch.get("true_strs") else None)
 
         # Body length: tokens before the first EOS, or the whole tail if none.
         tail = gen[:, len(prompt):]
@@ -376,6 +409,10 @@ def generate_roundtrip_records(
                    "z_src": z_src[b][mask_src[b]].half().cpu()}
             if batch.get("z_true") is not None:
                 rec["z_true"] = batch["z_true"][b][batch["mask_true"][b]].half().cpu()
+            if pppl_gen is not None:
+                rec["pppl_gen"] = float(pppl_gen[b])
+            if pppl_true is not None:
+                rec["pppl_true"] = float(pppl_true[b])
             recs.append(rec)
     return recs, gen_lens
 
@@ -428,7 +465,15 @@ def score_roundtrip_records(recs, embed_dim: int, device, chunk_rows: int = 4,
         ceiling, _ = grouped_recall(S_true, groups, ks)
         del S_true
 
-    return {"n": len(recs), "gen2src": gen2src, "src2gen": src2gen}, ceiling
+    metrics = {"n": len(recs), "gen2src": gen2src, "src2gen": src2gen}
+    # Pseudo-perplexity, when the caller asked for it. nan-safe: a generation
+    # that tokenizes to no scoreable residue yields NaN rather than poisoning the
+    # mean, and a pool with none of them simply omits the key.
+    for key in ("pppl_gen", "pppl_true"):
+        vals = [r[key] for r in recs if key in r and r[key] == r[key]]
+        if vals:
+            metrics[key] = sum(vals) / len(vals)
+    return metrics, ceiling
 
 
 def score_and_write(args, device) -> None:
@@ -468,6 +513,12 @@ def score_and_write(args, device) -> None:
     S_true = filip_score_matrix_chunked(Z_true.to(device), Z_src, mask_true.to(device),
                                         mask_src, chunk_rows=args.filip_chunk_rows)
     ceiling, _ = grouped_recall(S_true, groups, ks)
+
+    for key in ("pppl_gen", "pppl_true"):
+        vals = [r[key] for r in recs if key in r and r[key] == r[key]]
+        if vals:
+            print(f"[rt][score] {key} = {sum(vals)/len(vals):.3f}  (n={len(vals)})",
+                  flush=True)
 
     tgt = "protein" if _target_is_protein(args.direction) else "text"
     src = "text" if _target_is_protein(args.direction) else "protein"
@@ -539,6 +590,10 @@ def main() -> None:
     ap.add_argument("--selection", choices=["margin", "pos"], default="margin")
     ap.add_argument("--panel-size", type=int, default=256,
                     help="train rows sampled as the selection reference panel")
+    ap.add_argument("--pppl-passes", type=int, default=0,
+                    help="text2protein only: report AMPLIFY pseudo-perplexity of the "
+                         "generated proteins (0 = off). See train_rl's --pppl-passes; "
+                         "it is enabled there and left off here by default")
     ap.add_argument("--score-only", action="store_true",
                     help="skip generation; merge+score existing shards (single process)")
     args = ap.parse_args()

@@ -127,6 +127,30 @@ EVAL_EVERY=200
 EVAL_SAMPLES=1000
 EVAL_MAX_NEW=${MAX_NEW_TOKENS}
 
+# AMPLIFY pseudo-perplexity of the generated proteins, reported next to the
+# round-trip R@K. ON here and OFF everywhere else, because this is where it
+# earns its keep: the reward is a FILIP score in the retrieval space, and a
+# policy can climb it with sequences that embed well but are not proteins.
+# R@K cannot see that — PPPL can. Read it as the second axis:
+#
+#   pppl_gen falling toward pppl_true, R@K rising   -> what you want
+#   R@K rising, pppl_gen climbing away from true    -> reward hacking; the
+#                                                      policy found embedding-
+#                                                      space junk
+#   pppl_gen at ~pppl_true, R@K flat                -> plausible but generic
+#
+# ALWAYS read it against pppl_true (the fixed pool's real proteins under the
+# identical estimator, printed alongside), never an absolute number — AMPLIFY
+# has memorized well-known proteins and scores those near 1.0.
+#
+# 8 masked passes: positions are partitioned by p % 8 and one class is masked per
+# pass, so 8 forwards score every residue exactly once under a real mask. That is
+# 12.5% masked at a time — the regime the model was trained in — and lands within
+# ~3% of exact PPPL for ~1/30 the cost. Cost here is 8 extra encoder forwards per
+# eval batch, against a generation step that dominates; the eval runs every
+# EVAL_EVERY steps. Set 0 to turn it off.
+PPPL_PASSES=8
+
 # Cold-start architecture. IGNORED when INIT_CKPT is set — a continued run takes
 # its architecture from the checkpoint's own header, so it cannot be reshaped.
 CROSS_ATTN_EVERY=1
@@ -163,7 +187,7 @@ job_banner "text2protein RL (src.train_rl)" \
     MAX_NEW_TOKENS TEMPERATURE TOP_P \
     LENGTH_LAMBDA LENGTH_TOLERANCE \
     REWARD_CONTRASTIVE MARGIN_BETA LOG_MARGIN_CEILING \
-    EVAL_EVERY EVAL_SAMPLES EVAL_MAX_NEW SAVE_EVERY LOG_EVERY \
+    EVAL_EVERY EVAL_SAMPLES EVAL_MAX_NEW PPPL_PASSES SAVE_EVERY LOG_EVERY \
     CROSS_ATTN_EVERY CROSS_ATTN_MODE UNFREEZE_TOP UNFREEZE_WHERE WARM_START_QALIGN
 require_files RETRIEVAL_CKPT INIT_CKPT
 
@@ -182,6 +206,6 @@ require_files RETRIEVAL_CKPT INIT_CKPT
     --length-lambda "${LENGTH_LAMBDA}" --length-tolerance "${LENGTH_TOLERANCE}" \
     --log-every "${LOG_EVERY}" --save-every "${SAVE_EVERY}" ${REWARD_EXTRA} \
     --eval-every "${EVAL_EVERY}" --eval-samples "${EVAL_SAMPLES}" \
-    --eval-max-new-tokens "${EVAL_MAX_NEW}"
+    --eval-max-new-tokens "${EVAL_MAX_NEW}" --pppl-passes "${PPPL_PASSES}"
 
 finish $?

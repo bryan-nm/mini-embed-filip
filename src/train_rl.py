@@ -70,6 +70,7 @@ from src.decoder_adapters import (
 from src.dist import barrier, cleanup, init_distributed
 from src.encoders import (
     encode_protein_batch, encode_text_batch, load_protein_encoder, load_text_encoder,
+    protein_pppl,
 )
 from src.gen_ckpt import GenMeta
 from src.losses import filip_score_matrix_chunked
@@ -196,7 +197,7 @@ def cosine_warmup_factor(step: int, total: int, warmup: int) -> float:
 def roundtrip_eval_inloop(core, dtok, adapters, pairs, eval_idx, prompt,
                           pad_id, eos_id, enc_src, src_proj, enc_tgt, tgt_proj, get_src,
                           get_tgt, empty_tgt, embed_dim,
-                          args, env, device, need_ceiling: bool):
+                          args, env, device, need_ceiling: bool, pppl_fn=None):
     """Free-running round-trip retrieval over a FIXED val subset.
 
     Identical measurement to `python -m src.roundtrip_eval`: same generation path
@@ -234,9 +235,13 @@ def roundtrip_eval_inloop(core, dtok, adapters, pairs, eval_idx, prompt,
             out = {"z_src": z_src, "mem": z_src, "mask_src": mask_src,
                    "uids": [pairs[i].uid for i in chunk]}
             if need_ceiling:
-                h_true, mask_true = enc_tgt([get_tgt(pairs[i]) for i in chunk])
+                true_strs = [get_tgt(pairs[i]) for i in chunk]
+                h_true, mask_true = enc_tgt(true_strs)
                 out["z_true"] = tgt_proj(h_true.float())
                 out["mask_true"] = mask_true
+                # The PPPL ceiling rides the same first-eval-only path as the R@K
+                # ceiling: it depends on the fixed pool alone, so it never moves.
+                out["true_strs"] = true_strs
             yield out
 
     recs, _ = generate_roundtrip_records(
@@ -244,7 +249,7 @@ def roundtrip_eval_inloop(core, dtok, adapters, pairs, eval_idx, prompt,
         prompt=prompt, pad_id=pad_id, eos_id=eos_id, tgt_proj=tgt_proj,
         encode_generated=lambda strs: enc_tgt(strs), empty_target=empty_tgt,
         max_new_tokens=args.eval_max_new_tokens, temperature=args.eval_temperature,
-        top_p=args.eval_top_p)
+        top_p=args.eval_top_p, pppl_fn=pppl_fn)
 
     recs = [r for part in gather_roundtrip_payloads(recs, env) for r in part]
     if not env.is_main:
@@ -399,6 +404,20 @@ def main() -> None:
                     help="eval nucleus cutoff (default: --top-p)")
     ap.add_argument("--eval-max-new-tokens", type=int, default=None,
                     help="default: --max-new-tokens")
+    ap.add_argument("--pppl-passes", type=int, default=0,
+                    help="report AMPLIFY pseudo-perplexity of the generated proteins "
+                         "alongside the round-trip eval (0 = off). N is the number of "
+                         "masked passes: positions are partitioned by p %% N and one "
+                         "class is masked per pass, so N forwards score every residue "
+                         "exactly once under a real mask. 8 masks 12.5%% at a time, "
+                         "close to the regime these models are trained under, and lands "
+                         "within ~3%% of exact PPPL at ~1/30 the cost. text2protein "
+                         "only — the estimator is AMPLIFY's masked head.\n"
+                         "This measures PLAUSIBILITY, not faithfulness: a generic "
+                         "well-formed protein scores well and retrieves nothing. Read "
+                         "pppl_gen against pppl_true on the same pool (printed "
+                         "alongside), not against an absolute scale — AMPLIFY has "
+                         "memorized well-known proteins and scores them near 1.0")
     ap.add_argument("--eval-filip-chunk-rows", type=int, default=4,
                     help="row chunk for the N x N FILIP scoring on rank 0; bounds the "
                          "transient (~chunk_rows*N*L_gen*L_src floats) on top of the "
@@ -413,6 +432,13 @@ def main() -> None:
     args = ap.parse_args()
     if args.group_size < 2:
         raise SystemExit("--group-size must be >= 2 (group-relative advantage needs a group)")
+    if args.pppl_passes and args.direction != "text2protein":
+        raise SystemExit(
+            "--pppl-passes is text2protein only: the estimator masks residues and "
+            "scores them with AMPLIFY's protein head, which has no meaning for a "
+            "generated caption")
+    if args.pppl_passes and args.pppl_passes < 2:
+        raise SystemExit("--pppl-passes must be 0 (off) or >= 2")
     if args.max_new_tokens is None:
         args.max_new_tokens = (cfg.data.max_protein_tokens
                                if args.direction == "text2protein"
@@ -673,7 +699,22 @@ def main() -> None:
     # set, so it's computed once and reused — the "done" flag is tracked on EVERY
     # rank, not inferred from rank 0's returned ceiling (only rank 0 scores), or the
     # non-main ranks would keep encoding true targets forever.
-    eval_state = {"ceiling": None, "done": False, "seconds": 0.0}
+    eval_state = {"ceiling": None, "pppl_true": None, "done": False, "seconds": 0.0}
+
+    # Pseudo-perplexity of the generated proteins, off unless --pppl-passes > 0.
+    # Uses the SAME frozen protein encoder the reward already re-encodes with, so
+    # this adds --pppl-passes forwards per eval batch on top of the one the eval
+    # already does; generation dominates, so it is a small slice of a small slice.
+    def _pppl(strs):
+        return protein_pppl(prot_model, prot_tok, strs, device,
+                            cfg.data.max_protein_tokens, passes=args.pppl_passes)
+
+    pppl_fn = _pppl if args.pppl_passes else None
+    if args.pppl_passes:
+        if env.is_main:
+            print(f"[rl] PPPL reporting ON ({args.pppl_passes} masked passes over "
+                  f"AMPLIFY). Plausibility, not faithfulness — read pppl_gen against "
+                  f"pppl_true, not against an absolute scale.", flush=True)
 
     def run_eval(step_id: int) -> None:
         if not eval_idx:
@@ -687,11 +728,15 @@ def main() -> None:
                 core, dtok, adapters, pairs, eval_idx, prompt, pad_id, eos_id,
                 enc_src, src_proj, enc_tgt, tgt_proj, get_src, get_tgt, empty_tgt,
                 cfg.model.embed_dim, args, env, device,
-                need_ceiling=not eval_state["done"])
+                need_ceiling=not eval_state["done"], pppl_fn=pppl_fn)
         finally:
             rng_restore(device, rng)
         if ceiling is not None:
             eval_state["ceiling"] = ceiling
+        # pppl_true is a property of the fixed pool, so it is computed on the
+        # first eval alongside the R@K ceiling and reused from then on.
+        if metrics is not None and metrics.get("pppl_true") is not None:
+            eval_state["pppl_true"] = metrics["pppl_true"]
         eval_state["done"] = True
         dt = time.time() - t_ev
         eval_state["seconds"] += dt
@@ -700,13 +745,22 @@ def main() -> None:
             ceil = eval_state["ceiling"] or {}
             # R@K is only reported for k <= pool size, so a tiny --eval-samples
             # has no R@10.
+            # pppl_gen is this step's generations; pppl_true is the fixed pool's
+            # true proteins under the identical estimator — the only scale on
+            # which pppl_gen means anything.
+            pppl_msg = ""
+            if metrics.get("pppl_gen") is not None:
+                metrics["pppl_true"] = eval_state["pppl_true"]
+                pppl_msg = (f"pppl gen={metrics['pppl_gen']:.2f} "
+                            f"true={eval_state['pppl_true']:.2f} | ")
             print(f"[rl][rt] step={step_id} n={metrics['n']} "
                   f"gen->src R@1={g2s['R@1']:.4f} "
                   f"R@10={g2s.get('R@10', float('nan')):.4f} "
                   f"mAP={g2s['mAP']:.4f} medrank={g2s['median_rank']:.0f} | "
                   f"src->gen R@1={s2g['R@1']:.4f} mAP={s2g['mAP']:.4f} | "
                   f"ceiling R@1={ceil.get('R@1', float('nan')):.4f} "
-                  f"mAP={ceil.get('mAP', float('nan')):.4f} | {dt:.1f}s", flush=True)
+                  f"mAP={ceil.get('mAP', float('nan')):.4f} | {pppl_msg}{dt:.1f}s",
+                  flush=True)
             with open(ckpt_dir / "rl_roundtrip.jsonl", "a") as f:
                 f.write(json.dumps({"step": step_id, "seconds": round(dt, 2),
                                     "ceiling": eval_state["ceiling"], **metrics}) + "\n")

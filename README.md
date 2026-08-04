@@ -477,7 +477,32 @@ re-queued job after a wall-time kill picks up where it left off.
 | `--length-lambda` / `--length-tolerance` | `0` / `0.25` | two-sided log-symmetric length band |
 | `--reward-contrastive` / `--reward-margin-beta` | off / `1.0` | margin reward instead of the raw positive score |
 | `--eval-every` / `--eval-samples` | `200` / `1000` | held-out round-trip metric → `rl_roundtrip.jsonl` |
+| `--pppl-passes` | `0` (off) | AMPLIFY pseudo-perplexity of the generations; text2protein only |
 | `--cross-attn-every`, `--cross-attn-mode`, `--unfreeze-top`, `--unfreeze-where`, `--warm-start-qalign` | | cold start only |
+
+**Pseudo-perplexity (`--pppl-passes`).** The reward is a FILIP score in the
+retrieval space, so a policy can climb it with sequences that embed well without
+being proteins — and R@K cannot see that, because it is computed in the same
+space the policy is gaming. PPPL is the second axis. AMPLIFY is a masked LM, so
+the meaningful number masks each residue before scoring it; scoring without
+masking is free (the head's logits are already computed) but nearly useless — a
+real protein and a shuffle of its own amino acids come out at 1.40 vs 1.46,
+against 1.0–1.2 vs 22–23 for the masked version.
+
+Exact PPPL is one forward per residue. `--pppl-passes N` partitions positions by
+`p % N` and masks one class per pass, so N forwards score every residue exactly
+once under a real mask. At the default 8 that masks 12.5% at a time — the regime
+these models are trained under — and measured within ~3% of exact PPPL at ~1/30
+the cost.
+
+Read `pppl_gen` against the `pppl_true` printed beside it (the fixed pool's real
+proteins under the identical estimator), never against an absolute scale: AMPLIFY
+has memorized well-known proteins and scores those near 1.0. The signature to
+watch is `pppl_gen` falling toward `pppl_true` while R@K rises. R@K rising while
+`pppl_gen` climbs away from true is reward hacking.
+
+Enabled in `train_t2p_rl.pbs` and off everywhere else, including
+`roundtrip_eval` (where the flag exists for spot checks) and the SFT trainers.
 
 ### `src/roundtrip_eval`
 

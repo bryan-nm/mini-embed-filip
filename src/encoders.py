@@ -334,6 +334,69 @@ def _protein_valid_mask(input_ids: torch.Tensor, attention_mask: torch.Tensor,
 
 
 @torch.no_grad()
+def protein_pppl(model, tokenizer, seqs: List[str], device: torch.device,
+                 max_len: int, passes: int = 8) -> torch.Tensor:
+    """Pseudo-perplexity per sequence, by a strided masked-subset estimator.
+
+    AMPLIFY is a MASKED LM, so the token-level number worth reporting is
+    pseudo-perplexity: mask a position, score the true residue against the
+    resulting distribution, repeat. Scoring WITHOUT masking is not a perplexity —
+    the model sees the residue it is predicting, and the measured dynamic range
+    collapses to ~1.0-1.7 between a real protein and a shuffle of the same amino
+    acids, against ~1.0-23 for the masked version. The unmasked number is free
+    (`forward` already returns logits) and almost meaningless; this is the one
+    that separates.
+
+    Exact PPPL costs one forward per residue. Instead we partition positions by
+    `p % passes` and mask one class per pass, so `passes` forwards score EVERY
+    position exactly once, each under a genuine mask. The approximation is that
+    the other masked positions in the same pass are also hidden, so each
+    prediction sees (1 - 1/passes) of its context rather than all of it. At the
+    default 8 that is 12.5% masked — close to the 15% these models are trained
+    under, so it is in-distribution rather than an extrapolation. Fewer passes is
+    cheaper and biases PPPL upward (less context); more is closer to exact.
+
+    Returns [B] float32 on CPU. A sequence with no scoreable position yields NaN,
+    so callers must aggregate with nan-safe means.
+    """
+    if passes < 2:
+        raise ValueError(
+            f"protein_pppl needs passes >= 2 (got {passes}); passes=1 masks every "
+            f"position at once, which scores residues against no context at all")
+    mask_id = getattr(tokenizer, "mask_token_id", None)
+    if mask_id is None:
+        raise ValueError("protein_pppl needs a tokenizer with a <mask> token")
+
+    enc = tokenizer(seqs, padding=True, truncation=True, max_length=max_len,
+                    return_tensors="pt")
+    ids = enc["input_ids"].to(device)
+    pad_mask = enc["attention_mask"].to(device)
+    additive = _amplify_additive_mask(pad_mask)
+    # Score only real residues: specials carry no sequence content and would
+    # dilute the number with trivially-predictable positions.
+    scoreable = _protein_valid_mask(ids, pad_mask, tokenizer, mask_specials=True)
+
+    B, L = ids.shape
+    pos = torch.arange(L, device=device)
+    total = torch.zeros(B, device=device, dtype=torch.float64)
+    count = torch.zeros(B, device=device, dtype=torch.float64)
+    for j in range(passes):
+        sel = scoreable & ((pos % passes) == j)[None, :]        # [B, L]
+        if not bool(sel.any()):
+            continue
+        masked = ids.masked_fill(sel, mask_id)
+        logits = model(input_ids=masked, attention_mask=additive).logits
+        logp = torch.log_softmax(logits.float(), dim=-1)
+        gold = logp.gather(-1, ids.unsqueeze(-1)).squeeze(-1)   # [B, L]
+        total += (gold * sel).sum(dim=1).double()
+        count += sel.sum(dim=1).double()
+
+    mean_nll = -total / count.clamp_min(1)
+    ppl = torch.exp(mean_nll).float()
+    return torch.where(count > 0, ppl, torch.full_like(ppl, float("nan"))).cpu()
+
+
+@torch.no_grad()
 def encode_protein_batch(
     model, tokenizer, seqs: List[str], device: torch.device,
     max_len: int, mask_specials: bool = True,
