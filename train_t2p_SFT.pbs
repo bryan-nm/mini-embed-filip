@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_t2p_sft
-#PBS -l walltime=08:00:00
+#PBS -l walltime=12:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -21,6 +21,9 @@
 # ---------------------------------------------------------------------------
 
 MASTER_PORT=29502
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
 # ===========================================================================
@@ -40,10 +43,10 @@ CKPT_DIR=checkpoints/generation            # writes <CKPT_DIR>/text2protein/
 # vs (B=64, T=512) the linear term B*T is identical and the attention term B*T^2
 # is halved, so this is the same-or-smaller footprint at twice the batch.
 #
-# WALL TIME BASIS: per step is same-to-half the old cost, steps/epoch halve from
-# the doubled batch, and the row count falls with one caption per accession. The
-# per-epoch round-trip eval also halves (RT_MAX_NEW tracks the cap). 8h against
-# the old 16h; read the per-epoch "done in" line on the first job.
+# WALL TIME BASIS: ~575k rows at 192 ranks x B=64 is ~47 steps/epoch, ~936 steps
+# over 20 epochs (against ~1868 before). Per step is same-to-half the old ~31s,
+# so ~6-7h of training plus 20 round-trip evals. 12h, not 8 — at ~25s/step this
+# is the job with the least margin after p2t, and the eval is not free.
 BATCH_SIZE=64
 EPOCHS=20
 LR=1.5e-4

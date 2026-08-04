@@ -33,6 +33,9 @@
 # ---------------------------------------------------------------------------
 
 MASTER_PORT=29503
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
 # ===========================================================================
@@ -50,9 +53,13 @@ CKPT_DIR=checkpoints/generation            # writes <CKPT_DIR>/protein2text/
 # protein source) halved, and that is not the binding term. Raising the batch
 # here would be sizing against the wrong tensor.
 #
-# WALL TIME BASIS: unchanged per step, so the only saving is fewer rows. Kept at
-# 16h for that reason — this is the slowest job in the repo per step and the one
-# least helped by the shorter proteins.
+# WALL TIME BASIS: this one does NOT get cheaper. ~575k rows at 192 ranks x B=8
+# is ~374 steps/epoch, ~7487 steps over 20 epochs — essentially identical to the
+# old ~7474, because the row count barely moved (the old corpus had the same
+# number of ROWS, just 8.87 captions over 64.7k proteins instead of one each) and
+# per-step cost is set by BioGPT over a 512-token caption, which is untouched.
+# At the ~8s/step the old budget implied, 20 epochs is ~16h — i.e. AT the wall.
+# Hence RESUME_ARGS below: a wall-time kill costs one epoch, not the job.
 BATCH_SIZE=8
 EPOCHS=20
 LR=1.5e-4
@@ -96,6 +103,19 @@ RT_SAMPLES=512
 RT_MAX_NEW=${MAX_TARGET_TOKENS}
 
 # ===========================================================================
+# This job sits at its wall-time budget (see WALL TIME BASIS above), so make a
+# kill recoverable: continue from the latest epoch checkpoint if one exists,
+# otherwise start fresh from the retrieval checkpoint. Re-queuing the script is
+# then the whole recovery procedure. --resume auto rejects an empty directory,
+# which is why this is conditional rather than unconditional.
+if ls ${CKPT_DIR}/protein2text/epoch*.pt >/dev/null 2>&1; then
+    RESUME_ARGS="--resume auto"
+    RESUME_MODE="continuing from the latest epoch in ${CKPT_DIR}/protein2text"
+else
+    RESUME_ARGS=""
+    RESUME_MODE="fresh start from ${RETRIEVAL_CKPT}"
+fi
+
 EXTRA=""
 [ "$GRAD_CKPT" = 1 ] && EXTRA="--grad-checkpointing"
 if [ "$RT_SAMPLES" = 0 ]; then
@@ -117,7 +137,7 @@ job_banner "protein2text SFT (src.train_generation)" \
     RETRIEVAL_CKPT CKPT_DIR \
     BATCH_SIZE EPOCHS LR GRAD_CKPT MAX_TARGET_TOKENS \
     CROSS_ATTN_EVERY CROSS_ATTN_MODE MEMORY_SPACE UNFREEZE_TOP UNFREEZE_WHERE \
-    COV_LAMBDA COV_TAU RT_SAMPLES RT_MAX_NEW VAL_SUBSET
+    COV_LAMBDA COV_TAU RT_SAMPLES RT_MAX_NEW VAL_SUBSET RESUME_MODE
 require_files RETRIEVAL_CKPT
 
 # Per epoch, [gen][rt] reports free-running round-trip retrieval on a fixed val
@@ -134,6 +154,6 @@ require_files RETRIEVAL_CKPT
     --batch-size "${BATCH_SIZE}" --epochs "${EPOCHS}" --lr "${LR}" \
     --max-target-tokens "${MAX_TARGET_TOKENS}" \
     --coverage-lambda "${COV_LAMBDA}" --coverage-tau "${COV_TAU}" \
-    --val-subset "${VAL_SUBSET}" ${EXTRA}
+    --val-subset "${VAL_SUBSET}" ${RESUME_ARGS} ${EXTRA}
 
 finish $?

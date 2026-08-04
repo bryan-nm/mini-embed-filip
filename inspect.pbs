@@ -20,6 +20,9 @@
 # Model and dataset locations are NOT set here — config.py owns them.
 # ---------------------------------------------------------------------------
 
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 export OMP_NUM_THREADS=32          # single process, so take the whole node
 

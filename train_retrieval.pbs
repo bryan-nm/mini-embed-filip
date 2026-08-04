@@ -18,6 +18,9 @@
 # ---------------------------------------------------------------------------
 
 MASTER_PORT=29501
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
 # ===========================================================================
@@ -44,11 +47,11 @@ CKPT_DIR=checkpoints/retrieval
 # comparable to pre-sweep runs. Hold it FIXED across the embed_dim sweep — that
 # is the comparison that matters. Set BATCH_SIZE=16 to reproduce the old pool.
 #
-# WALL TIME BASIS: per-step FILIP arithmetic is ~2x cheaper (L_p halves and D
-# drops 4x, but B and the column count both double), and steps/epoch fall with
-# both the doubled batch and the one-caption-per-accession row count. 8h is
-# generous against the old 16h even on a pessimistic row count; read s/step off
-# the first job.
+# WALL TIME BASIS: the corpus is ~575k rows (counted off precompute's own rank
+# ranges). At 192 ranks x B=32 that is ~94 steps/epoch, ~1965 steps over 21
+# epochs, against ~3924 before. Per step is ~2x cheaper (L_p halves and D drops
+# 4x, but B and the column count both double), so ~7-8s/step against the ~15s
+# the old 16h budget implied => ~4h. 8h holds with room.
 BATCH_SIZE=32
 GROUP_SIZE=16
 PHASE1_EPOCHS=1

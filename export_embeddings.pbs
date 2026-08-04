@@ -22,6 +22,9 @@
 # ---------------------------------------------------------------------------
 
 MASTER_PORT=29508
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
 # ===========================================================================
@@ -36,12 +39,12 @@ NAME=swissprot         # outputs <OUT_DIR>/<NAME>_pooled.npz
 # ===========================================================================
 POOLING=mean           # mean = one vector per item; none = full per-token packed
 # Encoder batch: keep it equal to precompute.pbs, since this runs the same
-# encoders over the same corpus. Attention memory is O(BATCH_SIZE * seqlen^2);
-# 128 is the conservative read at the 512-token protein cap (see precompute.pbs).
+# encoders over the same corpus — including the revert to the known-good 64 (see
+# the GPU page-fault note there).
 #
-# WALL TIME BASIS: same 4x per-protein saving as precompute, so 3h against the
-# old 6h.
-BATCH_SIZE=128
+# WALL TIME BASIS: same per-protein cost as precompute, over ~575k proteins;
+# precompute's protein phase measured ~3.4 min/rank, so 3h is generous.
+BATCH_SIZE=64
 
 # ===========================================================================
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"

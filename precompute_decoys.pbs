@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_precompute_decoys
-#PBS -l walltime=02:00:00
-#PBS -l select=16
+#PBS -l walltime=01:00:00
+#PBS -l select=2
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
-#PBS -q capacity
+#PBS -q debug
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
@@ -20,6 +20,9 @@
 # ---------------------------------------------------------------------------
 
 MASTER_PORT=29506
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
 # ===========================================================================

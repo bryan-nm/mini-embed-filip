@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_precompute
-#PBS -l walltime=02:00:00
-#PBS -l select=16
+#PBS -l walltime=01:00:00
+#PBS -l select=2
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
-#PBS -q capacity
+#PBS -q debug
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
@@ -18,6 +18,9 @@
 # ---------------------------------------------------------------------------
 
 MASTER_PORT=29500
+# PBS runs this from a spooled copy with $HOME as the working directory, so the
+# cd MUST come before the source — see pbs_common.sh.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
 # ===========================================================================
@@ -28,18 +31,42 @@ CACHE_DIR=cache
 # ===========================================================================
 # Hyperparameters
 # ===========================================================================
-# Encoder batch. AMPLIFY attention is materialized full (~[B,H,L,L]) on the
-# non-fused XPU path, so memory is O(BATCH_SIZE * seqlen^2). 64 was the largest
-# that fit at the old 1024-token protein cap; at 512 that term is 4x smaller,
-# while the fp32 hidden-state buffers (O(B*L*d)) only halve — so the real
-# headroom is between 2x and 4x. 128 takes the conservative end: if it runs with
-# room to spare, 256 is the ceiling the L^2 term allows; if it OOMs, go back.
+# Encoder batch. 64 is the KNOWN-GOOD value — the only one with a completed run
+# behind it. It was briefly raised to 128 on the theory that the 512-token cap
+# left headroom in AMPLIFY's O(BATCH_SIZE * seqlen^2) attention; job 8731358 then
+# died ~6 min in with a GPU page fault (one rank aborted, the rest were torn
+# down). Reverted, because a completed run beats an argument.
 #
-# WALL TIME BASIS: per-protein encode is ~4x cheaper at a 512 cap, and the text
-# side no longer repeats a protein's row per caption. 2h has slack against the
-# old 3h before the row count is even counted — check the [precompute] items/s
-# line on the first job and re-trim.
-BATCH_SIZE=128
+# For the record, that argument does NOT explain the crash, so do not assume 64
+# is the fix: at B=128/L=512 the [B,H,L,L] fp32 tensors are ~1.9 GB each, LESS
+# than the ~3.8 GB the known-good B=64/L=1024 config carried. If 64 also faults,
+# the batch was never the cause — see the debug recipe below.
+BATCH_SIZE=64
+
+# --- if this job faults again -------------------------------------------------
+# The failure signature to match is:
+#   "Segmentation fault from GPU at 0x..., type: 0 (NotPresent), access: 1 (Write)"
+# That is a DEVICE-side page fault, not filesystem contention — a shared-FS
+# problem shows up as EIO/SIGBUS on an mmap'd page or as a hang, not as a GPU
+# PDE fault. So dropping the node count is a way to iterate cheaply, not a fix.
+#
+# Bisect on 2 nodes in the debug queue (edit the two PBS lines at the top):
+#   #PBS -l select=2
+#   #PBS -q debug
+# and add --subset-size to bound it, e.g. `--subset-size 20000` on the python
+# line below. Then, in order:
+#   1. Does it survive at all on 2 nodes? If yes, raise nodes until it faults —
+#      that points at scale/fabric, not the encoder.
+#   2. If it faults on 2 nodes too, it is per-rank: bisect BATCH_SIZE down.
+#   3. Note WHICH node the aborting rank sat on. Aurora tiles do fail
+#      individually; if a re-run at identical settings dies on the SAME node it
+#      is that node, and if it dies on a DIFFERENT one it is systematic. That
+#      one bit is the cheapest thing to establish first — just resubmit.
+#
+# WALL TIME BASIS: measured on the crashed job — rank 0 ran 14.9 proteins/s, so
+# ~2998 proteins/rank is ~3.4 min for the protein phase; text is a comparable
+# pass. The corpus has ~575k unique proteins (8.9x the old 64.7k, since captions
+# no longer repeat them), and it still lands far inside 2h.
 
 # ===========================================================================
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
