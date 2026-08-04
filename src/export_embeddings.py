@@ -56,6 +56,7 @@ from src.data import (
     load_splits,
 )
 from src.model import load_retrieval
+from src.shards import check_shard_world, reset_shard_dir
 
 
 def _device(name: str) -> torch.device:
@@ -250,7 +251,8 @@ def _live_shard(items, ids, start, prefix, encode_fn, proj, shards_dir, env,
                     zr.tofile(fbin)
                     offsets.append(offsets[-1] + zr.shape[0])
         with open(shards_dir / f"{prefix}meta.{tag}.json", "w") as f:
-            json.dump({"start": start, "offsets": offsets, "ids": ids}, f)
+            json.dump({"start": start, "world": env.world_size,
+                       "offsets": offsets, "ids": ids}, f)
 
 
 def _merge_live_pooled(shards_dir, prefix):
@@ -272,11 +274,16 @@ def _merge_live_pertoken(shards_dir, shard_prefix, out_prefix):
     "protein"); `out_prefix` is the final output basename.
     """
     pieces = []
+    metas = []
     for mp in glob.glob(str(shards_dir / f"{shard_prefix}meta.*.json")):
         with open(mp) as f:
             meta = json.load(f)
+        metas.append(meta)
         tag = Path(mp).name.split(".")[-2]
         pieces.append((meta["start"], tag, meta))
+    # Concatenation with no contiguity check: stale shards would silently add
+    # rows to the export. See src/shards.py.
+    check_shard_world(metas, shards_dir, f"{shard_prefix} export shards")
     pieces.sort(key=lambda t: t[0])
 
     offsets = [0]
@@ -329,9 +336,9 @@ def run_live(args, cfg) -> None:
 
     out_dir = Path(args.out_dir)
     shards_dir = out_dir / f"{args.name}_shards"
-    if env.is_main:
-        shards_dir.mkdir(parents=True, exist_ok=True)
-    barrier()
+    # Clear the previous run's shards: the merges below just concatenate, so
+    # leftovers from a different world size would silently pad the export.
+    reset_shard_dir(shards_dir, env)
 
     # Rank-0-first load (AMPLIFY's trust_remote_code module cache is written once).
     def _load():

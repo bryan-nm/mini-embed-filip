@@ -71,6 +71,7 @@ from src.decoys import (
     write_decoy_fingerprint,
 )
 from src.dist import barrier, cleanup, init_distributed
+from src.shards import check_shard_world, reset_shard_dir
 from src.encoders import (
     encode_text_batch,
     load_text_encoder,
@@ -243,7 +244,8 @@ def load_plan(decoy_cache_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 def encode_shard(args, cfg, env) -> None:
     shards_dir = Path(args.shards_dir)
-    shards_dir.mkdir(parents=True, exist_ok=True)
+    # See src/shards.py: a retry at a different world size leaves orphans.
+    reset_shard_dir(shards_dir, env)
     device = env.device
 
     _, texts = load_corpus(cfg, args, verbose=env.is_main)
@@ -308,7 +310,8 @@ def encode_shard(args, cfg, env) -> None:
     mask_fh.close()
 
     with open(shards_dir / f"decoymeta.{tag}.json", "w") as f:
-        json.dump({"rank": env.rank, "start": start, "end": end,
+        json.dump({"rank": env.rank, "world": env.world_size,
+                   "start": start, "end": end,
                    "lens": lens, "keep": keep}, f)
     print(f"[decoy][rank {env.rank}] shard done: {len(lens)} decoys, "
           f"{sum(lens)} tokens, {n_dropped} dropped (swap outside the token window)",
@@ -327,18 +330,21 @@ def merge_shards(args, cfg) -> None:
     m = int(plan["owner_row"].shape[0])
     n_rows = int(plan["row_ptr"].shape[0] - 1)
 
-    metas = sorted(glob.glob(str(shards_dir / "decoymeta.*.json")))
-    if not metas:
+    meta_paths = sorted(glob.glob(str(shards_dir / "decoymeta.*.json")))
+    if not meta_paths:
         raise RuntimeError(f"No decoy shard metadata in {shards_dir}; encode first.")
+    metas = []
+    for mp in meta_paths:
+        with open(mp) as f:
+            metas.append(json.load(f))
+    check_shard_world(metas, shards_dir, "decoy shards")
 
     h_out = open(out_dir / "decoy_h.bin", "wb")
     mask_out = open(out_dir / "decoy_mask.bin", "wb")
     offsets = [0]
     keep: list[int] = []
     expect_start = 0
-    for mp in metas:
-        with open(mp) as f:
-            meta = json.load(f)
+    for mp, meta in zip(meta_paths, metas):
         if meta["start"] != expect_start:
             raise RuntimeError(
                 f"decoy shard gap/overlap: {mp} starts at {meta['start']}, expected "

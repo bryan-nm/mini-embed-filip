@@ -56,6 +56,7 @@ from src.decoder_adapters import (
     clear_cross_memory, target_prefix_ids,
 )
 from src.dist import init_distributed, barrier, cleanup
+from src.shards import check_shard_world, reset_shard_dir
 from src.encoders import (
     encode_protein_batch, encode_text_batch,
     load_protein_encoder, load_text_encoder,
@@ -86,7 +87,10 @@ def _target_is_protein(direction: str) -> bool:
 def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> None:
     device = env.device
     shards_dir = Path(args.shards_dir)
-    shards_dir.mkdir(parents=True, exist_ok=True)
+    # Clear the previous run's shards first. This merge just concatenates — it
+    # has no contiguity check — so stale shards would silently add rows to the
+    # scored pool and quietly change R@K rather than failing. See src/shards.py.
+    reset_shard_dir(shards_dir, env)
 
     start, end = _shard_range(len(sel_indices), env.rank, env.world_size)
     my = sel_indices[start:end]
@@ -236,7 +240,8 @@ def generate_shard(args, cfg, env, sel_indices, pairs, panel_indices=None) -> No
                   f"eta={(len(my)-done)/max(rate,1e-6)/60:.1f} min", flush=True)
             last_log = time.time()
 
-    torch.save({"start": start, "direction": args.direction, "records": records},
+    torch.save({"start": start, "world": env.world_size,
+                "direction": args.direction, "records": records},
                shards_dir / f"shard.{env.rank:05d}.pt")
     print(f"[rt][rank {env.rank}] wrote {len(records)} records", flush=True)
 
@@ -431,9 +436,11 @@ def score_and_write(args, device) -> None:
     shards = sorted(glob.glob(str(Path(args.shards_dir) / "shard.*.pt")))
     if not shards:
         raise RuntimeError(f"No shards in {args.shards_dir}; run generation first.")
-    recs = []
-    for sp in shards:
-        recs.extend(torch.load(sp, map_location="cpu")["records"])
+    loaded = [torch.load(sp, map_location="cpu") for sp in shards]
+    # This concatenation has no other integrity check, so a mixed shard
+    # directory would just inflate the candidate pool and change R@K silently.
+    check_shard_world(loaded, args.shards_dir, "round-trip shards")
+    recs = [r for sh in loaded for r in sh["records"]]
     n = len(recs)
     print(f"[rt][score] merged {n} records from {len(shards)} shards", flush=True)
 

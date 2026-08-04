@@ -61,6 +61,7 @@ from src.data import (
     write_cache_fingerprint,
 )
 from src.dist import barrier, cleanup, init_distributed
+from src.shards import check_shard_world, reset_shard_dir
 from src.encoders import (
     encode_protein_batch,
     encode_text_batch,
@@ -135,7 +136,10 @@ def _encode_modality(items, ids, start, end, prefix, encode_fn,
     torch.save({"sum": tok_sum, "count": tok_count},
                shards_dir / f"{prefix}_sum.{tag}.pt")
     with open(shards_dir / f"{prefix}meta.{tag}.json", "w") as f:
-        json.dump({"rank": env.rank, "start": start, "end": end,
+        # "world" stamps which run produced this shard; the merge refuses a
+        # directory that mixes generations (see src/shards.py).
+        json.dump({"rank": env.rank, "world": env.world_size,
+                   "start": start, "end": end,
                    "lens": lens, "ids": ids}, f)
     print(f"[precompute][rank {env.rank}][{prefix}] shard done: {len(ids)} rows, "
           f"{sum(lens)} tokens", flush=True)
@@ -144,7 +148,11 @@ def _encode_modality(items, ids, start, end, prefix, encode_fn,
 def encode_shard(args, cfg, env) -> None:
     device = env.device
     shards_dir = Path(args.shards_dir)
-    shards_dir.mkdir(parents=True, exist_ok=True)
+    # Clear any previous run's shards before writing. A retry at a DIFFERENT
+    # world size only overwrites the low-numbered ones and leaves the rest, and
+    # the merge then walks into the leftovers. Rank 0 clears, all ranks barrier,
+    # then we write.
+    reset_shard_dir(shards_dir, env)
 
     mask_text_specials = not args.no_mask_text_specials
     mask_protein_specials = not args.no_mask_protein_specials
@@ -229,10 +237,17 @@ def _merge_modality(shards_dir: Path, cache_dir: Path, prefix: str,
     Validates that the shards tile [0, expected_total) contiguously. Returns
     (offsets_tensor [rows+1], ids list).
     """
-    metas = sorted(glob.glob(str(shards_dir / f"{prefix}meta.*.json")))
-    if not metas:
+    meta_paths = sorted(glob.glob(str(shards_dir / f"{prefix}meta.*.json")))
+    if not meta_paths:
         raise RuntimeError(
             f"No {prefix} shard metadata in {shards_dir}; run encode first.")
+    metas = []
+    for mp in meta_paths:
+        with open(mp) as f:
+            metas.append(json.load(f))
+    # Catch a directory holding two runs' shards BEFORE the contiguity walk
+    # below, which would otherwise report it as a confusing "gap/overlap".
+    check_shard_world(metas, shards_dir, f"{prefix} shards")
     h_out = open(cache_dir / f"{prefix}_h.bin", "wb")
     mask_out = open(cache_dir / f"{prefix}_mask.bin", "wb")
     offsets = [0]
@@ -241,9 +256,7 @@ def _merge_modality(shards_dir: Path, cache_dir: Path, prefix: str,
     mean_sum = None            # corpus token-sum accumulated across shards
     mean_count = 0
     have_all_sums = True
-    for mp in metas:
-        with open(mp) as f:
-            meta = json.load(f)
+    for mp, meta in zip(meta_paths, metas):
         if meta["start"] != expect_start:
             raise RuntimeError(
                 f"{prefix} shard gap/overlap: {mp} starts at {meta['start']}, "

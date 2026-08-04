@@ -1,10 +1,21 @@
 #!/bin/bash
-# Shared setup for every PBS job in this repo. Source it near the top of a job
-# script, after setting MASTER_PORT (each job uses its own so two concurrent jobs
-# on the same node don't collide) and optionally RANKS_PER_NODE.
+# Shared setup for every PBS job in this repo. Every job script starts with:
 #
 #   MASTER_PORT=29502
+#   cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 #   source ./pbs_common.sh
+#
+# THE cd IS REQUIRED, AND IT HAS TO COME FIRST. PBS copies the job script into
+# /var/spool/pbs/mom_priv/jobs/ and runs it with $HOME as the working directory —
+# NOT the directory you submitted from. So `source ./pbs_common.sh` without the
+# cd looks for it in $HOME and fails, and every helper this file defines is then
+# "command not found" (and `python` too, since the venv activate below never
+# ran). That is the whole of that failure mode.
+#
+# PBS_O_WORKDIR is the directory qsub was invoked from, so the repo's location is
+# written down nowhere: move the checkout and the scripts follow it. If you would
+# rather pin it, replace that line in each script with a literal
+# `cd /path/to/mini-embed-filip`.
 #
 # What this does NOT do, deliberately: set FILIP_MODELS_DIR, FILIP_DATA_CSV, or
 # any other model/dataset path. config.py owns those. A job script that exports
@@ -12,10 +23,16 @@
 # recording something other than what the job read.
 set -o pipefail
 
-REPO=/flare/NLDesignProtein/bryan/FILIP-dev-space/mini-embed-filip
+# Confirm the cd actually landed in the repo before anything depends on it —
+# otherwise the failure surfaces much later as a confusing import error.
+if [ ! -f config.py ] || [ ! -d src ]; then
+    echo "FATAL: $(pwd) is not the mini-embed-filip repo root (no config.py / src/)." >&2
+    echo "       Submit with qsub from the repo root, or edit the cd in this job script." >&2
+    exit 1
+fi
+
 module load frameworks
 source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
-cd "${REPO}" || { echo "FATAL: cannot cd to ${REPO}" >&2; exit 1; }
 
 # --- topology: 12 tiles/node ---
 RANKS_PER_NODE=${RANKS_PER_NODE:-12}
@@ -23,7 +40,16 @@ NNODES=$(wc -l < "$PBS_NODEFILE" | tr -d " ")
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
 
 # --- tiles individually addressable + rendezvous for torch.distributed ---
-export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"   # not the doubled OpenCL+L0 default
+# Set AFTER `module load frameworks`, which is what makes this stick. The
+# frameworks module now defaults ONEAPI_DEVICE_SELECTOR to
+# "opencl:gpu;level_zero:gpu" (for Triton-XPU / vLLM / Ray / dpctl) and prints an
+# Lmod warning saying so. That warning is emitted at load time and is expected:
+# the export below overrides it right after, back to the Level-Zero-only
+# selector every job in this repo has always used. Exposing both backends makes
+# each physical tile enumerate twice, which breaks the one-rank-per-tile
+# mapping. The banner prints the effective value so the .o file records what the
+# job actually ran with.
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
 export MASTER_PORT=${MASTER_PORT:-29500}
@@ -70,6 +96,13 @@ job_banner() {
     echo "  repo          : $(pwd)"
     echo "  git commit    : $(git rev-parse --short HEAD 2>/dev/null || echo '<no git>')${dirty}"
     echo "  topology      : ${NNODES} nodes x ${RANKS_PER_NODE} ranks/node = ${NRANKS} ranks"
+    echo "----------------------------------------------------------------"
+    echo "  device / fabric environment (effective, after module load):"
+    local e
+    for e in ONEAPI_DEVICE_SELECTOR ZE_FLAT_DEVICE_HIERARCHY OMP_NUM_THREADS \
+             CCL_PROCESS_LAUNCHER CCL_ATL_TRANSPORT CCL_KVS_MODE FI_PROVIDER; do
+        printf '    %-24s = %s\n' "$e" "${!e}"
+    done
     echo "----------------------------------------------------------------"
     echo "  paths resolved by config.py:"
     python config.py 2>&1 | sed 's/^/    /'
