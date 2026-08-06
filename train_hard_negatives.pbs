@@ -45,7 +45,23 @@ GROUP_SIZE=16
 FILIP_CHUNK_ROWS=8
 EPOCHS=10
 LR=5e-5                 # fine-tune LR: we resume a converged model
-NUM_WORKERS=4           # this loader reads 1+MAX_DECOYS text rows per sample
+# This is the ONLY phase in the repo that runs DataLoader workers, and therefore
+# the only one whose batches transit /dev/shm. Job 8735369 died at the epoch-0 ->
+# epoch-1 boundary with SIGBUS on one rank (then the oneCCL "RECV entry failed"
+# cascade on its peers), which is the signature of a worker failing to get a
+# shared-memory page.
+#
+# Footprint is NUM_WORKERS * PREFETCH_FACTOR * batch_bytes per rank, x12 ranks
+# per node. A decoy batch is ~100 MB at the 512-token caps (protein + text + 2
+# decoy captions), so 4x2 was ~9.6 GB/node steady — and ~19 GB across an epoch
+# boundary, where the old and new worker sets briefly coexist. That boundary is
+# exactly where it died. 2x2 halves the steady figure, and the loaders are now
+# persistent, which removes the doubling entirely.
+#
+# The banner prints /dev/shm size and available; check the first line of the .o
+# file against the loader footprint before raising these.
+NUM_WORKERS=2
+PREFETCH_FACTOR=2       # this loader reads 1+MAX_DECOYS text rows per sample
 # These MUST match what the resumed run finished with (train_retrieval.pbs), or
 # "resume with its existing objective" silently isn't.
 ALIGN_AUX_WEIGHT=0
@@ -78,7 +94,7 @@ fi
 slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 job_banner "hard-negative mining (src.train_hard_negatives)" \
     RETRIEVAL_CKPT CACHE_DIR DECOY_DIR CKPT_DIR RESUME_MODE \
-    BATCH_SIZE GROUP_SIZE FILIP_CHUNK_ROWS EPOCHS LR NUM_WORKERS \
+    BATCH_SIZE GROUP_SIZE FILIP_CHUNK_ROWS EPOCHS LR NUM_WORKERS PREFETCH_FACTOR \
     ALIGN_AUX_WEIGHT R2_UNIFORMITY_WEIGHT \
     DECOY_WEIGHT DECOY_START_FRAC DECOY_RAMP_FRAC DECOY_MARGIN MAX_DECOYS
 require_files RETRIEVAL_CKPT CACHE_DIR DECOY_DIR
@@ -90,6 +106,7 @@ require_files RETRIEVAL_CKPT CACHE_DIR DECOY_DIR
         --batch-size "${BATCH_SIZE}" --group-size "${GROUP_SIZE}" \
         --filip-chunk-rows "${FILIP_CHUNK_ROWS}" \
         --epochs "${EPOCHS}" --lr "${LR}" --num-workers "${NUM_WORKERS}" \
+        --prefetch-factor "${PREFETCH_FACTOR}" \
         --align-aux-weight "${ALIGN_AUX_WEIGHT}" \
         --r2-uniformity-weight "${R2_UNIFORMITY_WEIGHT}" \
         --decoy-weight "${DECOY_WEIGHT}" \

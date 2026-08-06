@@ -215,6 +215,25 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
         collate = collate_fn or raw_collate
         bs = cfg.retrieval.live_batch_size
 
+    # Worker options. DataLoader workers hand batches to the parent through
+    # SHARED MEMORY, so the resident footprint is
+    # num_workers * prefetch_factor * batch_bytes, PER RANK — times 12 ranks on
+    # an Aurora node. A decoy batch is ~100 MB at the 512-token caps, so this is
+    # the one knob in the repo that can exhaust /dev/shm, and the failure mode
+    # when it does is SIGBUS in a worker (which then takes the job down as a
+    # oneCCL "RECV entry failed" cascade on every peer of the dead rank).
+    #
+    # persistent_workers keeps them alive across epochs. Without it every epoch
+    # boundary tears down N workers and spawns N more, and for that window BOTH
+    # sets hold shared-memory segments — the peak is double the steady state, at
+    # exactly the moment nothing is being computed to hide it.
+    nw = cfg.retrieval.num_workers
+    worker_kw = {}
+    if nw > 0:
+        worker_kw = {"num_workers": nw,
+                     "prefetch_factor": cfg.retrieval.prefetch_factor,
+                     "persistent_workers": True}
+
     # Distributed: shard the train set across ranks. drop_last keeps a constant
     # per-rank batch size B, which the grouped all-gather (fixed-shape gather)
     # depends on. Validation runs on rank 0 only (unsharded loader).
@@ -225,18 +244,19 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
         )
         train_loader = DataLoader(
             train_ds, batch_size=bs, sampler=train_sampler,
-            num_workers=cfg.retrieval.num_workers, collate_fn=collate, drop_last=True,
+            collate_fn=collate, drop_last=True, **worker_kw,
         )
     else:
         train_sampler = None
         train_loader = DataLoader(
-            train_ds, batch_size=bs, shuffle=True,
-            num_workers=cfg.retrieval.num_workers, collate_fn=collate,
-            drop_last=len(train_ds) >= 2 * bs,
+            train_ds, batch_size=bs, shuffle=True, collate_fn=collate,
+            drop_last=len(train_ds) >= 2 * bs, **worker_kw,
         )
+    # Val runs on ONE rank, once per epoch, and is projection-bound rather than
+    # I/O-bound — workers buy it nothing and would double that rank's
+    # shared-memory footprint (its node is already the busiest). Always 0.
     val_loader = DataLoader(
-        val_ds, batch_size=bs, shuffle=False,
-        num_workers=cfg.retrieval.num_workers, collate_fn=collate,
+        val_ds, batch_size=bs, shuffle=False, num_workers=0, collate_fn=collate,
     )
     if len(train_loader) == 0:
         raise RuntimeError(
@@ -245,6 +265,10 @@ def build_loaders(cfg: Cfg, splits_path: Path, env, pairs=None, val_subset: int 
         )
     if env.is_main:
         print(f"[train] batches/epoch/rank: train={len(train_loader)} val={len(val_loader)} bs={bs}")
+        if nw > 0:
+            print(f"[train] loader workers: {nw} x prefetch {cfg.retrieval.prefetch_factor} "
+                  f"(persistent), val=0. Batches cross into the parent through "
+                  f"/dev/shm; see the shm line in the job banner if a rank SIGBUSes.")
     return train_loader, val_loader, train_sampler, row_group_ids, row_text_ids
 
 

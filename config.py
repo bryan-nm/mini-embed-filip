@@ -114,6 +114,11 @@ class RetrievalCfg:
     batch_size: int = 128
     live_batch_size: int = 8
     num_workers: int = 0
+    # Batches per worker held in flight. Total shared memory is
+    # num_workers * prefetch_factor * batch_bytes per rank, and every rank on a
+    # node draws from the same /dev/shm — so this multiplies with num_workers,
+    # it does not trade against it. Only bites when num_workers > 0.
+    prefetch_factor: int = 2
 
     phase1_epochs: int = 1
     phase2_epochs: int = 3
@@ -180,7 +185,16 @@ class HardNegCfg:
     # serialized into the training step; workers overlap them with compute. The
     # decoy MATH is <1% of the R2 contrastive math, so if a step is slow it is
     # essentially always this.
-    num_workers: int = 4
+    # 2, not 4. This is the only phase in the repo that runs loader workers, and
+    # so the only one whose batches transit /dev/shm: at the 512-token caps a
+    # decoy batch is ~100 MB (protein + text + 2 decoy captions), and
+    # num_workers * prefetch_factor * 100 MB * 12 ranks/node is what the node has
+    # to hold. At 4x2 that is ~9.6 GB/node steady and ~19 GB across an epoch
+    # boundary; a worker that cannot get its shared-memory page dies with SIGBUS,
+    # and its peers then fail with oneCCL "RECV entry failed". Raise only
+    # alongside the shm figure the job banner prints.
+    num_workers: int = 2
+    prefetch_factor: int = 2
     epochs: int = 3
     lr: float = 5e-5                          # fine-tune LR: we resume a converged model
     weight_decay: float = 0.01

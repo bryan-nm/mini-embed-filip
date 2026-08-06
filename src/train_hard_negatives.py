@@ -216,6 +216,11 @@ def main() -> None:
     ap.add_argument("--filip-chunk-rows", type=int, default=0,
                     help=">0 chunks the FILIP score matrices over the anchor axis")
     ap.add_argument("--val-subset", type=int, default=1000)
+    ap.add_argument("--prefetch-factor", type=int, default=hn.prefetch_factor,
+                    help="batches held in flight PER WORKER. Shared memory used is "
+                         "num-workers * this * batch_bytes per rank, x12 ranks per "
+                         "node; lower it before lowering --num-workers if the loader "
+                         "is keeping up but a rank died with SIGBUS")
     ap.add_argument("--num-workers", type=int, default=hn.num_workers,
                     help="DataLoader workers. This phase reads 1+max_decoys text "
                          "rows per sample, so 0 serializes ~3x the random reads "
@@ -247,6 +252,7 @@ def main() -> None:
     cfg.retrieval.cache_dir = args.cache_dir
     cfg.retrieval.batch_size = args.batch_size
     cfg.retrieval.num_workers = args.num_workers
+    cfg.retrieval.prefetch_factor = args.prefetch_factor
     cfg.data.subset_size = args.subset_size
     cfg.data.seed = args.seed
     cfg.retrieval.align_aux_weight = args.align_aux_weight

@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_retrieval
-#PBS -l walltime=08:00:00
+#PBS -l walltime=05:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fsx
@@ -55,7 +55,7 @@ CKPT_DIR=checkpoints/retrieval
 BATCH_SIZE=32
 GROUP_SIZE=16
 PHASE1_EPOCHS=1
-PHASE2_EPOCHS=20
+PHASE2_EPOCHS=50
 LR=2e-4
 # R1 token-spread weight; raise toward 0.3 if R1 collapses.
 PHASE1_UNIFORMITY_WEIGHT=0.3

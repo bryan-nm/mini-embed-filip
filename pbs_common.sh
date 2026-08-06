@@ -103,6 +103,13 @@ job_banner() {
              CCL_PROCESS_LAUNCHER CCL_ATL_TRANSPORT CCL_KVS_MODE FI_PROVIDER; do
         printf '    %-24s = %s\n' "$e" "${!e}"
     done
+    # /dev/shm is where DataLoader workers hand batches to their parent, shared by
+    # all 12 ranks on a node. A worker that cannot get a page dies with SIGBUS,
+    # and every peer of that rank then fails with oneCCL "RECV entry failed" —
+    # so when a job dies that way, this line is the first thing to check against
+    # the loader's reported footprint. Meaningless for num_workers=0 phases.
+    printf '    %-24s = %s\n' "/dev/shm (size avail)" \
+        "$(df -h /dev/shm 2>/dev/null | awk 'NR==2 {print $2" "$4}' || echo '<unknown>')"
     echo "----------------------------------------------------------------"
     echo "  paths resolved by config.py:"
     python config.py 2>&1 | sed 's/^/    /'
